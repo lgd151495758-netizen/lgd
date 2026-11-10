@@ -1,0 +1,80 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Build unsigned IPA
+        id: ipa
+        run: |
+          set -o pipefail
+          xcodebuild -project Quillmark.xcodeproj -scheme Quillmark -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log | grep -E "error:|warning: unre|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/Build/Products/Release-iphoneos/Quillmark.app
+          mkdir -p dist/Payload
+          cp -R build/Build/Products/Release-iphoneos/Quillmark.app dist/Payload/
+          (cd dist && zip -qry Quillmark.ipa Payload)
+          ls -la dist/Quillmark.ipa
+
+      - name: Report build errors
+        if: failure() && steps.ipa.outcome == 'failure'
+        run: bash scripts/annotate.sh build.log
+
+      - name: Upload IPA artifact
+        if: steps.ipa.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quillmark-ipa
+          path: dist/Quillmark.ipa
+
+      - name: Publish "latest" release
+        if: steps.ipa.outcome == 'success' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Quillmark 最新构建
+          prerelease: true
+          body: |
+            自动构建（commit ${{ github.sha }}）。下载 Quillmark.ipa，用 Sideloadly 签名安装到 iPad。
+          files: dist/Quillmark.ipa
+
+      - name: Unit tests (iPad simulator)
+        id: tests
+        if: steps.ipa.outcome == 'success'
+        run: |
+          set -o pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 scripts/pick_ipad.py)
+          echo "Simulator: $UDID"
+          xcodebuild test -project Quillmark.xcodeproj -scheme Quillmark \
+            -destination "id=$UDID" -derivedDataPath build-tests \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee test.log | grep -E "error:|Test Case .*(passed|failed)|Executed|TEST (SUCCEEDED|FAILED)" || true
+          grep -q "TEST SUCCEEDED" test.log
+
+      - name: Report test failures
+        if: failure() && steps.tests.outcome == 'failure'
+        run: bash scripts/annotate.sh test.log
