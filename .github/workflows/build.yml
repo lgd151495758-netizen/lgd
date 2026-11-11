@@ -11,14 +11,16 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - name: Select Xcode
         run: |
-          XCODE=$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)
+          # Newest stable Xcode on the image (skip betas / release candidates).
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -viE "beta|rc" | sort -V | tail -1)
+          echo "Using $XCODE"
           sudo xcode-select -s "$XCODE"
           xcodebuild -version
 
