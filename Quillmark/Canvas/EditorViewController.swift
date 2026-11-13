@@ -111,7 +111,7 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
 extension EditorViewController: UIPencilInteractionDelegate {
     @available(iOS 17.5, *)
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
-        handlePencilTap(interaction.preferredTapAction)
+        handlePencilTap(UIPencilInteraction.preferredTapAction)
     }
 
     func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
