@@ -1,25 +1,38 @@
 import UIKit
 
 /// Transparent ink layer laid over one PDF page.
-/// Committed strokes are vector `CAShapeLayer`s (they stay sharp when the page is zoomed);
-/// the stroke being drawn lives in `liveLayer` and includes Apple Pencil predicted points.
+/// Committed strokes are vector `CAShapeLayer`s (they stay sharp when the page is zoomed).
+/// Highlighter strokes live in a container below pen ink and use a multiply blend, so printed
+/// text stays dark underneath. The stroke being drawn lives in `liveLayer`.
 final class PageInkView: UIView, InkInputDelegate {
     let pageIndex: Int
     let pageSize: CGSize
     private weak var session: DocumentSession?
 
+    static let highlighterOpacity: Float = 0.6
+
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
+    private let highlightContainer = CALayer()
+    private let inkContainer = CALayer()
     private let liveLayer = CAShapeLayer()
+    private let eraserCursor = CAShapeLayer()
     private var strokeLayers: [UUID: CAShapeLayer] = [:]
     private var renderedStrokes: [UUID: InkStroke] = [:]
     private var lastLayoutSize: CGSize = .zero
+    private let geometryCache = StrokeGeometryCache()
 
+    // Drawing state
     private var livePoints: [InkPoint] = []
     private var liveTool = ToolSettings()
     private var liveStartTime: TimeInterval = 0
     /// estimationUpdateIndex -> index into the stroke's points, for force values that arrive later.
     private var pendingEstimates: [NSNumber: Int] = [:]
     private var lastCommitted: (id: UUID, points: [InkPoint])?
+
+    // Erasing state
+    private var eraseOriginal: [InkStroke]?
+    private var eraseWorking: [InkStroke] = []
+    private var lastErasePoint: CGPoint?
 
     init(pageIndex: Int, pageSize: CGSize, session: DocumentSession) {
         self.pageIndex = pageIndex
@@ -28,8 +41,17 @@ final class PageInkView: UIView, InkInputDelegate {
         super.init(frame: .zero)
         backgroundColor = .clear
         isOpaque = false
+
+        layer.addSublayer(highlightContainer)
+        layer.addSublayer(inkContainer)
         liveLayer.fillRule = .nonZero
         layer.addSublayer(liveLayer)
+        eraserCursor.fillColor = UIColor.systemGray.withAlphaComponent(0.15).cgColor
+        eraserCursor.strokeColor = UIColor.systemGray.cgColor
+        eraserCursor.lineWidth = 1
+        eraserCursor.isHidden = true
+        layer.addSublayer(eraserCursor)
+
         inkRecognizer.inkDelegate = self
         addGestureRecognizer(inkRecognizer)
         updateInputMode(fingerDrawing: session.tool.fingerDrawing)
@@ -39,10 +61,8 @@ final class PageInkView: UIView, InkInputDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
-    private var pageToView: CGAffineTransform {
-        let s = PageMapping.scale(viewSize: bounds.size, pageSize: pageSize)
-        return CGAffineTransform(scaleX: s, y: s)
-    }
+    private var scale: CGFloat { PageMapping.scale(viewSize: bounds.size, pageSize: pageSize) }
+    private var pageToView: CGAffineTransform { CGAffineTransform(scaleX: scale, y: scale) }
 
     func updateInputMode(fingerDrawing: Bool) {
         inkRecognizer.allowsFingerDrawing = fingerDrawing
@@ -54,7 +74,10 @@ final class PageInkView: UIView, InkInputDelegate {
         lastLayoutSize = bounds.size
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        liveLayer.frame = bounds
+        let containers: [CALayer] = [highlightContainer, inkContainer, liveLayer, eraserCursor]
+        for container in containers {
+            container.frame = bounds
+        }
         let transform = pageToView
         for (id, shape) in strokeLayers {
             shape.frame = bounds
@@ -68,7 +91,10 @@ final class PageInkView: UIView, InkInputDelegate {
     /// Brings the shape layers in line with the session's strokes for this page.
     func sync() {
         guard let session else { return }
-        let strokes = session.strokes(onPage: pageIndex)
+        render(session.strokes(onPage: pageIndex))
+    }
+
+    private func render(_ strokes: [InkStroke]) {
         let ids = Set(strokes.map(\.id))
         let transform = pageToView
 
@@ -90,47 +116,96 @@ final class PageInkView: UIView, InkInputDelegate {
                 strokeLayers[stroke.id] = shape
             }
             if renderedStrokes[stroke.id] != stroke {
-                shape.fillColor = stroke.color.cgColor
+                Self.applyAppearance(highlighter: stroke.isHighlighter, color: stroke.color, to: shape)
                 shape.path = stroke.outlinePath(transform: transform)
                 renderedStrokes[stroke.id] = stroke
             }
-            // Re-inserting keeps z-order equal to stroke order, below the live stroke.
-            layer.insertSublayer(shape, below: liveLayer)
+            // Re-adding keeps z-order equal to stroke order inside each container.
+            let container = stroke.isHighlighter ? highlightContainer : inkContainer
+            container.addSublayer(shape)
         }
         CATransaction.commit()
     }
 
-    // MARK: Input
+    private static func applyAppearance(highlighter: Bool, color: RGBAColor, to shape: CAShapeLayer) {
+        shape.fillColor = color.cgColor
+        if highlighter {
+            shape.opacity = highlighterOpacity
+            shape.compositingFilter = "multiplyBlendMode"
+        } else {
+            shape.opacity = 1
+            shape.compositingFilter = nil
+        }
+    }
+
+    // MARK: Input routing
 
     func inkBegan(_ touch: UITouch, event: UIEvent?) {
         guard let session else { return }
         liveTool = session.tool
-        livePoints.removeAll(keepingCapacity: true)
-        pendingEstimates.removeAll()
-        lastCommitted = nil
-        liveStartTime = touch.timestamp
-        append(event?.coalescedTouches(for: touch) ?? [touch])
-        updateLiveStroke(predicted: [])
+        if liveTool.kind == .eraser {
+            eraseBegan(touch, event: event)
+        } else {
+            drawBegan(touch, event: event)
+        }
     }
 
     func inkMoved(_ touch: UITouch, event: UIEvent?) {
-        append(event?.coalescedTouches(for: touch) ?? [touch])
-        let predicted = liveTool.prediction ? (event?.predictedTouches(for: touch) ?? []) : []
-        updateLiveStroke(predicted: predicted)
+        if liveTool.kind == .eraser {
+            eraseMoved(touch, event: event)
+        } else {
+            drawMoved(touch, event: event)
+        }
     }
 
     func inkEnded(_ touch: UITouch, event: UIEvent?) {
-        append(event?.coalescedTouches(for: touch) ?? [touch])
-        commitLiveStroke()
+        if liveTool.kind == .eraser {
+            eraseMoved(touch, event: event)
+            eraseEnded()
+        } else {
+            append(event?.coalescedTouches(for: touch) ?? [touch])
+            commitLiveStroke()
+        }
     }
 
     func inkCancelled() {
+        if liveTool.kind == .eraser {
+            eraseOriginal = nil
+            lastErasePoint = nil
+            setEraserCursor(nil)
+            sync()
+            return
+        }
         livePoints.removeAll()
         pendingEstimates.removeAll()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         liveLayer.path = nil
         CATransaction.commit()
+    }
+
+    // MARK: Drawing
+
+    private func drawBegan(_ touch: UITouch, event: UIEvent?) {
+        livePoints.removeAll(keepingCapacity: true)
+        pendingEstimates.removeAll()
+        lastCommitted = nil
+        liveStartTime = touch.timestamp
+        let highlighter = liveTool.kind == .highlighter
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        Self.applyAppearance(highlighter: highlighter,
+                             color: highlighter ? liveTool.highlighterColor : liveTool.color,
+                             to: liveLayer)
+        CATransaction.commit()
+        append(event?.coalescedTouches(for: touch) ?? [touch])
+        updateLiveStroke(predicted: [])
+    }
+
+    private func drawMoved(_ touch: UITouch, event: UIEvent?) {
+        append(event?.coalescedTouches(for: touch) ?? [touch])
+        let predicted = liveTool.prediction ? (event?.predictedTouches(for: touch) ?? []) : []
+        updateLiveStroke(predicted: predicted)
     }
 
     func inkEstimatedPropertiesUpdated(_ touch: UITouch) {
@@ -170,12 +245,17 @@ final class PageInkView: UIView, InkInputDelegate {
         PenModel.normalizedForce(raw: touch.force, maximum: touch.maximumPossibleForce, isStylus: touch.type == .pencil)
     }
 
-    private func inkPoint(from touch: UITouch) -> InkPoint {
+    private func pagePoint(_ touch: UITouch) -> CGPoint {
         let location = touch.preciseLocation(in: self)
-        let scale = PageMapping.scale(viewSize: bounds.size, pageSize: pageSize)
+        let s = scale
+        return CGPoint(x: location.x / s, y: location.y / s)
+    }
+
+    private func inkPoint(from touch: UITouch) -> InkPoint {
+        let p = pagePoint(touch)
         let isStylus = touch.type == .pencil
-        return InkPoint(x: Float(location.x / scale),
-                        y: Float(location.y / scale),
+        return InkPoint(x: Float(p.x),
+                        y: Float(p.y),
                         force: forceValue(touch),
                         azimuth: isStylus ? Float(touch.azimuthAngle(in: self)) : 0,
                         altitude: isStylus ? Float(touch.altitudeAngle) : .pi / 2,
@@ -183,8 +263,13 @@ final class PageInkView: UIView, InkInputDelegate {
     }
 
     private func makeStroke(points: [InkPoint]) -> InkStroke {
-        InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
-                  smoothing: liveTool.smoothing, points: points)
+        if liveTool.kind == .highlighter {
+            let shaped = liveTool.highlighterStraight ? StrokeProcessor.straightened(points) : points
+            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
+                             width: liveTool.highlighterWidth, smoothing: 0.7, points: shaped, tool: .highlighter)
+        }
+        return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
+                         smoothing: liveTool.smoothing, points: points, tool: .pen)
     }
 
     private func updateLiveStroke(predicted: [UITouch]) {
@@ -193,7 +278,6 @@ final class PageInkView: UIView, InkInputDelegate {
         let stroke = makeStroke(points: points)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        liveLayer.fillColor = stroke.color.cgColor
         liveLayer.path = stroke.outlinePath(transform: pageToView, finished: false)
         CATransaction.commit()
     }
@@ -207,8 +291,76 @@ final class PageInkView: UIView, InkInputDelegate {
         }
         guard let session, !livePoints.isEmpty else { return }
         let stroke = makeStroke(points: livePoints)
-        lastCommitted = (stroke.id, stroke.points)
+        // Straightened highlighter points no longer map 1:1 to touches, so skip force refinement.
+        if stroke.points.count == livePoints.count {
+            lastCommitted = (id: stroke.id, points: stroke.points)
+        } else {
+            lastCommitted = nil
+        }
         livePoints.removeAll(keepingCapacity: true)
         session.addStroke(stroke, page: pageIndex)
+    }
+
+    // MARK: Erasing
+
+    private var eraserRadius: CGFloat { CGFloat(liveTool.eraserRadius) }
+
+    private func eraseBegan(_ touch: UITouch, event: UIEvent?) {
+        guard let session else { return }
+        let original = session.strokes(onPage: pageIndex)
+        eraseOriginal = original
+        eraseWorking = original
+        let p = pagePoint(touch)
+        lastErasePoint = p
+        applyErase(from: p, to: p)
+        setEraserCursor(p)
+    }
+
+    private func eraseMoved(_ touch: UITouch, event: UIEvent?) {
+        guard eraseOriginal != nil else { return }
+        for sample in event?.coalescedTouches(for: touch) ?? [touch] {
+            let p = pagePoint(sample)
+            applyErase(from: lastErasePoint ?? p, to: p)
+            lastErasePoint = p
+        }
+        setEraserCursor(lastErasePoint)
+    }
+
+    private func eraseEnded() {
+        defer {
+            eraseOriginal = nil
+            lastErasePoint = nil
+            setEraserCursor(nil)
+        }
+        guard let session, let original = eraseOriginal else { return }
+        if eraseWorking != original {
+            session.replaceStrokes(onPage: pageIndex, before: original, after: eraseWorking)
+        } else {
+            sync()
+        }
+    }
+
+    private func applyErase(from a: CGPoint, to b: CGPoint) {
+        let result = EraserEngine.erase(eraseWorking, from: a, to: b, radius: eraserRadius,
+                                        mode: liveTool.eraserMode, highlighterOnly: liveTool.eraseHighlighterOnly,
+                                        cache: geometryCache)
+        guard result.changed else { return }
+        eraseWorking = result.strokes
+        render(eraseWorking)
+    }
+
+    private func setEraserCursor(_ pagePoint: CGPoint?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if let pagePoint {
+            let center = pagePoint.applying(pageToView)
+            let r = eraserRadius * scale
+            eraserCursor.path = CGPath(ellipseIn: CGRect(x: center.x - r, y: center.y - r, width: 2 * r, height: 2 * r),
+                                       transform: nil)
+            eraserCursor.isHidden = false
+        } else {
+            eraserCursor.isHidden = true
+        }
+        CATransaction.commit()
     }
 }

@@ -68,6 +68,34 @@ struct RGBAColor: Codable, Equatable, Hashable {
     static let ink = RGBAColor(0.11, 0.11, 0.13)
 }
 
+enum ToolKind: String, Codable, CaseIterable {
+    case pen
+    case highlighter
+    case eraser
+}
+
+enum EraserMode: String, Codable, CaseIterable, Identifiable {
+    /// Removes only the touched part of a stroke (splits it).
+    case pixel
+    /// Removes every stroke the eraser touches.
+    case stroke
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .pixel: return "精确擦除"
+        case .stroke: return "整笔擦除"
+        }
+    }
+}
+
+/// What kind of mark a stroke is. Missing in older files, which means `.pen`.
+enum InkTool: String, Codable {
+    case pen
+    case highlighter
+}
+
 struct InkStroke: Codable, Equatable, Identifiable {
     var id: UUID
     var pen: PenKind
@@ -77,6 +105,13 @@ struct InkStroke: Codable, Equatable, Identifiable {
     /// Stabilization strength used when the stroke was drawn (0 = raw, 1 = heavy).
     var smoothing: Float
     var points: [InkPoint]
+    /// `nil` for pen strokes written before highlighters existed.
+    var tool: InkTool?
+    /// Already-processed centerline. Set for pieces left over by the precise eraser, which must
+    /// keep their exact shape instead of being re-smoothed from raw points.
+    var baked: [StrokeSample]?
+
+    var isHighlighter: Bool { tool == .highlighter }
 }
 
 struct PageAnnotations: Codable, Equatable {
@@ -101,14 +136,32 @@ struct DocumentAnnotations: Codable, Equatable {
 
 /// Current tool configuration, persisted between launches.
 struct ToolSettings: Codable, Equatable {
+    var kind: ToolKind = .pen
+    /// Tool to return to on Apple Pencil double-tap ("switch to previous").
+    var previousKind: ToolKind = .eraser
+
+    // Pen
     var pen: PenKind = .fountain
     var color: RGBAColor = .ink
     var width: Float = 1.8
-    var fingerDrawing: Bool = false
     var smoothing: Float = 0.45
     var prediction: Bool = true
 
+    // Highlighter
+    var highlighterColor: RGBAColor = ToolSettings.highlighterPalette[0]
+    var highlighterWidth: Float = 14
+    var highlighterStraight: Bool = false
+
+    // Eraser
+    var eraserMode: EraserMode = .pixel
+    var eraserRadius: Float = 8
+    var eraseHighlighterOnly: Bool = false
+
+    var fingerDrawing: Bool = false
+
     static let widthPresets: [Float] = [1.0, 1.8, 3.0]
+    static let highlighterWidthPresets: [Float] = [8, 14, 22]
+    static let eraserRadiusPresets: [Float] = [4, 8, 16]
 
     static let palette: [RGBAColor] = [
         .ink,
@@ -119,7 +172,40 @@ struct ToolSettings: Codable, Equatable {
         RGBAColor(0.93, 0.50, 0.10),
     ]
 
-    private static let defaultsKey = "toolSettings.v1"
+    static let highlighterPalette: [RGBAColor] = [
+        RGBAColor(1.00, 0.88, 0.20),
+        RGBAColor(0.55, 0.92, 0.45),
+        RGBAColor(1.00, 0.55, 0.75),
+        RGBAColor(0.45, 0.80, 1.00),
+        RGBAColor(1.00, 0.70, 0.30),
+    ]
+
+    /// Selects a tool and remembers the one being left for double-tap "switch to previous".
+    mutating func select(_ newKind: ToolKind) {
+        guard newKind != kind else { return }
+        previousKind = kind
+        kind = newKind
+    }
+
+    /// Apple Pencil double-tap with the "switch to eraser" preference.
+    mutating func toggleEraser() {
+        if kind == .eraser {
+            let target = previousKind == .eraser ? ToolKind.pen : previousKind
+            previousKind = .eraser
+            kind = target
+        } else {
+            select(.eraser)
+        }
+    }
+
+    /// Apple Pencil double-tap with the "switch to previous tool" preference.
+    mutating func switchToPrevious() {
+        let target = previousKind
+        previousKind = kind
+        kind = target == kind ? .pen : target
+    }
+
+    private static let defaultsKey = "toolSettings.v2"
 
     static func load(from defaults: UserDefaults = .standard) -> ToolSettings {
         guard let data = defaults.data(forKey: defaultsKey),

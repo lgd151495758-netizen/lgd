@@ -50,6 +50,22 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
                 self?.applyInputMode(fingerDrawing: fingerDrawing)
             }
             .store(in: &cancellables)
+
+        let pencilInteraction = UIPencilInteraction()
+        pencilInteraction.delegate = self
+        view.addInteraction(pencilInteraction)
+    }
+
+    /// Apple Pencil (2nd generation) double-tap, following the user's system preference.
+    fileprivate func handlePencilTap(_ action: UIPencilPreferredAction) {
+        switch action {
+        case .ignore:
+            return
+        case .switchPrevious:
+            session.tool.switchToPrevious()
+        default:
+            session.tool.toggleEraser()
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -89,6 +105,17 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
         if overlays[overlay.pageIndex] === overlay {
             overlays[overlay.pageIndex] = nil
         }
+    }
+}
+
+extension EditorViewController: UIPencilInteractionDelegate {
+    @available(iOS 17.5, *)
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveTap tap: UIPencilInteraction.Tap) {
+        handlePencilTap(interaction.preferredTapAction)
+    }
+
+    func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
+        handlePencilTap(UIPencilInteraction.preferredTapAction)
     }
 }
 

@@ -9,17 +9,20 @@ final class DocumentSession: ObservableObject {
     enum Command: Equatable {
         case insert(page: Int, stroke: InkStroke, index: Int)
         case remove(page: Int, stroke: InkStroke, index: Int)
+        /// Replaces all strokes of a page (one eraser gesture).
+        case replace(page: Int, before: [InkStroke], after: [InkStroke])
 
         var inverse: Command {
             switch self {
             case let .insert(page, stroke, index): return .remove(page: page, stroke: stroke, index: index)
             case let .remove(page, stroke, index): return .insert(page: page, stroke: stroke, index: index)
+            case let .replace(page, before, after): return .replace(page: page, before: after, after: before)
             }
         }
 
         var page: Int {
             switch self {
-            case let .insert(page, _, _), let .remove(page, _, _): return page
+            case let .insert(page, _, _), let .remove(page, _, _), let .replace(page, _, _): return page
             }
         }
     }
@@ -70,6 +73,12 @@ final class DocumentSession: ObservableObject {
 
     func addStroke(_ stroke: InkStroke, page: Int) {
         perform(.insert(page: page, stroke: stroke, index: strokes(onPage: page).count))
+    }
+
+    /// Commits the result of an eraser gesture as one undoable step.
+    func replaceStrokes(onPage page: Int, before: [InkStroke], after: [InkStroke]) {
+        guard before != after else { return }
+        perform(.replace(page: page, before: before, after: after))
     }
 
     func perform(_ command: Command) {
@@ -140,6 +149,10 @@ final class DocumentSession: ObservableObject {
         case let .remove(page, stroke, _):
             annotations.updatePage(page) { p in
                 p.strokes.removeAll { $0.id == stroke.id }
+            }
+        case let .replace(page, _, after):
+            annotations.updatePage(page) { p in
+                p.strokes = after
             }
         }
         pageDidChange?(command.page)

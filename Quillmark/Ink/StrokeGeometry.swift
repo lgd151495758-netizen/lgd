@@ -2,7 +2,7 @@ import CoreGraphics
 import Foundation
 
 /// A processed point on the stroke centerline with its half-width.
-struct StrokeSample: Equatable {
+struct StrokeSample: Codable, Equatable {
     var point: CGPoint
     var radius: CGFloat
 }
@@ -36,13 +36,16 @@ enum StrokeProcessor {
     static let minimumSpacing: CGFloat = 0.25
     static let minimumRadius: CGFloat = 0.12
 
-    static func samples(for points: [InkPoint], pen: PenKind, width: Float, smoothing: Float, finished: Bool) -> [StrokeSample] {
+    static func samples(for points: [InkPoint], pen: PenKind, width: Float, smoothing: Float, finished: Bool,
+                        highlighter: Bool = false) -> [StrokeSample] {
         guard let first = points.first else { return [] }
         let follow = CGFloat(1 - max(0, min(0.95, smoothing)) * 0.85)
         let base = CGFloat(width) / 2
 
         func targetRadius(_ p: InkPoint, speed: Float) -> CGFloat {
-            max(minimumRadius, base * CGFloat(PenModel.widthFactor(pen: pen, force: p.force, speed: speed)))
+            // A highlighter has a felt chisel: constant width, no pressure or speed response.
+            if highlighter { return max(minimumRadius, base) }
+            return max(minimumRadius, base * CGFloat(PenModel.widthFactor(pen: pen, force: p.force, speed: speed)))
         }
 
         var result = [StrokeSample(point: first.location, radius: targetRadius(first, speed: 0))]
@@ -77,7 +80,48 @@ enum StrokeProcessor {
             }
         }
 
-        applyTaper(&result, pen: pen, finished: finished)
+        if !highlighter {
+            applyTaper(&result, pen: pen, finished: finished)
+        }
+        return result
+    }
+
+    /// Replaces a freehand stroke by a straight segment from its first to its last point
+    /// (highlighter "straight line" mode). Intermediate points keep the outline well formed.
+    static func straightened(_ points: [InkPoint], spacing: Float = 2) -> [InkPoint] {
+        guard let first = points.first, let last = points.last, points.count > 1 else { return points }
+        let length = hypotf(last.x - first.x, last.y - first.y)
+        let steps = max(1, Int(length / spacing))
+        return (0...steps).map { i in
+            let f = Float(i) / Float(steps)
+            return InkPoint(x: first.x + (last.x - first.x) * f,
+                            y: first.y + (last.y - first.y) * f,
+                            force: first.force + (last.force - first.force) * f,
+                            azimuth: first.azimuth, altitude: first.altitude,
+                            t: first.t + (last.t - first.t) * f)
+        }
+    }
+
+    /// Inserts interpolated samples so neighbours are at most `maxSpacing` apart.
+    static func densified(_ samples: [StrokeSample], maxSpacing: CGFloat) -> [StrokeSample] {
+        guard samples.count > 1, maxSpacing > 0 else { return samples }
+        var result: [StrokeSample] = [samples[0]]
+        result.reserveCapacity(samples.count * 2)
+        for i in 1..<samples.count {
+            let a = samples[i - 1]
+            let b = samples[i]
+            let distance = hypot(b.point.x - a.point.x, b.point.y - a.point.y)
+            let extra = Int(distance / maxSpacing)
+            if extra > 0 {
+                for k in 1...extra {
+                    let f = CGFloat(k) / CGFloat(extra + 1)
+                    result.append(StrokeSample(point: CGPoint(x: a.point.x + (b.point.x - a.point.x) * f,
+                                                              y: a.point.y + (b.point.y - a.point.y) * f),
+                                               radius: a.radius + (b.radius - a.radius) * f))
+                }
+            }
+            result.append(b)
+        }
         return result
     }
 
@@ -184,8 +228,14 @@ enum StrokeOutline {
 }
 
 extension InkStroke {
+    /// Centerline used for rendering and hit testing.
+    func renderSamples(finished: Bool = true) -> [StrokeSample] {
+        if let baked { return baked }
+        return StrokeProcessor.samples(for: points, pen: pen, width: width, smoothing: smoothing,
+                                       finished: finished, highlighter: isHighlighter)
+    }
+
     func outlinePath(transform: CGAffineTransform = .identity, finished: Bool = true) -> CGPath {
-        let samples = StrokeProcessor.samples(for: points, pen: pen, width: width, smoothing: smoothing, finished: finished)
-        return StrokeOutline.path(for: samples, transform: transform)
+        StrokeOutline.path(for: renderSamples(finished: finished), transform: transform)
     }
 }
