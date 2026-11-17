@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # The arm64 macOS pool is often out of capacity; the Intel pool has the same Xcode.
+    runs-on: macos-15-intel
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
