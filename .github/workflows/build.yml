@@ -11,8 +11,13 @@ permissions:
 
 jobs:
   build:
-    # The arm64 macOS pool is often out of capacity; the Intel pool has the same Xcode.
-    runs-on: macos-15-intel
+    # Hosted macOS pools are often out of capacity. Try the arm64 and the Intel pool at the
+    # same time; whichever gets a machine builds and publishes the IPA.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -52,7 +57,7 @@ jobs:
         if: steps.ipa.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: Quillmark-ipa
+          name: Quillmark-ipa-${{ matrix.runner }}
           path: dist/Quillmark.ipa
 
       - name: Publish "latest" release
