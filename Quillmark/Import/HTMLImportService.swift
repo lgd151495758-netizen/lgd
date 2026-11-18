@@ -17,12 +17,13 @@ enum ImportError: LocalizedError {
     }
 }
 
-/// Copies the HTML (plus its resources) into a staging folder, converts it to PDF and
-/// creates a library document.
+/// Creates a live web document: local HTML is copied with its resources, a web address is
+/// saved as a `.webarchive`.
 @MainActor
 enum HTMLImportService {
-    static func importDocument(from source: ImportSource, layout: PageLayoutMode,
-                               into library: LibraryStore) async throws -> DocumentMeta {
+    static let archiveName = "page.webarchive"
+
+    static func importDocument(from source: ImportSource, into library: LibraryStore) async throws -> DocumentMeta {
         let fileManager = FileManager.default
         let staging = fileManager.temporaryDirectory.appendingPathComponent("import-\(UUID().uuidString)", isDirectory: true)
         let sourceFolder = staging.appendingPathComponent("source", isDirectory: true)
@@ -32,20 +33,17 @@ enum HTMLImportService {
         switch source {
         case .file(let url):
             let entry = try stageLocalHTML(url, into: sourceFolder)
-            let output = try await HTMLPDFConverter.convert(.file(entry, readAccess: sourceFolder), layout: layout)
-            let title = nonEmpty(output.title) ?? url.deletingPathExtension().lastPathComponent
-            return try library.createDocument(title: title, pdfData: output.pdfData, layout: layout,
-                                              sourceKind: .htmlFile, sourceURL: url.lastPathComponent,
-                                              stagedSource: sourceFolder)
+            let title = htmlTitle(of: entry) ?? url.deletingPathExtension().lastPathComponent
+            return try library.createDocument(title: title, pdfData: nil, layout: .live, sourceKind: .htmlFile,
+                                              sourceURL: url.lastPathComponent, stagedSource: sourceFolder,
+                                              sourceEntry: entry.lastPathComponent)
         case .web(let url):
-            let output = try await HTMLPDFConverter.convert(.web(url), layout: layout)
-            if let html = output.html {
-                try? html.write(to: sourceFolder.appendingPathComponent("index.html"), atomically: true, encoding: .utf8)
-            }
+            let output = try await WebArchiver.archive(url)
+            try output.archive.write(to: sourceFolder.appendingPathComponent(archiveName), options: .atomic)
             let title = nonEmpty(output.title) ?? url.host ?? "网页"
-            return try library.createDocument(title: title, pdfData: output.pdfData, layout: layout,
-                                              sourceKind: .webURL, sourceURL: url.absoluteString,
-                                              stagedSource: sourceFolder)
+            return try library.createDocument(title: title, pdfData: nil, layout: .live, sourceKind: .webURL,
+                                              sourceURL: url.absoluteString, stagedSource: sourceFolder,
+                                              sourceEntry: archiveName)
         }
     }
 
@@ -58,6 +56,27 @@ enum HTMLImportService {
               let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
               let host = url.host, !host.isEmpty else { return nil }
         return url
+    }
+
+    /// Reads `<title>` from an HTML file without loading it.
+    nonisolated static func htmlTitle(of file: URL) -> String? {
+        guard let data = try? Data(contentsOf: file, options: .mappedIfSafe) else { return nil }
+        let text = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
+        guard let open = text.range(of: "<title", options: .caseInsensitive),
+              let close = text.range(of: ">", range: open.upperBound..<text.endIndex),
+              let end = text.range(of: "</title>", options: .caseInsensitive, range: close.upperBound..<text.endIndex) else {
+            return nil
+        }
+        let raw = String(text[close.upperBound..<end.lowerBound])
+        let decoded = raw
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
+        return decoded.isEmpty ? nil : decoded
     }
 
     /// Copies a picked `.html` file (and a browser-saved `name_files` folder next to it) or a whole

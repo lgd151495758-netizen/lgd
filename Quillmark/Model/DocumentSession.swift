@@ -81,6 +81,18 @@ final class DocumentSession: ObservableObject {
         perform(.replace(page: page, before: before, after: after))
     }
 
+    /// Apple Pencil (2nd generation) double-tap, following the user's system preference.
+    func handlePencilDoubleTap(_ action: UIPencilPreferredAction) {
+        switch action {
+        case .ignore:
+            return
+        case .switchPrevious:
+            tool.switchToPrevious()
+        default:
+            tool.toggleEraser()
+        }
+    }
+
     func perform(_ command: Command) {
         execute(command)
         undoStack.append(command)

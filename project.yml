@@ -7,8 +7,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "1"
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "2"
     DEVELOPMENT_LANGUAGE: zh-Hans
 targets:
   Quillmark:
@@ -16,6 +16,10 @@ targets:
     platform: iOS
     sources:
       - path: Quillmark
+        excludes:
+          - "Web/*.js"
+      - path: Quillmark/Web/qm-runtime.js
+        buildPhase: resources
     settings:
       base:
         PRODUCT_NAME: Quillmark

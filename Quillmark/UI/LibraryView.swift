@@ -4,7 +4,6 @@ import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
-    @AppStorage("defaultLayout") private var layoutRaw: String = PageLayoutMode.pagedA4.rawValue
 
     @State private var path: [DocumentMeta] = []
     @State private var showFileImporter = false
@@ -13,7 +12,6 @@ struct LibraryView: View {
     @State private var isImporting = false
     @State private var errorMessage: String?
 
-    private var layout: PageLayoutMode { PageLayoutMode(rawValue: layoutRaw) ?? .pagedA4 }
     private let columns = [GridItem(.adaptive(minimum: 170, maximum: 230), spacing: 24)]
 
     var body: some View {
@@ -47,7 +45,7 @@ struct LibraryView: View {
                 }
             }
         } message: {
-            Text("页面模式：\(layout.displayName)")
+            Text("网页会保存到本地，可离线批注。")
         }
         .alert("导入失败", isPresented: errorBinding) {
             Button("好", role: .cancel) {}
@@ -68,7 +66,7 @@ struct LibraryView: View {
             ContentUnavailableView {
                 Label("还没有文档", systemImage: "doc.richtext")
             } description: {
-                Text("导入 HTML 文件或打开网址，像批注 PDF 一样在网页上书写。")
+                Text("导入 HTML 文件或打开网址，网页里的按钮照常可用，用 Apple Pencil 直接在上面书写。")
             } actions: {
                 Button("导入 HTML 文件") { showFileImporter = true }
                     .buttonStyle(.borderedProminent)
@@ -79,7 +77,8 @@ struct LibraryView: View {
                 LazyVGrid(columns: columns, spacing: 28) {
                     ForEach(library.documents) { meta in
                         NavigationLink(value: meta) {
-                            DocumentCard(meta: meta, pdfURL: library.pdfURL(for: meta.id))
+                            DocumentCard(meta: meta, pdfURL: library.pdfURL(for: meta.id),
+                                         thumbnailURL: library.thumbnailURL(for: meta.id))
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
@@ -109,14 +108,6 @@ struct LibraryView: View {
             } label: {
                 Label("打开网址…", systemImage: "globe")
             }
-            Section("页面模式") {
-                Picker("页面模式", selection: $layoutRaw) {
-                    ForEach(PageLayoutMode.allCases) { mode in
-                        Text(mode.displayName).tag(mode.rawValue)
-                    }
-                }
-                .pickerStyle(.inline)
-            }
         } label: {
             Label("导入", systemImage: "plus")
         }
@@ -129,11 +120,10 @@ struct LibraryView: View {
     private func startImport(_ source: ImportSource) {
         guard !isImporting else { return }
         isImporting = true
-        let layout = self.layout
         Task { @MainActor in
             defer { isImporting = false }
             do {
-                let meta = try await HTMLImportService.importDocument(from: source, layout: layout, into: library)
+                let meta = try await HTMLImportService.importDocument(from: source, into: library)
                 path.append(meta)
             } catch {
                 errorMessage = error.localizedDescription
@@ -145,6 +135,7 @@ struct LibraryView: View {
 private struct DocumentCard: View {
     let meta: DocumentMeta
     let pdfURL: URL
+    let thumbnailURL: URL
     @State private var thumbnail: UIImage?
 
     var body: some View {
@@ -175,7 +166,13 @@ private struct DocumentCard: View {
                 .foregroundStyle(.secondary)
         }
         .task(id: meta.modifiedAt) {
-            thumbnail = PDFDocument(url: pdfURL)?.page(at: 0)?.thumbnail(of: CGSize(width: 400, height: 540), for: .cropBox)
+            // Give the editor a moment to write the snapshot taken when it closes.
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            if let image = UIImage(contentsOfFile: thumbnailURL.path) {
+                thumbnail = image
+            } else {
+                thumbnail = PDFDocument(url: pdfURL)?.page(at: 0)?.thumbnail(of: CGSize(width: 400, height: 540), for: .cropBox)
+            }
         }
     }
 }
@@ -187,7 +184,7 @@ private struct ImportProgressView: View {
             VStack(spacing: 12) {
                 ProgressView()
                     .controlSize(.large)
-                Text("正在转换网页…")
+                Text("正在保存网页…")
                     .font(.callout)
             }
             .padding(28)

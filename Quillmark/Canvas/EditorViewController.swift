@@ -58,14 +58,7 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
 
     /// Apple Pencil (2nd generation) double-tap, following the user's system preference.
     fileprivate func handlePencilTap(_ action: UIPencilPreferredAction) {
-        switch action {
-        case .ignore:
-            return
-        case .switchPrevious:
-            session.tool.switchToPrevious()
-        default:
-            session.tool.toggleEraser()
-        }
+        session.handlePencilDoubleTap(action)
     }
 
     override func viewDidLayoutSubviews() {

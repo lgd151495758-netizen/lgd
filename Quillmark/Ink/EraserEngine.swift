@@ -106,8 +106,12 @@ enum EraserEngine {
         return runs
             .filter { $0.count >= 2 || ($0.first?.radius ?? 0) > 0.6 }
             .map { run in
-                InkStroke(id: UUID(), pen: stroke.pen, color: stroke.color, width: stroke.width,
-                          smoothing: stroke.smoothing, points: [], tool: stroke.tool, baked: run)
+                // Keep every attribute (colour, tool, web anchor…) of the original stroke.
+                var piece = stroke
+                piece.id = UUID()
+                piece.points = []
+                piece.baked = run
+                return piece
             }
     }
 

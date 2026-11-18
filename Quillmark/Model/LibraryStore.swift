@@ -2,6 +2,9 @@ import Foundation
 import PDFKit
 
 enum PageLayoutMode: String, Codable, CaseIterable, Identifiable {
+    /// Live web page annotated in place (current import mode).
+    case live
+    /// Legacy PDF conversions from version 0.1.
     case pagedA4
     case longPage
 
@@ -9,6 +12,7 @@ enum PageLayoutMode: String, Codable, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
+        case .live: return "网页"
         case .pagedA4: return "A4 分页"
         case .longPage: return "整张长页"
         }
@@ -28,6 +32,8 @@ struct DocumentMeta: Codable, Identifiable, Hashable {
     var layout: PageLayoutMode
     var sourceKind: SourceKind
     var sourceURL: String?
+    /// Entry file inside `source/` for live documents (`index.html`, `page.webarchive`…).
+    var sourceEntry: String?
 }
 
 /// Owns the on-disk library. Each document is a `<uuid>.qmark` folder:
@@ -65,6 +71,8 @@ final class LibraryStore: ObservableObject {
     func pdfURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("render.pdf") }
     func annotationsURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("annotations.json") }
     func metaURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("meta.json") }
+    func sourceFolder(for id: UUID) -> URL { folder(for: id).appendingPathComponent("source", isDirectory: true) }
+    func thumbnailURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("thumbnail.png") }
 
     func reload() {
         let items = (try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
@@ -79,19 +87,23 @@ final class LibraryStore: ObservableObject {
 
     @discardableResult
     func createDocument(title: String,
-                        pdfData: Data,
+                        pdfData: Data?,
                         layout: PageLayoutMode,
                         sourceKind: DocumentMeta.SourceKind,
                         sourceURL: String?,
-                        stagedSource: URL?) throws -> DocumentMeta {
+                        stagedSource: URL?,
+                        sourceEntry: String? = nil) throws -> DocumentMeta {
         let now = Date()
         let meta = DocumentMeta(id: UUID(), title: title, createdAt: now, modifiedAt: now,
-                                layout: layout, sourceKind: sourceKind, sourceURL: sourceURL)
+                                layout: layout, sourceKind: sourceKind, sourceURL: sourceURL,
+                                sourceEntry: sourceEntry)
         let folder = folder(for: meta.id)
         try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
-        try pdfData.write(to: pdfURL(for: meta.id), options: .atomic)
+        if let pdfData {
+            try pdfData.write(to: pdfURL(for: meta.id), options: .atomic)
+        }
         if let stagedSource, fileManager.fileExists(atPath: stagedSource.path) {
-            try? fileManager.moveItem(at: stagedSource, to: folder.appendingPathComponent("source", isDirectory: true))
+            try? fileManager.moveItem(at: stagedSource, to: sourceFolder(for: meta.id))
         }
         try writeMeta(meta)
         try Self.encoder.encode(DocumentAnnotations()).write(to: annotationsURL(for: meta.id), options: .atomic)

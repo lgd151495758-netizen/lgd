@@ -75,7 +75,7 @@ jobs:
           echo "Simulator: $UDID"
           xcodebuild test -project Quillmark.xcodeproj -scheme Quillmark \
             -destination "id=$UDID" -derivedDataPath build-tests \
-            CODE_SIGNING_ALLOWED=NO 2>&1 | tee test.log | grep -E "error:|Test Case .*(passed|failed)|Executed|TEST (SUCCEEDED|FAILED)" || true
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- DEVELOPMENT_TEAM= 2>&1 | tee test.log | grep -E "error:|Test Case .*(passed|failed)|Executed|TEST (SUCCEEDED|FAILED)" || true
           grep -q "TEST SUCCEEDED" test.log
 
       - name: Report test failures

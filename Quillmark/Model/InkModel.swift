@@ -96,6 +96,18 @@ enum InkTool: String, Codable {
     case highlighter
 }
 
+/// Where a stroke written on a live web page is attached. Points of an anchored stroke are
+/// relative to the top-left corner of the anchor element, in CSS pixels.
+struct WebAnchor: Codable, Equatable, Hashable {
+    /// CSS path from the nearest unique `id` (or `body`), e.g. `#main > p:nth-of-type(3)`.
+    var selector: String
+    /// First characters of the element's text, used to find it again if the path changed.
+    var fingerprint: String
+    var tag: String
+
+    static let body = WebAnchor(selector: "body", fingerprint: "", tag: "BODY")
+}
+
 struct InkStroke: Codable, Equatable, Identifiable {
     var id: UUID
     var pen: PenKind
@@ -110,8 +122,27 @@ struct InkStroke: Codable, Equatable, Identifiable {
     /// Already-processed centerline. Set for pieces left over by the precise eraser, which must
     /// keep their exact shape instead of being re-smoothed from raw points.
     var baked: [StrokeSample]?
+    /// Set for strokes on live web documents.
+    var anchor: WebAnchor?
 
     var isHighlighter: Bool { tool == .highlighter }
+
+    /// The same stroke moved by `offset` (used to switch between page and anchor coordinates).
+    func translated(by offset: CGPoint) -> InkStroke {
+        var copy = self
+        let dx = Float(offset.x)
+        let dy = Float(offset.y)
+        copy.points = points.map { p in
+            var q = p
+            q.x += dx
+            q.y += dy
+            return q
+        }
+        copy.baked = baked?.map { s in
+            StrokeSample(point: CGPoint(x: s.point.x + offset.x, y: s.point.y + offset.y), radius: s.radius)
+        }
+        return copy
+    }
 }
 
 struct PageAnnotations: Codable, Equatable {
