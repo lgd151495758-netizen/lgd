@@ -67,7 +67,8 @@ final class WebLiveTests: XCTestCase {
     }
 
     func testInkFollowsItsElementAndHidesWithIt() async throws {
-        let pick = try XCTUnwrap(await bridge.pickAnchor(at: CGPoint(x: 40, y: 130)))
+        let picked = await bridge.pickAnchor(at: CGPoint(x: 40, y: 130))
+        let pick = try XCTUnwrap(picked)
         XCTAssertEqual(pick.anchor.selector, "#note")
         XCTAssertEqual(pick.anchor.fingerprint, "Anchor paragraph text for testing")
         XCTAssertEqual(pick.origin.y, 120, accuracy: 1)
@@ -94,7 +95,8 @@ final class WebLiveTests: XCTestCase {
     }
 
     func testInkIsFoundAgainAfterReloadEvenIfThePageChanged() async throws {
-        let pick = try XCTUnwrap(await bridge.pickAnchor(at: CGPoint(x: 40, y: 188)))
+        let picked = await bridge.pickAnchor(at: CGPoint(x: 40, y: 188))
+        let pick = try XCTUnwrap(picked)
         XCTAssertEqual(pick.anchor.fingerprint, "Second plain paragraph is the target")
         XCTAssertTrue(pick.anchor.selector.hasSuffix("p:nth-of-type(2)"), pick.anchor.selector)
         let ink = stroke(at: CGPoint(x: 40, y: 188), anchoredTo: pick)
@@ -114,7 +116,8 @@ final class WebLiveTests: XCTestCase {
     }
 
     func testRemovingStrokesClearsThePage() async throws {
-        let pick = try XCTUnwrap(await bridge.pickAnchor(at: CGPoint(x: 40, y: 130)))
+        let picked = await bridge.pickAnchor(at: CGPoint(x: 40, y: 130))
+        let pick = try XCTUnwrap(picked)
         let a = stroke(at: CGPoint(x: 40, y: 130), anchoredTo: pick)
         let b = stroke(at: CGPoint(x: 40, y: 140), anchoredTo: pick)
         bridge.sync([a, b])
