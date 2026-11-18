@@ -14,15 +14,16 @@
 - 撤销 / 重做，自动保存；网页里指向其他页面的链接用 Safari 打开
 - 旧版本（v0.1）转换的 PDF 文档仍可打开批注
 
-## 编译（无需 Mac）
+## 编译（无需 Mac，使用 Codemagic）
 
-每次推送到 `main`，GitHub Actions 会在 macOS 构建机上：
+每次推送到 `main`，[Codemagic](https://codemagic.io) 会按 `codemagic.yaml`：
 
 1. 用 XcodeGen 根据 `project.yml` 生成工程
-2. 编译未签名的 `Quillmark.ipa`，发布到 Releases 的 **latest**
+2. 编译未签名的 `Quillmark.ipa`
 3. 在 iPad 模拟器上运行单元测试
+4. 把结果发到邮箱；IPA 在 Codemagic 构建页面的 **Artifacts** 里下载
 
-下载地址：<https://github.com/lgd151495758-netizen/lgd/releases/download/latest/Quillmark.ipa>
+（GitHub Actions 的 macOS 机器经常排不上，`.github/workflows/build.yml` 只保留手动运行。）
 
 ## 安装到 iPad（Windows）
 

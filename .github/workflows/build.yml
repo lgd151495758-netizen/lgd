@@ -1,9 +1,8 @@
 name: Build
 
+# Builds now run on Codemagic (codemagic.yaml): GitHub's hosted macOS machines were
+# repeatedly unavailable. This workflow is kept for manual runs only.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
