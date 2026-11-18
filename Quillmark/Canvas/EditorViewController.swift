@@ -66,6 +66,16 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
         applyInputMode(fingerDrawing: session.tool.fingerDrawing)
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        PresentationCenter.shared.setContentSource(view)
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        PresentationCenter.shared.clearContentSource(view)
+    }
+
     /// Fingers always scroll; Apple Pencil never scrolls. With finger drawing on, scrolling
     /// needs two fingers.
     private func applyInputMode(fingerDrawing: Bool) {

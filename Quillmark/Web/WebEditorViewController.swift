@@ -99,8 +99,14 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         applyGestureRules()
     }
 
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        PresentationCenter.shared.setContentSource(view)
+    }
+
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        PresentationCenter.shared.clearContentSource(view)
         saveThumbnail()
     }
 

@@ -3,6 +3,7 @@ import SwiftUI
 /// Floating editor toolbar: tool selector, options of the current tool, undo/redo, finger drawing.
 struct ToolbarView: View {
     @ObservedObject var session: DocumentSession
+    @ObservedObject private var presentation = PresentationCenter.shared
 
     private var tool: ToolSettings { session.tool }
 
@@ -45,6 +46,16 @@ struct ToolbarView: View {
                 }
                 .toggleStyle(.button)
                 .accessibilityLabel("手指书写")
+                if presentation.isExternalDisplayConnected {
+                    divider
+                    Toggle(isOn: $presentation.contentOnly) {
+                        Label("投屏仅内容", systemImage: "rectangle.on.rectangle")
+                            .labelStyle(.titleAndIcon)
+                            .font(.callout)
+                    }
+                    .toggleStyle(.button)
+                    .accessibilityHint("打开：投屏画面只显示文档内容，工具栏只在 iPad 上显示")
+                }
             }
             .font(.title3)
             .padding(.horizontal, 16)
