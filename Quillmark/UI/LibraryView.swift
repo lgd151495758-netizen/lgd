@@ -58,6 +58,17 @@ struct LibraryView: View {
         .onOpenURL { url in
             if url.isFileURL { startImport(.file(url)) }
         }
+        .onAppear {
+            if let url = library.pendingImportURL {
+                library.pendingImportURL = nil
+                startImport(.file(url))
+            }
+        }
+        .onChange(of: library.pendingImportURL) { _, url in
+            guard let url else { return }
+            library.pendingImportURL = nil
+            startImport(.file(url))
+        }
     }
 
     @ViewBuilder

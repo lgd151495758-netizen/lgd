@@ -39,7 +39,11 @@ struct DocumentMeta: Codable, Identifiable, Hashable {
 /// Owns the on-disk library. Each document is a `<uuid>.qmark` folder:
 /// `meta.json`, `render.pdf`, `annotations.json` and an optional `source/` copy of the HTML.
 final class LibraryStore: ObservableObject {
+    static let shared = LibraryStore()
+
     @Published private(set) var documents: [DocumentMeta] = []
+    /// File URL opened from the Files app (forwarded by `MainSceneDelegate`).
+    @Published var pendingImportURL: URL?
     let root: URL
 
     private let fileManager = FileManager.default

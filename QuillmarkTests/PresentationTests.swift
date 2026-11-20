@@ -1,4 +1,5 @@
 import CoreGraphics
+import UIKit
 import XCTest
 @testable import Quillmark
 
@@ -19,16 +20,45 @@ final class PresentationTests: XCTestCase {
         XCTAssertEqual(PresentationLayout.aspectFit(.zero, in: CGRect(x: 0, y: 0, width: 10, height: 10)), .zero)
     }
 
-    func testContentOnlyIsDefaultAndRemembered() throws {
+    func testFillWidthExpandsToFullDisplayWidth() {
+        let rect = PresentationLayout.frame(for: CGSize(width: 820, height: 1100),
+                                            in: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                                            mode: .fillWidth)
+        XCTAssertEqual(rect.width, 1920, accuracy: 0.01)
+        XCTAssertEqual(rect.minX, 0, accuracy: 0.01)
+        XCTAssertEqual(rect.minY, 0, accuracy: 0.01, "taller content starts at the top")
+        XCTAssertGreaterThan(rect.height, 1080)
+
+        let short = PresentationLayout.frame(for: CGSize(width: 1200, height: 400),
+                                             in: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+                                             mode: .fillWidth)
+        XCTAssertEqual(short.width, 1920, accuracy: 0.01)
+        XCTAssertEqual(short.midY, 540, accuracy: 0.01, "shorter content is vertically centered")
+    }
+
+    func testContentOnlyAndFillModeArePersisted() throws {
         let suite = "presentation-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
 
         let center = PresentationCenter(defaults: defaults)
-        XCTAssertTrue(center.contentOnly, "like Goodnotes, projection shows only the content by default")
+        XCTAssertTrue(center.contentOnly, "projection shows only content by default")
+        XCTAssertEqual(center.fillMode, .aspectFit)
         XCTAssertFalse(center.isExternalDisplayConnected)
         XCTAssertFalse(center.isShowingContentOnly)
+
         center.contentOnly = false
-        XCTAssertFalse(PresentationCenter(defaults: defaults).contentOnly)
+        center.fillMode = .fillWidth
+
+        let reloaded = PresentationCenter(defaults: defaults)
+        XCTAssertFalse(reloaded.contentOnly)
+        XCTAssertEqual(reloaded.fillMode, .fillWidth)
+    }
+
+    @MainActor
+    func testSceneAccessoryBridgeDoesNotCrash() {
+        let vc = UIViewController()
+        let token = SceneAccessoryBridge.registerExternalDisplay(on: vc)
+        SceneAccessoryBridge.unregister(token, from: vc)
     }
 }

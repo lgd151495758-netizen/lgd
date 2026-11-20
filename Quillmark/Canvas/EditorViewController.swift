@@ -68,12 +68,14 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        PresentationCenter.shared.setContentSource(view)
+        PresentationCenter.shared.registerSceneAccessory(on: self)
+        PresentationCenter.shared.setContentSource(self)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        PresentationCenter.shared.clearContentSource(view)
+        PresentationCenter.shared.clearContentSource(self)
+        PresentationCenter.shared.unregisterSceneAccessory(from: self)
     }
 
     /// Fingers always scroll; Apple Pencil never scrolls. With finger drawing on, scrolling
@@ -108,6 +110,26 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
         if overlays[overlay.pageIndex] === overlay {
             overlays[overlay.pageIndex] = nil
         }
+    }
+}
+
+extension EditorViewController: PresentationContentSource {
+    var presentationView: UIView { view }
+
+    func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void) {
+        let bounds = pdfView.bounds
+        guard bounds.width > 0, bounds.height > 0 else {
+            completion(nil, .zero)
+            return
+        }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = min(view.window?.screen.scale ?? 2, 2)
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
+        let image = renderer.image { _ in
+            pdfView.drawHierarchy(in: bounds, afterScreenUpdates: false)
+        }
+        completion(image, bounds.size)
     }
 }
 

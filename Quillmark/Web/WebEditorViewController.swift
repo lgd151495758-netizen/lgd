@@ -25,6 +25,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private var livePoints: [InkPoint] = []
     private var liveStartTime: TimeInterval = 0
     private var pendingEstimates: [NSNumber: Int] = [:]
+    private var activePendingLayer: CAShapeLayer?
+    private var activePendingIsHighlighter = false
 
     // Erasing state
     private var eraseOriginal: [InkStroke]?
@@ -101,12 +103,14 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        PresentationCenter.shared.setContentSource(view)
+        PresentationCenter.shared.registerSceneAccessory(on: self)
+        PresentationCenter.shared.setContentSource(self)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        PresentationCenter.shared.clearContentSource(view)
+        PresentationCenter.shared.clearContentSource(self)
+        PresentationCenter.shared.unregisterSceneAccessory(from: self)
         saveThumbnail()
     }
 
@@ -336,6 +340,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         CATransaction.setDisableActions(true)
         liveLayer.path = path
         CATransaction.commit()
+        pushPresentationOverlay()
     }
 
     private func commitLiveStroke() {
@@ -344,6 +349,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             return
         }
         let stroke = makeStroke(points: livePoints)
+        let isHighlighter = liveTool.kind == .highlighter
         livePoints.removeAll(keepingCapacity: true)
         pendingEstimates.removeAll()
 
@@ -355,6 +361,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         pending.opacity = liveLayer.opacity
         pending.compositingFilter = liveLayer.compositingFilter
         view.layer.insertSublayer(pending, below: liveLayer)
+        activePendingLayer = pending
+        activePendingIsHighlighter = isHighlighter
         setLivePath(nil)
 
         let box = stroke.outlinePath().boundingBox
@@ -365,8 +373,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             var anchored = stroke.translated(by: CGPoint(x: -(pick?.origin.x ?? 0), y: -(pick?.origin.y ?? 0)))
             anchored.anchor = pick?.anchor ?? .body
             self.session.addStroke(anchored, page: Self.page)
-            try? await Task.sleep(nanoseconds: 80_000_000)
+            try? await Task.sleep(nanoseconds: 120_000_000)
             pending.removeFromSuperlayer()
+            if self.activePendingLayer === pending {
+                self.activePendingLayer = nil
+                self.pushPresentationOverlay()
+            }
+            PresentationCenter.shared.requestFrameRefresh()
         }
     }
 
@@ -433,6 +446,43 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             eraserCursor.isHidden = true
         }
         CATransaction.commit()
+        pushPresentationOverlay()
+    }
+
+    private func pushPresentationOverlay() {
+        guard PresentationCenter.shared.isShowingContentOnly else { return }
+        let state = LiveOverlayState(
+            sourceSize: view.bounds.size,
+            strokePath: liveLayer.path,
+            strokeColor: liveLayer.fillColor,
+            strokeOpacity: liveLayer.opacity,
+            isHighlighter: liveTool.kind == .highlighter,
+            pendingPath: activePendingLayer?.path,
+            pendingColor: activePendingLayer?.fillColor,
+            pendingOpacity: activePendingLayer?.opacity ?? 1,
+            pendingIsHighlighter: activePendingIsHighlighter,
+            cursorPath: eraserCursor.isHidden ? nil : eraserCursor.path
+        )
+        PresentationCenter.shared.updateLiveOverlay(state)
+    }
+}
+
+extension WebEditorViewController: PresentationContentSource {
+    var presentationView: UIView { view }
+
+    func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void) {
+        let bounds = webView.bounds
+        guard bounds.width > 0, bounds.height > 0 else {
+            completion(nil, .zero)
+            return
+        }
+        let configuration = WKSnapshotConfiguration()
+        configuration.rect = bounds
+        configuration.snapshotWidth = NSNumber(value: min(Double(bounds.width), 960.0))
+        configuration.afterScreenUpdates = false
+        webView.takeSnapshot(with: configuration) { image, _ in
+            completion(image, bounds.size)
+        }
     }
 }
 
