@@ -30,9 +30,6 @@ struct ToolbarView: View {
                     session.tool.select(.eraser)
                 }
                 divider
-                toolButton(title: "直尺", symbol: "ruler", selected: session.geometryAid == .ruler) {
-                    session.toggleGeometryAid(.ruler)
-                }
                 toolButton(title: "圆规", symbol: "compass.drawing", selected: session.geometryAid == .compass) {
                     session.toggleGeometryAid(.compass)
                 }

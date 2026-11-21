@@ -12,9 +12,9 @@ enum RecognizedShape: Equatable {
     func adjusted(to dragPoint: CGPoint, initialAnchor: CGPoint) -> RecognizedShape {
         switch self {
         case let .line(start, _):
-            return .line(start: start, end: ShapeRecognizer.snapAngle(from: start, to: dragPoint, stepDegrees: 45, toleranceDegrees: 5))
+            return .line(start: start, end: ShapeRecognizer.snapAngle(from: start, to: dragPoint, stepDegrees: 90, toleranceDegrees: 1.2))
         case let .arrow(start, _):
-            return .arrow(start: start, end: ShapeRecognizer.snapAngle(from: start, to: dragPoint, stepDegrees: 45, toleranceDegrees: 5))
+            return .arrow(start: start, end: ShapeRecognizer.snapAngle(from: start, to: dragPoint, stepDegrees: 90, toleranceDegrees: 1.2))
         case let .ellipse(center, rx, ry, rotation):
             let base = max(12, hypot(initialAnchor.x - center.x, initialAnchor.y - center.y))
             let current = max(8, hypot(dragPoint.x - center.x, dragPoint.y - center.y))
@@ -111,7 +111,7 @@ enum ShapeRecognizer {
         if direct >= 18 {
             let maxDev = maxDistanceToSegment(points, a: first, b: last)
             if maxDev <= max(6, length * 0.065), length <= direct * 1.18 {
-                let snapped = snapAngle(from: first, to: last, stepDegrees: 45, toleranceDegrees: 6)
+                let snapped = snapAngle(from: first, to: last, stepDegrees: 90, toleranceDegrees: 2.0)
                 return .line(start: first, end: snapped)
             }
         }
@@ -120,7 +120,7 @@ enum ShapeRecognizer {
         if direct >= 22 {
             let maxDev = maxDistanceToSegment(points, a: first, b: last)
             if maxDev <= max(12, length * 0.13), length <= direct * 1.28 {
-                let snapped = snapAngle(from: first, to: last, stepDegrees: 45, toleranceDegrees: 6)
+                let snapped = snapAngle(from: first, to: last, stepDegrees: 90, toleranceDegrees: 2.0)
                 return .line(start: first, end: snapped)
             }
         }
@@ -165,7 +165,7 @@ enum ShapeRecognizer {
         let perp = abs(bx * (-shaftDir.y) + by * shaftDir.x)
         guard dot < -0.30, perp >= 4 else { return nil }
 
-        let snapped = snapAngle(from: first, to: tip, stepDegrees: 45, toleranceDegrees: 6)
+        let snapped = snapAngle(from: first, to: tip, stepDegrees: 90, toleranceDegrees: 2.0)
         return .arrow(start: first, end: snapped)
     }
 

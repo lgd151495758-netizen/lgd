@@ -1,6 +1,6 @@
 import UIKit
 
-/// Renders the virtual Ruler, virtual Compass, and magnetic snap indicators on the iPad screen.
+/// Renders the virtual Compass and magnetic snap indicators on the iPad screen.
 /// Lives as a sibling above `WKWebView` (never inside the web view and never mirrored in
 /// `LiveOverlayState`), so students on the external display only see the crisp drawn lines/arcs.
 final class GeometryToolOverlayView: UIView {
@@ -10,14 +10,7 @@ final class GeometryToolOverlayView: UIView {
             setNeedsDisplay()
         }
     }
-    var ruler = RulerState() {
-        didSet { setNeedsDisplay() }
-    }
     var compass = CompassState() {
-        didSet { setNeedsDisplay() }
-    }
-    /// Highlighted edge while drawing with the ruler (`-1` top, `+1` bottom, `0` none).
-    var activeRulerDrawEdge: CGFloat = 0 {
         didSet { setNeedsDisplay() }
     }
     /// Active sweep readout while drawing an arc with the compass.
@@ -82,13 +75,6 @@ final class GeometryToolOverlayView: UIView {
         switch aid {
         case .none:
             return false
-        case .ruler:
-            switch ruler.hitTest(point) {
-            case .body, .leftRotate, .rightRotate, .angleBadge:
-                return true
-            case .none, .drawTopEdge, .drawBottomEdge:
-                return false
-            }
         case .compass:
             switch compass.hitTest(point, in: bounds) {
             case .needle, .resizeHandle, .lockButton, .centerMarkButton, .fullCircleButton:
@@ -122,119 +108,12 @@ final class GeometryToolOverlayView: UIView {
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
-        switch aid {
-        case .none:
-            break
-        case .ruler:
-            drawRuler(in: ctx)
-        case .compass:
+        if aid == .compass {
             drawCompass(in: ctx)
         }
         if let snap = activeSnapPoint {
             drawSnapIndicator(at: snap, kind: activeSnapKind, in: ctx)
         }
-    }
-
-    private func drawRuler(in ctx: CGContext) {
-        let halfL = ruler.halfLength
-        let halfW = ruler.halfWidth
-        let bodyRect = CGRect(x: -halfL, y: -halfW, width: halfL * 2, height: halfW * 2)
-
-        ctx.saveGState()
-        ctx.translateBy(x: ruler.center.x, y: ruler.center.y)
-        ctx.rotate(by: ruler.angle)
-
-        // Frosted ruler body with subtle drop shadow so geometry underneath stays readable.
-        ctx.saveGState()
-        ctx.setShadow(offset: CGSize(width: 0, height: 3), blur: 10,
-                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
-        let bodyPath = UIBezierPath(roundedRect: bodyRect, cornerRadius: 7)
-        UIColor.systemBackground.withAlphaComponent(0.86).setFill()
-        bodyPath.fill()
-        ctx.restoreGState()
-
-        // Outer border
-        UIColor.label.withAlphaComponent(0.28).setStroke()
-        let border = UIBezierPath(roundedRect: bodyRect, cornerRadius: 7)
-        border.lineWidth = 1.1
-        border.stroke()
-
-        // Highlight active drawing edge in accent blue
-        if activeRulerDrawEdge != 0 {
-            let y = activeRulerDrawEdge * halfW
-            ctx.setStrokeColor(UIColor.systemBlue.cgColor)
-            ctx.setLineWidth(2.5)
-            ctx.move(to: CGPoint(x: -halfL + 4, y: y))
-            ctx.addLine(to: CGPoint(x: halfL - 4, y: y))
-            ctx.strokePath()
-        }
-
-        // Tick marks along top and bottom edges (every 10pt minor, 25pt mid, 50pt major)
-        ctx.setStrokeColor(UIColor.label.withAlphaComponent(0.45).cgColor)
-        var x = -halfL + 10
-        while x <= halfL - 10 {
-            let dist = Int(round(abs(x)))
-            let tickLen: CGFloat = (dist % 50 == 0) ? 12 : ((dist % 25 == 0) ? 8.5 : 5)
-            ctx.setLineWidth(dist % 50 == 0 ? 1.2 : 0.8)
-            // Top edge ticks
-            ctx.move(to: CGPoint(x: x, y: -halfW))
-            ctx.addLine(to: CGPoint(x: x, y: -halfW + tickLen))
-            // Bottom edge ticks
-            ctx.move(to: CGPoint(x: x, y: halfW))
-            ctx.addLine(to: CGPoint(x: x, y: halfW - tickLen))
-            x += 10
-        }
-        ctx.strokePath()
-
-        // Top-edge pivot alignment marks directly above the left & right rotate knobs
-        for pivotX in [-ruler.pivotOffset, ruler.pivotOffset] {
-            ctx.setFillColor(UIColor.systemBlue.cgColor)
-            ctx.fillEllipse(in: CGRect(x: pivotX - 3.5, y: -halfW - 3.5, width: 7, height: 7))
-            ctx.setStrokeColor(UIColor.white.cgColor)
-            ctx.setLineWidth(1.2)
-            ctx.strokeEllipse(in: CGRect(x: pivotX - 3.5, y: -halfW - 3.5, width: 7, height: 7))
-        }
-
-        // Subtle drag grip lines in the body
-        ctx.setStrokeColor(UIColor.secondaryLabel.withAlphaComponent(0.35).cgColor)
-        ctx.setLineWidth(1.3)
-        for gx in [-76.0, 76.0] as [CGFloat] {
-            for dy in [-5.0, 0.0, 5.0] as [CGFloat] {
-                ctx.move(to: CGPoint(x: gx - 10, y: dy))
-                ctx.addLine(to: CGPoint(x: gx + 10, y: dy))
-            }
-        }
-        ctx.strokePath()
-
-        // Left & right one-handed rotate handles (↻)
-        drawRotateKnob(at: CGPoint(x: -ruler.pivotOffset, y: 0), in: ctx)
-        drawRotateKnob(at: CGPoint(x: ruler.pivotOffset, y: 0), in: ctx)
-
-        // Central angle badge (tappable to cycle 0° / 90° / 45°)
-        let badgeRect = CGRect(x: -28, y: -12, width: 56, height: 24)
-        let badgePath = UIBezierPath(roundedRect: badgeRect, cornerRadius: 12)
-        UIColor.systemBlue.withAlphaComponent(0.14).setFill()
-        badgePath.fill()
-        UIColor.systemBlue.withAlphaComponent(0.45).setStroke()
-        badgePath.lineWidth = 1
-        badgePath.stroke()
-
-        let degText = "\(ruler.displayDegrees)°"
-        drawCenteredText(degText, in: badgeRect, font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
-                         color: .systemBlue)
-
-        ctx.restoreGState()
-    }
-
-    private func drawRotateKnob(at center: CGPoint, in ctx: CGContext) {
-        let r: CGFloat = 16
-        let rect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
-        UIColor.systemBlue.withAlphaComponent(0.14).setFill()
-        ctx.fillEllipse(in: rect)
-        UIColor.systemBlue.withAlphaComponent(0.75).setStroke()
-        ctx.setLineWidth(1.5)
-        ctx.strokeEllipse(in: rect)
-        drawCenteredText("↻", in: rect, font: .systemFont(ofSize: 15, weight: .semibold), color: .systemBlue)
     }
 
     private func drawCompass(in ctx: CGContext) {

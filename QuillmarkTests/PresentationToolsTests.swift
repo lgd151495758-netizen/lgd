@@ -32,16 +32,53 @@ final class PresentationToolsTests: XCTestCase {
 
     // MARK: ShapeRecognizer (Draw & Hold)
 
-    func testRecognizesStraightLineAndSnapsNearHorizontal() {
-        // 3 degrees off horizontal -> snaps to exact horizontal.
-        let endY = 100 + 200 * tan(3 * CGFloat.pi / 180)
-        let pts = polylinePoints([CGPoint(x: 20, y: 100), CGPoint(x: 220, y: endY)])
-        guard case let .line(start, end) = ShapeRecognizer.recognize(pts) else {
+    func testRecognizesStraightLineWithFineHorizontalVerticalSnapOnly() {
+        // 1.5° off horizontal -> snaps cleanly to 0°.
+        let nearFlatY = 100 + 200 * tan(1.5 * CGFloat.pi / 180)
+        let nearFlat = polylinePoints([CGPoint(x: 20, y: 100), CGPoint(x: 220, y: nearFlatY)])
+        guard case let .line(start, end) = ShapeRecognizer.recognize(nearFlat) else {
             return XCTFail("Expected straight line")
         }
         XCTAssertEqual(start.x, 20, accuracy: 0.5)
         XCTAssertEqual(start.y, 100, accuracy: 0.5)
-        XCTAssertEqual(end.y, 100, accuracy: 0.5, "should snap 3° line to horizontal")
+        XCTAssertEqual(end.y, 100, accuracy: 0.5, "1.5° line should snap to horizontal")
+
+        // 3.5° off horizontal -> must NOT be pulled flat to 0° (fine control).
+        let slightSlopeY = 100 + 200 * tan(3.5 * CGFloat.pi / 180)
+        let slightSlope = polylinePoints([CGPoint(x: 20, y: 100), CGPoint(x: 220, y: slightSlopeY)])
+        guard case let .line(_, slopeEnd) = ShapeRecognizer.recognize(slightSlope) else {
+            return XCTFail("Expected slightly sloped line")
+        }
+        XCTAssertEqual(slopeEnd.y, slightSlopeY, accuracy: 0.5, "3.5° line must preserve its slope")
+
+        // Live drag adjustment at 2.0° off horizontal must stay free (tolerance is 1.2°);
+        // at 0.8° off horizontal it snaps cleanly to 0°.
+        let base = RecognizedShape.line(start: CGPoint(x: 0, y: 100), end: CGPoint(x: 200, y: 100))
+        let drag2deg = CGPoint(x: 200, y: 100 + 200 * tan(2.0 * CGFloat.pi / 180))
+        if case let .line(_, adj2) = base.adjusted(to: drag2deg, initialAnchor: CGPoint(x: 200, y: 100)) {
+            XCTAssertEqual(adj2.y, drag2deg.y, accuracy: 0.1, "2° live drag must not stick to 0°")
+        } else {
+            XCTFail("Expected adjusted line")
+        }
+        let drag44deg = CGPoint(x: 200 * cos(44 * CGFloat.pi / 180), y: 100 + 200 * sin(44 * CGFloat.pi / 180))
+        if case let .line(_, adj44) = base.adjusted(to: drag44deg, initialAnchor: CGPoint(x: 200, y: 100)) {
+            XCTAssertEqual(adj44.x, drag44deg.x, accuracy: 0.1, "44° must not snap to 45°")
+            XCTAssertEqual(adj44.y, drag44deg.y, accuracy: 0.1)
+        } else {
+            XCTFail("Expected adjusted line")
+        }
+        let drag08deg = CGPoint(x: 200, y: 100 + 200 * tan(0.8 * CGFloat.pi / 180))
+        if case let .line(_, adj08) = base.adjusted(to: drag08deg, initialAnchor: CGPoint(x: 200, y: 100)) {
+            XCTAssertEqual(adj08.y, 100, accuracy: 0.01, "0.8° live drag should snap to 0°")
+        } else {
+            XCTFail("Expected adjusted line")
+        }
+        let drag89deg = CGPoint(x: 200 * cos(89.2 * CGFloat.pi / 180), y: 100 + 200 * sin(89.2 * CGFloat.pi / 180))
+        if case let .line(_, adj89) = base.adjusted(to: drag89deg, initialAnchor: CGPoint(x: 200, y: 100)) {
+            XCTAssertEqual(adj89.x, 0, accuracy: 0.01, "89.2° live drag should snap to 90°")
+        } else {
+            XCTFail("Expected adjusted line")
+        }
     }
 
     func testRecognizesShortAndLongArrows() {

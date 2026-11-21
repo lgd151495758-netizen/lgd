@@ -102,57 +102,6 @@ final class GeometryConstructionTests: XCTestCase {
         XCTAssertEqual(cross?.y ?? 0, 60, accuracy: 0.01)
     }
 
-    // MARK: One-Handed Virtual Ruler
-
-    func testRulerHitZonesProjectionAndPivotRotation() {
-        var ruler = RulerState(center: CGPoint(x: 300, y: 200), angle: 0, halfLength: 240, halfWidth: 32, pivotOffset: 190)
-
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 300, y: 200)), .angleBadge)
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 220, y: 200)), .body)
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 110, y: 200)), .leftRotate)
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 490, y: 200)), .rightRotate)
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 300, y: 162)), .drawTopEdge)
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 300, y: 238)), .drawBottomEdge)
-        XCTAssertEqual(ruler.hitTest(CGPoint(x: 300, y: 50)), .none)
-
-        // Edge projection keeps points strictly on top edge (y = 200 - 32 = 168).
-        let projected = ruler.projectToEdge(CGPoint(x: 275, y: 155), edge: -1, penRadius: 0)
-        XCTAssertEqual(projected.x, 275, accuracy: 0.01)
-        XCTAssertEqual(projected.y, 168, accuracy: 0.01)
-
-        // Translate snaps topLeftPivot onto point A=(120, 165).
-        let pointA = CGPoint(x: 120, y: 165)
-        let pointB = CGPoint(x: 320, y: 365) // 45° down-right from A
-        let snaps = [SnapPoint(point: pointA, kind: .endpoint), SnapPoint(point: pointB, kind: .intersection)]
-        let snappedA = ruler.translate(toCenter: CGPoint(x: 308, y: 199), snapPoints: snaps)
-        XCTAssertEqual(snappedA?.point, pointA)
-        XCTAssertEqual(ruler.topLeftPivot.x, pointA.x, accuracy: 0.01)
-        XCTAssertEqual(ruler.topLeftPivot.y, pointA.y, accuracy: 0.01)
-
-        // Initial rotate offset produces zero jump at touchdown.
-        let fixedPivot = ruler.topLeftPivot
-        let rightKnob = ruler.rightRotateCenter
-        let offset = ruler.initialRotateAngleOffset(for: .right, fixedPivot: fixedPivot, pointer: rightKnob)
-        ruler.rotate(dragging: .right, fixedPivot: fixedPivot, pointer: rightKnob, angleOffset: offset, snapPoints: [])
-        XCTAssertEqual(ruler.angle, 0, accuracy: 0.01)
-
-        // Swinging right knob near point B keeps topLeftPivot pinned at A and aligns top edge through B!
-        let snappedB = ruler.rotate(dragging: .right, fixedPivot: fixedPivot,
-                                    pointer: CGPoint(x: pointB.x + 2, y: pointB.y - 2),
-                                    angleOffset: offset, snapPoints: snaps)
-        XCTAssertEqual(snappedB?.point, pointB)
-        XCTAssertEqual(ruler.topLeftPivot.x, pointA.x, accuracy: 0.01)
-        XCTAssertEqual(ruler.topLeftPivot.y, pointA.y, accuracy: 0.01)
-        XCTAssertEqual(ruler.angle, .pi / 4, accuracy: 0.01)
-
-        // Quick angle cycling
-        ruler.angle = 0
-        ruler.cycleQuickAngle()
-        XCTAssertEqual(ruler.displayDegrees, 90)
-        ruler.cycleQuickAngle()
-        XCTAssertEqual(ruler.displayDegrees, 45)
-    }
-
     // MARK: One-Handed Virtual Compass & Sweep
 
     func testCompassSnapResizeLockAndSweep() {
@@ -216,12 +165,12 @@ final class GeometryConstructionTests: XCTestCase {
         XCTAssertEqual(radius, 150, accuracy: 0.01)
     }
 
-    func testOverlayPassesThroughNonControlPointsAndSessionTogglesAids() throws {
+    func testOverlayPassesThroughNonControlPointsAndSessionTogglesCompass() throws {
         let overlay = GeometryToolOverlayView(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
-        overlay.ruler = RulerState(center: CGPoint(x: 500, y: 400), angle: 0)
-        overlay.aid = .ruler
-        XCTAssertTrue(overlay.point(inside: CGPoint(x: 500, y: 400), with: nil))
-        XCTAssertFalse(overlay.point(inside: CGPoint(x: 500, y: 360), with: nil), "draw edge passes finger scrolling through")
+        overlay.compass = CompassState(center: CGPoint(x: 500, y: 400), radius: 100, armAngle: 0)
+        overlay.aid = .compass
+        XCTAssertTrue(overlay.point(inside: CGPoint(x: 500, y: 400), with: nil), "needle handle intercepts")
+        XCTAssertFalse(overlay.point(inside: CGPoint(x: 600, y: 400), with: nil), "draw circle passes finger scrolling through")
         XCTAssertFalse(overlay.point(inside: CGPoint(x: 50, y: 50), with: nil))
 
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aid-\(UUID().uuidString)", isDirectory: true)
@@ -234,9 +183,7 @@ final class GeometryConstructionTests: XCTestCase {
         session.toggleGeometryAid(.compass)
         XCTAssertEqual(session.geometryAid, .compass)
         XCTAssertEqual(session.tool.kind, .pen, "enabling compass switches away from eraser to pen")
-        session.toggleGeometryAid(.ruler)
-        XCTAssertEqual(session.geometryAid, .ruler)
-        session.toggleGeometryAid(.ruler)
+        session.toggleGeometryAid(.compass)
         XCTAssertEqual(session.geometryAid, .none)
     }
 }
