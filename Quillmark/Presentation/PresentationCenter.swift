@@ -4,6 +4,8 @@ import UIKit
 /// Provides frames of the active document area (strictly below the toolbar) for projection.
 protocol PresentationContentSource: AnyObject {
     var presentationView: UIView { get }
+    /// Called when the external display connects, disconnects, resizes, or changes fill mode.
+    func presentationViewportDidChange()
     /// Captures the visible document content asynchronously on the main thread.
     func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void)
 }
@@ -11,7 +13,10 @@ protocol PresentationContentSource: AnyObject {
 /// Real-time vector ink state mirrored directly onto the external display at 60 fps while drawing
 /// or erasing, so strokes appear immediately on the external screen without waiting for a snapshot.
 struct LiveOverlayState {
+    /// Size of the captured rectangle (matches the image passed to `PresentationViewController`).
     var sourceSize: CGSize = .zero
+    /// Vertical offset of the captured rectangle inside the editor view (`0` in most cases).
+    var captureOriginY: CGFloat = 0
     var strokePath: CGPath?
     var strokeColor: CGColor?
     var strokeOpacity: Float = 1
@@ -26,34 +31,94 @@ struct LiveOverlayState {
 }
 
 enum PresentationFillMode: String, Codable, CaseIterable, Identifiable {
-    /// Fits the entire content area inside the external display without cropping.
+    /// Matches the external screen's exact aspect ratio by adjusting the captured page height
+    /// (extending downward on taller displays like 16:10 / 3:2 / 4:3, or slicing vertically on
+    /// wider 16:9 displays) — fills all four edges with no black bars and no distortion.
+    case fillScreen
+    /// Shows the exact iPad content area centered on the external screen (letterboxed if needed).
     case aspectFit
-    /// Fills the full width of the external display (larger text on 16:9 projectors/monitors).
-    case fillWidth
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
+        case .fillScreen: return "全屏无黑边"
         case .aspectFit: return "适应屏幕"
-        case .fillWidth: return "填满宽度"
+        }
+    }
+}
+
+/// Geometry that adapts the editor's scrollable viewport to fill any external monitor aspect ratio.
+struct PresentationViewport: Equatable {
+    /// Height to give the scrollable content view (`>= visibleSize.height`).
+    var contentHeight: CGFloat
+    /// Extra height extending past the bottom of the iPad editor view (added to `contentInset.bottom`).
+    var extraBottomInset: CGFloat
+    /// Sub-rect of the content view to snapshot for the external display.
+    var captureRect: CGRect
+
+    static func compute(visibleSize: CGSize,
+                        externalSize: CGSize?,
+                        fillMode: PresentationFillMode,
+                        focusY: CGFloat? = nil,
+                        currentOriginY: CGFloat = 0) -> PresentationViewport {
+        let w = visibleSize.width
+        let h = visibleSize.height
+        guard w > 0, h > 0 else {
+            return PresentationViewport(contentHeight: 0, extraBottomInset: 0, captureRect: .zero)
+        }
+        guard fillMode == .fillScreen,
+              let externalSize, externalSize.width > 0, externalSize.height > 0 else {
+            return PresentationViewport(contentHeight: h, extraBottomInset: 0,
+                                        captureRect: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+
+        let externalAspect = externalSize.width / externalSize.height
+        let desiredHeight = w / externalAspect
+
+        if desiredHeight >= h {
+            // External display is taller/squarer than the iPad content strip (e.g. 16:10, 3:2,
+            // 1.44 AirPlay, 4:3 projector). Extend the scrollable view downward so the snapshot
+            // includes the extra lines below and fills the external screen edge-to-edge.
+            let maxHeight = max(h, w * 1.6)
+            let targetHeight = min(ceil(desiredHeight), maxHeight)
+            return PresentationViewport(contentHeight: targetHeight,
+                                        extraBottomInset: max(0, targetHeight - h),
+                                        captureRect: CGRect(x: 0, y: 0, width: w, height: targetHeight))
+        } else {
+            // External display is wider than the iPad content strip (e.g. 16:9 monitor, or iPad
+            // in portrait projecting to a landscape screen). Capture a full-width slice matching
+            // the external aspect ratio and keep the active pen position inside it.
+            let captureHeight = max(1, min(h, floor(desiredHeight)))
+            let maxOriginY = max(0, h - captureHeight)
+            var originY = min(max(0, currentOriginY), maxOriginY)
+            if let focusY {
+                let margin = min(48, captureHeight * 0.15)
+                if focusY < originY + margin {
+                    originY = max(0, focusY - margin)
+                } else if focusY > originY + captureHeight - margin {
+                    originY = min(maxOriginY, focusY - captureHeight + margin)
+                }
+            }
+            return PresentationViewport(contentHeight: h,
+                                        extraBottomInset: 0,
+                                        captureRect: CGRect(x: 0, y: originY, width: w, height: captureHeight))
         }
     }
 }
 
 enum PresentationLayout {
-    /// Target frame in `bounds` for a content view of `size`.
+    /// Target frame in `bounds` for a captured image of `size`.
     static func frame(for size: CGSize, in bounds: CGRect, mode: PresentationFillMode) -> CGRect {
         guard size.width > 0, size.height > 0, bounds.width > 0, bounds.height > 0 else { return .zero }
-        switch mode {
-        case .aspectFit:
-            return aspectFit(size, in: bounds)
-        case .fillWidth:
-            let scale = bounds.width / size.width
-            let height = size.height * scale
-            let y = height <= bounds.height ? bounds.midY - height / 2 : bounds.minY
-            return CGRect(x: bounds.minX, y: y, width: bounds.width, height: height)
+        let fitted = aspectFit(size, in: bounds)
+        if mode == .fillScreen,
+           abs(fitted.width - bounds.width) <= 3,
+           abs(fitted.height - bounds.height) <= 3 {
+            // Eliminate 1–2 px rounding seams when the captured rect already matches the screen aspect.
+            return bounds
         }
+        return fitted
     }
 
     /// Largest rect with the aspect ratio of `size` centered in `bounds`.
@@ -106,10 +171,6 @@ enum SceneAccessoryBridge {
 }
 
 /// Manages AirPlay / cable external display presentation ("投屏仅显示内容").
-/// Supports:
-/// 1. Standard iPadOS 16+ `UIWindowSceneSessionRoleExternalDisplayNonInteractive` scene lifecycle.
-/// 2. iPadOS 27+ `UISceneAccessory` runtime registration.
-/// 3. Connected-scene / `UIScreen.screens` fallback scanning when AirPlay connects before launch.
 final class PresentationCenter: ObservableObject {
     static let shared = PresentationCenter()
 
@@ -128,6 +189,7 @@ final class PresentationCenter: ObservableObject {
     @Published var contentOnly: Bool {
         didSet {
             defaults.set(contentOnly, forKey: Self.contentOnlyKey)
+            notifyViewportChanged()
             updateOverlayVisibility()
             requestFrameRefresh()
         }
@@ -137,13 +199,14 @@ final class PresentationCenter: ObservableObject {
         didSet {
             defaults.set(fillMode.rawValue, forKey: Self.fillModeKey)
             presenter?.fillMode = fillMode
+            notifyViewportChanged()
             requestFrameRefresh()
         }
     }
 
     static let framesPerSecond: Float = 24
     private static let contentOnlyKey = "presentation.contentOnly"
-    private static let fillModeKey = "presentation.fillMode"
+    private static let fillModeKey = "presentation.fillMode.v2"
 
     private let defaults: UserDefaults
     private var externalWindow: UIWindow?
@@ -153,8 +216,6 @@ final class PresentationCenter: ObservableObject {
     private var attachmentKind: AttachmentKind = .none
 
     private weak var contentSource: PresentationContentSource?
-    private var lastContentImage: UIImage?
-    private var lastContentSize: CGSize = .zero
     private var liveOverlay: LiveOverlayState = .empty
 
     private var accessoryTokens: [ObjectIdentifier: (host: WeakViewController, token: AnyObject)] = [:]
@@ -171,7 +232,7 @@ final class PresentationCenter: ObservableObject {
         if let raw = defaults.string(forKey: Self.fillModeKey), let saved = PresentationFillMode(rawValue: raw) {
             fillMode = saved
         } else {
-            fillMode = .aspectFit
+            fillMode = .fillScreen
         }
     }
 
@@ -187,6 +248,27 @@ final class PresentationCenter: ObservableObject {
         isExternalDisplayConnected && contentOnly && contentSource?.presentationView.window != nil
     }
 
+    /// Current logical size of the external display canvas (points), or `nil` when disconnected.
+    var externalDisplaySize: CGSize? {
+        guard isExternalDisplayConnected else { return nil }
+        if let bounds = presenter?.view.bounds, bounds.width > 0, bounds.height > 0 {
+            return bounds.size
+        }
+        if let bounds = externalScreen?.bounds, bounds.width > 0, bounds.height > 0 {
+            return bounds.size
+        }
+        return nil
+    }
+
+    /// Target width in points for `WKSnapshotConfiguration.snapshotWidth` so snapshots stay sharp
+    /// at the external monitor's resolution without oversampling.
+    var preferredSnapshotMaxWidthPoints: Double {
+        guard let screen = externalScreen else { return 960 }
+        let extPixelWidth = Double(screen.bounds.width * screen.scale)
+        let mainScale = Double(max(UIScreen.main.scale, 1))
+        return min(max(extPixelWidth / mainScale, 640), 1280)
+    }
+
     // MARK: Observation & Discovery
 
     func startObserving() {
@@ -198,6 +280,7 @@ final class PresentationCenter: ObservableObject {
             UIScene.didDisconnectNotification,
             UIScreen.didConnectNotification,
             UIScreen.didDisconnectNotification,
+            UIScreen.modeDidChangeNotification,
             UIScreen.capturedDidChangeNotification,
             UIApplication.didBecomeActiveNotification,
         ]
@@ -236,6 +319,9 @@ final class PresentationCenter: ObservableObject {
         if let externalWindowScene {
             if externalScene !== externalWindowScene {
                 attach(windowScene: externalWindowScene, kind: .connectedScene)
+            } else {
+                externalWindowScene.screen.overscanCompensation = .none
+                notifyViewportChanged()
             }
             updateSummary()
             return
@@ -244,6 +330,9 @@ final class PresentationCenter: ObservableObject {
         if let secondaryScreen = UIScreen.screens.first(where: { $0 !== UIScreen.main }) {
             if externalScreen !== secondaryScreen || externalWindow == nil {
                 attachFallback(screen: secondaryScreen)
+            } else {
+                secondaryScreen.overscanCompensation = .none
+                notifyViewportChanged()
             }
             updateSummary()
             return
@@ -261,11 +350,18 @@ final class PresentationCenter: ObservableObject {
     @discardableResult
     func attach(windowScene: UIWindowScene, kind: AttachmentKind) -> UIWindow {
         if let existing = externalWindow, externalScene === windowScene {
+            windowScene.screen.overscanCompensation = .none
             return existing
         }
         detach()
+        // Remove TV/AirPlay overscan margins so content reaches all four edges of the monitor.
+        windowScene.screen.overscanCompensation = .none
         let presenter = PresentationViewController()
         presenter.fillMode = fillMode
+        presenter.onBoundsChanged = { [weak self] in
+            self?.notifyViewportChanged()
+            self?.updateSummary()
+        }
         let window = UIWindow(windowScene: windowScene)
         window.rootViewController = presenter
         window.makeKeyAndVisible()
@@ -276,6 +372,7 @@ final class PresentationCenter: ObservableObject {
         self.attachmentKind = kind
         isExternalDisplayConnected = true
         updateSummary()
+        notifyViewportChanged()
         updateOverlayVisibility()
         start()
         requestFrameRefresh()
@@ -284,8 +381,13 @@ final class PresentationCenter: ObservableObject {
 
     private func attachFallback(screen: UIScreen) {
         detach()
+        screen.overscanCompensation = .none
         let presenter = PresentationViewController()
         presenter.fillMode = fillMode
+        presenter.onBoundsChanged = { [weak self] in
+            self?.notifyViewportChanged()
+            self?.updateSummary()
+        }
         let window = UIWindow(frame: screen.bounds)
         let setScreenSelector = NSSelectorFromString("setScreen:")
         if window.responds(to: setScreenSelector) {
@@ -300,6 +402,7 @@ final class PresentationCenter: ObservableObject {
         self.attachmentKind = .screenFallback
         isExternalDisplayConnected = true
         updateSummary()
+        notifyViewportChanged()
         updateOverlayVisibility()
         start()
         requestFrameRefresh()
@@ -319,24 +422,22 @@ final class PresentationCenter: ObservableObject {
         isCapturingFrame = false
         isExternalDisplayConnected = false
         updateSummary()
+        notifyViewportChanged()
     }
 
     // MARK: Content Source & Live Ink
 
     func setContentSource(_ source: PresentationContentSource) {
         contentSource = source
-        lastContentImage = nil
-        lastContentSize = .zero
-        updateOverlayVisibility()
         scanDisplays()
+        source.presentationViewportDidChange()
+        updateOverlayVisibility()
         requestFrameRefresh()
     }
 
     func clearContentSource(_ source: PresentationContentSource) {
         guard contentSource === source else { return }
         contentSource = nil
-        lastContentImage = nil
-        lastContentSize = .zero
         liveOverlay = .empty
         presenter?.updateLiveOverlay(.empty)
         requestFrameRefresh()
@@ -351,6 +452,10 @@ final class PresentationCenter: ObservableObject {
     func requestFrameRefresh() {
         guard presenter != nil else { return }
         captureNextFrame()
+    }
+
+    private func notifyViewportChanged() {
+        contentSource?.presentationViewportDidChange()
     }
 
     private func updateOverlayVisibility() {
@@ -403,7 +508,6 @@ final class PresentationCenter: ObservableObject {
         guard let presenter else { return }
         let now = CFAbsoluteTimeGetCurrent()
         if isCapturingFrame {
-            // Guard against a dropped async snapshot callback during reload.
             if now - captureStartedAt < 2.0 { return }
             isCapturingFrame = false
         }
@@ -415,8 +519,6 @@ final class PresentationCenter: ObservableObject {
                 guard let self else { return }
                 self.isCapturingFrame = false
                 guard let image, size.width > 0, size.height > 0 else { return }
-                self.lastContentImage = image
-                self.lastContentSize = size
                 guard self.isShowingContentOnly else { return }
                 self.presenter?.show(image: image, sourceSize: size)
             }
@@ -477,9 +579,10 @@ private final class DisplayLinkProxy: NSObject {
 
 /// Root view controller of the external display window.
 final class PresentationViewController: UIViewController {
-    var fillMode: PresentationFillMode = .aspectFit {
+    var fillMode: PresentationFillMode = .fillScreen {
         didSet { updateContentGeometry() }
     }
+    var onBoundsChanged: (() -> Void)?
 
     private let imageView = UIImageView()
     private let overlayContainer = CALayer()
@@ -488,6 +591,7 @@ final class PresentationViewController: UIViewController {
     private let eraserCursorLayer = CAShapeLayer()
 
     private var sourceSize: CGSize = .zero
+    private var lastBoundsSize: CGSize = .zero
     private var lastOverlay: LiveOverlayState = .empty
 
     override func viewDidLoad() {
@@ -515,6 +619,10 @@ final class PresentationViewController: UIViewController {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        if view.bounds.size != lastBoundsSize {
+            lastBoundsSize = view.bounds.size
+            onBoundsChanged?()
+        }
         updateContentGeometry()
     }
 
@@ -556,7 +664,8 @@ final class PresentationViewController: UIViewController {
             return
         }
         let scale = overlayContainer.bounds.width / refSize.width
-        var transform = CGAffineTransform(scaleX: scale, y: scale)
+        var transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale,
+                                          tx: 0, ty: -lastOverlay.captureOriginY * scale)
 
         applyShape(layer: pendingLayer, path: lastOverlay.pendingPath, color: lastOverlay.pendingColor,
                    opacity: lastOverlay.pendingOpacity, isHighlighter: lastOverlay.pendingIsHighlighter,

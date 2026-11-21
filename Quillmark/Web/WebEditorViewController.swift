@@ -17,6 +17,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private let geometryCache = StrokeGeometryCache()
     private var cancellables = Set<AnyCancellable>()
     private var documentURL: URL?
+    private var webViewHeightConstraint: NSLayoutConstraint?
+    private var presentationViewport = PresentationViewport(contentHeight: 0, extraBottomInset: 0, captureRect: .zero)
+    private var captureOriginY: CGFloat = 0
 
     static let page = 0
 
@@ -47,14 +50,17 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
+        view.clipsToBounds = true
 
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
+        let heightConstraint = webView.heightAnchor.constraint(equalTo: view.heightAnchor, constant: 0)
+        webViewHeightConstraint = heightConstraint
         NSLayoutConstraint.activate([
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             webView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             webView.topAnchor.constraint(equalTo: view.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            heightConstraint,
         ])
         webView.navigationDelegate = self
         webView.addInteraction(UIScribbleInteraction(delegate: self))
@@ -98,6 +104,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         super.viewDidLayoutSubviews()
         liveLayer.frame = view.bounds
         eraserCursor.frame = view.bounds
+        updatePresentationViewport(focusY: nil)
         applyGestureRules()
     }
 
@@ -221,6 +228,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     func inkBegan(_ touch: UITouch, event: UIEvent?) {
         liveTool = session.tool
+        updatePresentationViewport(focusY: touch.location(in: view).y)
         if liveTool.kind == .eraser {
             eraseBegan(touch)
         } else {
@@ -229,6 +237,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     func inkMoved(_ touch: UITouch, event: UIEvent?) {
+        updatePresentationViewport(focusY: touch.location(in: view).y)
         if liveTool.kind == .eraser {
             eraseMoved(touch, event: event)
         } else {
@@ -451,8 +460,10 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     private func pushPresentationOverlay() {
         guard PresentationCenter.shared.isShowingContentOnly else { return }
+        let captureRect = presentationViewport.captureRect.width > 0 ? presentationViewport.captureRect : view.bounds
         let state = LiveOverlayState(
-            sourceSize: view.bounds.size,
+            sourceSize: captureRect.size,
+            captureOriginY: captureRect.minY,
             strokePath: liveLayer.path,
             strokeColor: liveLayer.fillColor,
             strokeOpacity: liveLayer.opacity,
@@ -465,23 +476,69 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         )
         PresentationCenter.shared.updateLiveOverlay(state)
     }
+
+    private func updatePresentationViewport(focusY: CGFloat?) {
+        let visibleSize = view.bounds.size
+        guard visibleSize.width > 0, visibleSize.height > 0 else { return }
+        let center = PresentationCenter.shared
+        let externalSize = center.isShowingContentOnly ? center.externalDisplaySize : nil
+        let viewport = PresentationViewport.compute(
+            visibleSize: visibleSize,
+            externalSize: externalSize,
+            fillMode: center.fillMode,
+            focusY: focusY,
+            currentOriginY: captureOriginY
+        )
+        let originChanged = abs(viewport.captureRect.minY - captureOriginY) > 0.5
+        presentationViewport = viewport
+        captureOriginY = viewport.captureRect.minY
+
+        if let heightConstraint = webViewHeightConstraint,
+           abs(heightConstraint.constant - viewport.extraBottomInset) > 0.5 {
+            heightConstraint.constant = viewport.extraBottomInset
+            webView.scrollView.contentInset.bottom = viewport.extraBottomInset
+            webView.scrollView.verticalScrollIndicatorInsets.bottom = viewport.extraBottomInset
+            view.setNeedsLayout()
+        }
+        if originChanged {
+            pushPresentationOverlay()
+            center.requestFrameRefresh()
+        }
+    }
 }
 
 extension WebEditorViewController: PresentationContentSource {
     var presentationView: UIView { view }
 
+    func presentationViewportDidChange() {
+        updatePresentationViewport(focusY: nil)
+    }
+
     func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void) {
+        updatePresentationViewport(focusY: nil)
         let bounds = webView.bounds
         guard bounds.width > 0, bounds.height > 0 else {
             completion(nil, .zero)
             return
         }
+        let target = presentationViewport.captureRect
+        let captureRect: CGRect
+        if target.width > 0, target.height > 0 {
+            captureRect = target.intersection(bounds)
+        } else {
+            captureRect = bounds
+        }
+        guard captureRect.width > 0, captureRect.height > 0 else {
+            completion(nil, .zero)
+            return
+        }
         let configuration = WKSnapshotConfiguration()
-        configuration.rect = bounds
-        configuration.snapshotWidth = NSNumber(value: min(Double(bounds.width), 960.0))
+        configuration.rect = captureRect
+        let maxWidth = PresentationCenter.shared.preferredSnapshotMaxWidthPoints
+        configuration.snapshotWidth = NSNumber(value: min(Double(captureRect.width), maxWidth))
         configuration.afterScreenUpdates = false
         webView.takeSnapshot(with: configuration) { image, _ in
-            completion(image, bounds.size)
+            completion(image, captureRect.size)
         }
     }
 }

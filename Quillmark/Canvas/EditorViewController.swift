@@ -8,6 +8,8 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
     let pdfView = PDFView()
     private var overlays: [Int: PageInkView] = [:]
     private var cancellables = Set<AnyCancellable>()
+    private var pdfViewHeightConstraint: NSLayoutConstraint?
+    private var presentationViewport = PresentationViewport(contentHeight: 0, extraBottomInset: 0, captureRect: .zero)
 
     init(session: DocumentSession) {
         self.session = session
@@ -21,14 +23,17 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .secondarySystemBackground
+        view.clipsToBounds = true
 
         pdfView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(pdfView)
+        let heightConstraint = pdfView.heightAnchor.constraint(equalTo: view.heightAnchor, constant: 0)
+        pdfViewHeightConstraint = heightConstraint
         NSLayoutConstraint.activate([
             pdfView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             pdfView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             pdfView.topAnchor.constraint(equalTo: view.topAnchor),
-            pdfView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            heightConstraint,
         ])
 
         pdfView.backgroundColor = .secondarySystemBackground
@@ -63,6 +68,7 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        updatePresentationViewport()
         applyInputMode(fingerDrawing: session.tool.fingerDrawing)
     }
 
@@ -116,20 +122,54 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider {
 extension EditorViewController: PresentationContentSource {
     var presentationView: UIView { view }
 
+    func presentationViewportDidChange() {
+        updatePresentationViewport()
+    }
+
+    private func updatePresentationViewport() {
+        let visibleSize = view.bounds.size
+        guard visibleSize.width > 0, visibleSize.height > 0 else { return }
+        let center = PresentationCenter.shared
+        let externalSize = center.isShowingContentOnly ? center.externalDisplaySize : nil
+        let viewport = PresentationViewport.compute(
+            visibleSize: visibleSize,
+            externalSize: externalSize,
+            fillMode: center.fillMode
+        )
+        presentationViewport = viewport
+        if let heightConstraint = pdfViewHeightConstraint,
+           abs(heightConstraint.constant - viewport.extraBottomInset) > 0.5 {
+            heightConstraint.constant = viewport.extraBottomInset
+            if let scrollView = pdfView.firstDescendant(of: UIScrollView.self) {
+                scrollView.contentInset.bottom = viewport.extraBottomInset
+                scrollView.verticalScrollIndicatorInsets.bottom = viewport.extraBottomInset
+            }
+            view.setNeedsLayout()
+        }
+    }
+
     func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void) {
+        updatePresentationViewport()
         let bounds = pdfView.bounds
         guard bounds.width > 0, bounds.height > 0 else {
+            completion(nil, .zero)
+            return
+        }
+        let target = presentationViewport.captureRect
+        let captureRect = (target.width > 0 && target.height > 0) ? target.intersection(bounds) : bounds
+        guard captureRect.width > 0, captureRect.height > 0 else {
             completion(nil, .zero)
             return
         }
         let format = UIGraphicsImageRendererFormat()
         format.scale = min(view.window?.screen.scale ?? 2, 2)
         format.opaque = true
-        let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
-        let image = renderer.image { _ in
+        let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+        let image = renderer.image { ctx in
+            ctx.cgContext.translateBy(x: -captureRect.minX, y: -captureRect.minY)
             pdfView.drawHierarchy(in: bounds, afterScreenUpdates: false)
         }
-        completion(image, bounds.size)
+        completion(image, captureRect.size)
     }
 }
 
