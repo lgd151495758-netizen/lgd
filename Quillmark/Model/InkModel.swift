@@ -241,10 +241,60 @@ enum ScratchpadPaperStyle: String, Codable, CaseIterable, Identifiable {
 }
 
 enum ScratchpadSplitMode: String, Codable, Equatable {
-    /// Top shows the live HTML problem; bottom is the interactive math scratchpad.
-    case split
+    /// Freely movable & resizable floating sticky-note window over the live HTML page.
+    case floating
     /// Full-screen math whiteboard.
     case full
+}
+
+/// Pure layout clamping for the floating math sticky note (`便签`).
+enum StickyNoteLayout {
+    static let minSize = CGSize(width: 260, height: 200)
+    static let edgeMargin: CGFloat = 10
+
+    /// Comfortable initial floating sticky-note frame in the lower-right area of `bounds`.
+    static func defaultFrame(in bounds: CGRect) -> CGRect {
+        let w = min(max(minSize.width, round(bounds.width * 0.48)), max(minSize.width, bounds.width - edgeMargin * 2))
+        let h = min(max(minSize.height, round(bounds.height * 0.46)), max(minSize.height, bounds.height - edgeMargin * 2))
+        let x = max(edgeMargin, bounds.width - w - 18)
+        let y = max(edgeMargin, bounds.height - h - 22)
+        return clamped(CGRect(x: x, y: y, width: w, height: h), in: bounds)
+    }
+
+    /// Clamps any dragged/resized sticky-note rect to stay reachable inside `bounds`.
+    static func clamped(_ rect: CGRect, in bounds: CGRect) -> CGRect {
+        guard bounds.width > 0, bounds.height > 0 else { return rect }
+        let maxW = max(1, bounds.width - edgeMargin * 2)
+        let maxH = max(1, bounds.height - edgeMargin * 2)
+        let w = min(max(min(minSize.width, maxW), rect.width), maxW)
+        let h = min(max(min(minSize.height, maxH), rect.height), maxH)
+        let minX = edgeMargin
+        let maxX = max(minX, bounds.width - w - edgeMargin)
+        let minY = edgeMargin
+        let maxY = max(minY, bounds.height - h - edgeMargin)
+        let x = min(max(minX, rect.origin.x), maxX)
+        let y = min(max(minY, rect.origin.y), maxY)
+        return CGRect(x: round(x), y: round(y), width: round(w), height: round(h))
+    }
+
+    /// Resizes from the bottom-right corner by `(dx, dy)` while pinning the top-left corner.
+    static func resizingBottomRight(from rect: CGRect, delta: CGPoint, in bounds: CGRect) -> CGRect {
+        let maxW = max(minSize.width, bounds.width - rect.minX - edgeMargin)
+        let maxH = max(minSize.height, bounds.height - rect.minY - edgeMargin)
+        let newW = min(max(minSize.width, rect.width + delta.x), maxW)
+        let newH = min(max(minSize.height, rect.height + delta.y), maxH)
+        return clamped(CGRect(x: rect.minX, y: rect.minY, width: newW, height: newH), in: bounds)
+    }
+
+    /// Resizes from the bottom-left corner by `(dx, dy)` while pinning the top-right corner.
+    static func resizingBottomLeft(from rect: CGRect, delta: CGPoint, in bounds: CGRect) -> CGRect {
+        let rightEdge = rect.maxX
+        let maxW = max(minSize.width, rightEdge - edgeMargin)
+        let maxH = max(minSize.height, bounds.height - rect.minY - edgeMargin)
+        let newW = min(max(minSize.width, rect.width - delta.x), maxW)
+        let newH = min(max(minSize.height, rect.height + delta.y), maxH)
+        return clamped(CGRect(x: rightEdge - newW, y: rect.minY, width: newW, height: newH), in: bounds)
+    }
 }
 
 struct PageAnnotations: Codable, Equatable {
@@ -255,10 +305,12 @@ struct DocumentAnnotations: Codable, Equatable {
     var version: Int = 1
     /// Keyed by zero-based page index as a string, so the JSON stays a plain object.
     var pages: [String: PageAnnotations] = [:]
-    /// Per-document multi-page math scratchpad pages (optional for backward compatibility).
+    /// Per-document multi-page math sticky-note pages (optional for backward compatibility).
     var scratchpadPages: [PageAnnotations]?
-    /// Preferred background paper style for this document's scratchpad.
+    /// Preferred background paper style for this document's sticky note.
     var scratchpadPaper: ScratchpadPaperStyle?
+    /// Last floating position & size of this document's sticky note.
+    var scratchpadFrame: CGRect?
 
     /// Negative page indices (`-1, -2, ...`) map to zero-based scratchpad pages (`0, 1, ...`).
     static func scratchpadPageID(_ scratchpadIndex: Int) -> Int {

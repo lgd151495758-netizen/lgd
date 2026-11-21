@@ -34,7 +34,7 @@ struct ToolbarView: View {
                     session.toggleGeometryAid(.compass)
                 }
                 if session.meta.layout == .live {
-                    toolButton(title: "草稿", symbol: "note.text", selected: session.isScratchpadOpen) {
+                    toolButton(title: "便签", symbol: "note.text", selected: session.isScratchpadOpen) {
                         session.toggleScratchpad()
                     }
                 }

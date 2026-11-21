@@ -1,46 +1,57 @@
 import UIKit
 
-/// Hosts the iPad-only Scratchpad header bar (split resize handle, paper style, multi-page controls,
-/// clear, full/split toggle, close) above `ScratchpadCanvasView`.
-/// Only `canvas.renderCleanImage(size:)` is projected to the external display — the header bar never appears to students.
+/// Floating movable & resizable math sticky-note window (`便签`).
+///
+/// - Drag the top sticky-note header bar (with Apple Pencil or finger) to place it anywhere over the page.
+/// - Drag either bottom corner grip (`⌟` / `⌞`) to resize width and height freely.
+/// - Only `canvas.renderCleanImage(size:)` is projected to students — the header bar and corner
+///   resize grips stay strictly on the iPad.
 final class ScratchpadPanelView: UIView, UIGestureRecognizerDelegate {
-    static let headerHeight: CGFloat = 40
+    static let headerHeight: CGFloat = 36
+    static let cornerRadius: CGFloat = 14
 
     let canvas: ScratchpadCanvasView
     private let session: DocumentSession
 
-    /// Called while the user drags the top header bar in Split Mode to resize the panel vertically.
-    var onSplitDragDelta: ((CGFloat) -> Void)?
+    /// Fired incrementally in superview coordinates while dragging the header bar.
+    var onMoveDelta: ((CGPoint) -> Void)?
+    /// Fired incrementally while dragging the bottom-right corner resize grip.
+    var onResizeBottomRight: ((CGPoint) -> Void)?
+    /// Fired incrementally while dragging the bottom-left corner resize grip.
+    var onResizeBottomLeft: ((CGPoint) -> Void)?
+    /// Fired when a drag or resize finishes so the final frame can be persisted.
+    var onFrameInteractionEnded: (() -> Void)?
 
+    private let cardContainer = UIView()
     private let headerBar = UIView()
-    private let topDivider = UIView()
+    private let headerDivider = UIView()
     private let gripView = UIView()
-    private let splitModeButton = UIButton(type: .system)
-    private let paperControl = UISegmentedControl(items: ScratchpadPaperStyle.allCases.map(\.displayName))
+    private let paperMenuButton = UIButton(type: .system)
     private let prevPageButton = UIButton(type: .system)
     private let pageLabel = UILabel()
     private let nextPageButton = UIButton(type: .system)
     private let addPageButton = UIButton(type: .system)
     private let clearButton = UIButton(type: .system)
+    private let expandButton = UIButton(type: .system)
     private let closeButton = UIButton(type: .system)
+    private let bottomRightGrip = CornerResizeGripView(corner: .bottomRight)
+    private let bottomLeftGrip = CornerResizeGripView(corner: .bottomLeft)
 
-    private var lastPanY: CGFloat = 0
+    private var lastMoveLocation: CGPoint = .zero
+    private var lastResizeRightLocation: CGPoint = .zero
+    private var lastResizeLeftLocation: CGPoint = .zero
 
     init(session: DocumentSession) {
         self.session = session
         self.canvas = ScratchpadCanvasView(session: session)
         super.init(frame: .zero)
-        backgroundColor = .systemBackground
+        backgroundColor = .clear
         clipsToBounds = false
 
-        // Subtle upward elevation shadow so Split Mode separates crisply from the HTML problem above.
-        layer.shadowColor = UIColor.black.cgColor
-        layer.shadowOffset = CGSize(width: 0, height: -2)
-        layer.shadowRadius = 10
-        layer.shadowOpacity = 0.14
-
+        setupCardContainer()
         setupHeaderBar()
         setupCanvas()
+        setupResizeGrips()
         refreshHeaderState()
     }
 
@@ -48,123 +59,187 @@ final class ScratchpadPanelView: UIView, UIGestureRecognizerDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
+    private func setupCardContainer() {
+        cardContainer.backgroundColor = .white
+        cardContainer.clipsToBounds = true
+        cardContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(cardContainer)
+        NSLayoutConstraint.activate([
+            cardContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            cardContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            cardContainer.topAnchor.constraint(equalTo: topAnchor),
+            cardContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
     private func setupHeaderBar() {
-        headerBar.backgroundColor = .secondarySystemBackground
+        // Warm sticky-note header tint so it visually reads as a movable note card above the HTML page.
+        headerBar.backgroundColor = UIColor(red: 0.99, green: 0.95, blue: 0.83, alpha: 1.0)
         headerBar.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(headerBar)
+        cardContainer.addSubview(headerBar)
 
-        topDivider.backgroundColor = .separator
-        topDivider.translatesAutoresizingMaskIntoConstraints = false
-        headerBar.addSubview(topDivider)
+        headerDivider.backgroundColor = UIColor(red: 0.86, green: 0.78, blue: 0.56, alpha: 0.7)
+        headerDivider.translatesAutoresizingMaskIntoConstraints = false
+        headerBar.addSubview(headerDivider)
 
-        gripView.backgroundColor = UIColor.tertiaryLabel.withAlphaComponent(0.7)
+        gripView.backgroundColor = UIColor(red: 0.58, green: 0.50, blue: 0.34, alpha: 0.45)
         gripView.layer.cornerRadius = 2
         gripView.translatesAutoresizingMaskIntoConstraints = false
         headerBar.addSubview(gripView)
 
-        let pan = UIPanGestureRecognizer(target: self, action: #selector(handleHeaderPan(_:)))
-        pan.delegate = self
-        headerBar.addGestureRecognizer(pan)
+        let movePan = UIPanGestureRecognizer(target: self, action: #selector(handleMovePan(_:)))
+        movePan.delegate = self
+        headerBar.addGestureRecognizer(movePan)
 
-        // Left: Half/Full screen toggle
-        splitModeButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
-        splitModeButton.addTarget(self, action: #selector(toggleSplitMode), for: .touchUpInside)
+        // Left: Compact paper style menu button (fits even when sticky note is resized narrow).
+        paperMenuButton.showsMenuAsPrimaryAction = true
+        paperMenuButton.titleLabel?.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        paperMenuButton.tintColor = UIColor(red: 0.32, green: 0.26, blue: 0.14, alpha: 1.0)
+        paperMenuButton.contentEdgeInsets = UIEdgeInsets(top: 3, left: 6, bottom: 3, right: 6)
+        paperMenuButton.backgroundColor = UIColor.black.withAlphaComponent(0.06)
+        paperMenuButton.layer.cornerRadius = 7
 
-        // Center: Paper style selector
-        paperControl.selectedSegmentIndex = ScratchpadPaperStyle.allCases.firstIndex(of: session.scratchpadPaper) ?? 1
-        paperControl.setTitleTextAttributes([.font: UIFont.systemFont(ofSize: 12, weight: .medium)], for: .normal)
-        paperControl.addTarget(self, action: #selector(paperChanged), for: .valueChanged)
+        // Right: Compact icon buttons for paging, clear, full-screen toggle, and close.
+        let iconTint = UIColor(red: 0.30, green: 0.25, blue: 0.14, alpha: 1.0)
+        let smallConfig = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
 
-        // Right: Page navigation + Clear + Close
-        prevPageButton.setImage(UIImage(systemName: "chevron.left"), for: .normal)
+        prevPageButton.setImage(UIImage(systemName: "chevron.left", withConfiguration: smallConfig), for: .normal)
+        prevPageButton.tintColor = iconTint
         prevPageButton.addTarget(self, action: #selector(prevPage), for: .touchUpInside)
 
-        pageLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        pageLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         pageLabel.textAlignment = .center
-        pageLabel.textColor = .label
+        pageLabel.textColor = iconTint
 
-        nextPageButton.setImage(UIImage(systemName: "chevron.right"), for: .normal)
+        nextPageButton.setImage(UIImage(systemName: "chevron.right", withConfiguration: smallConfig), for: .normal)
+        nextPageButton.tintColor = iconTint
         nextPageButton.addTarget(self, action: #selector(nextPage), for: .touchUpInside)
 
-        addPageButton.setImage(UIImage(systemName: "plus.circle.fill"), for: .normal)
-        addPageButton.accessibilityLabel = "新增草稿页"
+        addPageButton.setImage(UIImage(systemName: "plus.circle.fill", withConfiguration: smallConfig), for: .normal)
+        addPageButton.tintColor = .systemBlue
+        addPageButton.accessibilityLabel = "新增便签页"
         addPageButton.addTarget(self, action: #selector(addPage), for: .touchUpInside)
 
-        clearButton.setTitle("清空", for: .normal)
-        clearButton.setTitleColor(.systemRed, for: .normal)
-        clearButton.titleLabel?.font = .systemFont(ofSize: 13, weight: .medium)
+        clearButton.setImage(UIImage(systemName: "trash", withConfiguration: smallConfig), for: .normal)
+        clearButton.tintColor = .systemRed
+        clearButton.accessibilityLabel = "清空本页"
         clearButton.addTarget(self, action: #selector(clearPage), for: .touchUpInside)
 
-        closeButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
-        closeButton.tintColor = .secondaryLabel
-        closeButton.accessibilityLabel = "收起草稿板"
-        closeButton.addTarget(self, action: #selector(closeScratchpad), for: .touchUpInside)
+        expandButton.tintColor = iconTint
+        expandButton.accessibilityLabel = "切换满屏或悬浮便签"
+        expandButton.addTarget(self, action: #selector(toggleFullMode), for: .touchUpInside)
 
-        let leftStack = UIStackView(arrangedSubviews: [splitModeButton])
-        leftStack.spacing = 8
-        leftStack.alignment = .center
+        closeButton.setImage(UIImage(systemName: "xmark.circle.fill", withConfiguration: smallConfig), for: .normal)
+        closeButton.tintColor = UIColor(red: 0.45, green: 0.40, blue: 0.30, alpha: 0.85)
+        closeButton.accessibilityLabel = "收起便签"
+        closeButton.addTarget(self, action: #selector(closeStickyNote), for: .touchUpInside)
 
         let rightStack = UIStackView(arrangedSubviews: [
-            prevPageButton, pageLabel, nextPageButton, addPageButton, clearButton, closeButton,
+            prevPageButton, pageLabel, nextPageButton, addPageButton, clearButton, expandButton, closeButton,
         ])
-        rightStack.spacing = 8
+        rightStack.axis = .horizontal
+        rightStack.spacing = 6
         rightStack.alignment = .center
+        rightStack.translatesAutoresizingMaskIntoConstraints = false
 
-        let container = UIStackView(arrangedSubviews: [leftStack, paperControl, rightStack])
-        container.axis = .horizontal
-        container.alignment = .center
-        container.distribution = .equalSpacing
-        container.translatesAutoresizingMaskIntoConstraints = false
-        headerBar.addSubview(container)
+        paperMenuButton.translatesAutoresizingMaskIntoConstraints = false
+        headerBar.addSubview(paperMenuButton)
+        headerBar.addSubview(rightStack)
 
         NSLayoutConstraint.activate([
-            headerBar.leadingAnchor.constraint(equalTo: leadingAnchor),
-            headerBar.trailingAnchor.constraint(equalTo: trailingAnchor),
-            headerBar.topAnchor.constraint(equalTo: topAnchor),
+            headerBar.leadingAnchor.constraint(equalTo: cardContainer.leadingAnchor),
+            headerBar.trailingAnchor.constraint(equalTo: cardContainer.trailingAnchor),
+            headerBar.topAnchor.constraint(equalTo: cardContainer.topAnchor),
             headerBar.heightAnchor.constraint(equalToConstant: Self.headerHeight),
 
-            topDivider.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor),
-            topDivider.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor),
-            topDivider.topAnchor.constraint(equalTo: headerBar.topAnchor),
-            topDivider.heightAnchor.constraint(equalToConstant: 0.5),
+            headerDivider.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor),
+            headerDivider.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor),
+            headerDivider.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor),
+            headerDivider.heightAnchor.constraint(equalToConstant: 0.6),
 
             gripView.centerXAnchor.constraint(equalTo: headerBar.centerXAnchor),
             gripView.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 4),
-            gripView.widthAnchor.constraint(equalToConstant: 36),
-            gripView.heightAnchor.constraint(equalToConstant: 4),
+            gripView.widthAnchor.constraint(equalToConstant: 32),
+            gripView.heightAnchor.constraint(equalToConstant: 3.5),
 
-            paperControl.widthAnchor.constraint(lessThanOrEqualToConstant: 240),
-            paperControl.heightAnchor.constraint(equalToConstant: 26),
+            paperMenuButton.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 8),
+            paperMenuButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor, constant: 1),
 
-            container.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 12),
-            container.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -12),
-            container.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor, constant: 2),
+            rightStack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -8),
+            rightStack.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor, constant: 1),
         ])
     }
 
     private func setupCanvas() {
         canvas.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(canvas)
+        cardContainer.addSubview(canvas)
         NSLayoutConstraint.activate([
-            canvas.leadingAnchor.constraint(equalTo: leadingAnchor),
-            canvas.trailingAnchor.constraint(equalTo: trailingAnchor),
+            canvas.leadingAnchor.constraint(equalTo: cardContainer.leadingAnchor),
+            canvas.trailingAnchor.constraint(equalTo: cardContainer.trailingAnchor),
             canvas.topAnchor.constraint(equalTo: headerBar.bottomAnchor),
-            canvas.bottomAnchor.constraint(equalTo: bottomAnchor),
+            canvas.bottomAnchor.constraint(equalTo: cardContainer.bottomAnchor),
+        ])
+    }
+
+    private func setupResizeGrips() {
+        bottomRightGrip.translatesAutoresizingMaskIntoConstraints = false
+        bottomLeftGrip.translatesAutoresizingMaskIntoConstraints = false
+        cardContainer.addSubview(bottomRightGrip)
+        cardContainer.addSubview(bottomLeftGrip)
+
+        let rightPan = UIPanGestureRecognizer(target: self, action: #selector(handleResizeRightPan(_:)))
+        bottomRightGrip.addGestureRecognizer(rightPan)
+
+        let leftPan = UIPanGestureRecognizer(target: self, action: #selector(handleResizeLeftPan(_:)))
+        bottomLeftGrip.addGestureRecognizer(leftPan)
+
+        NSLayoutConstraint.activate([
+            bottomRightGrip.trailingAnchor.constraint(equalTo: cardContainer.trailingAnchor),
+            bottomRightGrip.bottomAnchor.constraint(equalTo: cardContainer.bottomAnchor),
+            bottomRightGrip.widthAnchor.constraint(equalToConstant: 32),
+            bottomRightGrip.heightAnchor.constraint(equalToConstant: 32),
+
+            bottomLeftGrip.leadingAnchor.constraint(equalTo: cardContainer.leadingAnchor),
+            bottomLeftGrip.bottomAnchor.constraint(equalTo: cardContainer.bottomAnchor),
+            bottomLeftGrip.widthAnchor.constraint(equalToConstant: 32),
+            bottomLeftGrip.heightAnchor.constraint(equalToConstant: 32),
         ])
     }
 
     func refreshHeaderState() {
         let isFull = session.scratchpadSplitMode == .full
-        let iconName = isFull ? "rectangle.split.1x2" : "arrow.up.left.and.arrow.down.right"
-        let title = isFull ? " 半屏" : " 全屏"
-        splitModeButton.setImage(UIImage(systemName: iconName), for: .normal)
-        splitModeButton.setTitle(title, for: .normal)
-        gripView.isHidden = isFull
+        let smallConfig = UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        let iconName = isFull ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right"
+        expandButton.setImage(UIImage(systemName: iconName, withConfiguration: smallConfig), for: .normal)
 
-        let idx = ScratchpadPaperStyle.allCases.firstIndex(of: session.scratchpadPaper) ?? 1
-        if paperControl.selectedSegmentIndex != idx {
-            paperControl.selectedSegmentIndex = idx
+        gripView.isHidden = isFull
+        bottomRightGrip.isHidden = isFull
+        bottomLeftGrip.isHidden = isFull
+
+        // Rounded floating card appearance vs edge-to-edge full-screen whiteboard.
+        if isFull {
+            cardContainer.layer.cornerRadius = 0
+            cardContainer.layer.borderWidth = 0
+            layer.shadowOpacity = 0
+        } else {
+            cardContainer.layer.cornerRadius = Self.cornerRadius
+            cardContainer.layer.borderWidth = 0.8
+            cardContainer.layer.borderColor = UIColor(red: 0.78, green: 0.70, blue: 0.52, alpha: 0.75).cgColor
+            layer.shadowColor = UIColor.black.cgColor
+            layer.shadowOffset = CGSize(width: 0, height: 6)
+            layer.shadowRadius = 16
+            layer.shadowOpacity = 0.20
         }
+
+        // Paper style button & menu
+        paperMenuButton.setTitle("\(session.scratchpadPaper.displayName) ▾", for: .normal)
+        let actions = ScratchpadPaperStyle.allCases.map { style in
+            UIAction(title: style.displayName,
+                     state: style == session.scratchpadPaper ? .on : .off) { [weak self] _ in
+                self?.session.scratchpadPaper = style
+            }
+        }
+        paperMenuButton.menu = UIMenu(children: actions)
         canvas.paperStyle = session.scratchpadPaper
 
         let current = session.scratchpadPageIndex + 1
@@ -173,6 +248,8 @@ final class ScratchpadPanelView: UIView, UIGestureRecognizerDelegate {
         prevPageButton.isEnabled = session.scratchpadPageIndex > 0
         nextPageButton.isEnabled = session.scratchpadPageIndex < total - 1
     }
+
+    // MARK: Gestures
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
         var view: UIView? = touch.view
@@ -183,29 +260,61 @@ final class ScratchpadPanelView: UIView, UIGestureRecognizerDelegate {
         return true
     }
 
-    @objc private func handleHeaderPan(_ recognizer: UIPanGestureRecognizer) {
-        guard session.scratchpadSplitMode == .split, let superview else { return }
-        let y = recognizer.location(in: superview).y
+    @objc private func handleMovePan(_ recognizer: UIPanGestureRecognizer) {
+        guard session.scratchpadSplitMode == .floating, let superview else { return }
+        let loc = recognizer.location(in: superview)
         switch recognizer.state {
         case .began:
-            lastPanY = y
+            lastMoveLocation = loc
         case .changed:
-            let delta = y - lastPanY
-            lastPanY = y
-            onSplitDragDelta?(delta)
+            let delta = CGPoint(x: loc.x - lastMoveLocation.x, y: loc.y - lastMoveLocation.y)
+            lastMoveLocation = loc
+            onMoveDelta?(delta)
+        case .ended, .cancelled, .failed:
+            onFrameInteractionEnded?()
         default:
             break
         }
     }
 
-    @objc private func toggleSplitMode() {
-        session.toggleScratchpadSplitMode()
+    @objc private func handleResizeRightPan(_ recognizer: UIPanGestureRecognizer) {
+        guard session.scratchpadSplitMode == .floating, let superview else { return }
+        let loc = recognizer.location(in: superview)
+        switch recognizer.state {
+        case .began:
+            lastResizeRightLocation = loc
+        case .changed:
+            let delta = CGPoint(x: loc.x - lastResizeRightLocation.x, y: loc.y - lastResizeRightLocation.y)
+            lastResizeRightLocation = loc
+            onResizeBottomRight?(delta)
+        case .ended, .cancelled, .failed:
+            onFrameInteractionEnded?()
+        default:
+            break
+        }
     }
 
-    @objc private func paperChanged() {
-        let idx = paperControl.selectedSegmentIndex
-        guard idx >= 0, idx < ScratchpadPaperStyle.allCases.count else { return }
-        session.scratchpadPaper = ScratchpadPaperStyle.allCases[idx]
+    @objc private func handleResizeLeftPan(_ recognizer: UIPanGestureRecognizer) {
+        guard session.scratchpadSplitMode == .floating, let superview else { return }
+        let loc = recognizer.location(in: superview)
+        switch recognizer.state {
+        case .began:
+            lastResizeLeftLocation = loc
+        case .changed:
+            let delta = CGPoint(x: loc.x - lastResizeLeftLocation.x, y: loc.y - lastResizeLeftLocation.y)
+            lastResizeLeftLocation = loc
+            onResizeBottomLeft?(delta)
+        case .ended, .cancelled, .failed:
+            onFrameInteractionEnded?()
+        default:
+            break
+        }
+    }
+
+    // MARK: Header Actions
+
+    @objc private func toggleFullMode() {
+        session.toggleScratchpadSplitMode()
     }
 
     @objc private func prevPage() {
@@ -224,7 +333,54 @@ final class ScratchpadPanelView: UIView, UIGestureRecognizerDelegate {
         session.clearCurrentScratchpadPage()
     }
 
-    @objc private func closeScratchpad() {
+    @objc private func closeStickyNote() {
         session.isScratchpadOpen = false
+    }
+}
+
+/// Subtle diagonal corner grip indicator for freely resizing the floating sticky note (iPad-only).
+private final class CornerResizeGripView: UIView {
+    enum Corner {
+        case bottomRight
+        case bottomLeft
+    }
+
+    private let corner: Corner
+
+    init(corner: Corner) {
+        self.corner = corner
+        super.init(frame: .zero)
+        backgroundColor = .clear
+        isOpaque = false
+        contentMode = .redraw
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        ctx.saveGState()
+        ctx.setStrokeColor(UIColor(red: 0.45, green: 0.40, blue: 0.30, alpha: 0.55).cgColor)
+        ctx.setLineWidth(1.6)
+        ctx.setLineCap(.round)
+
+        let w = bounds.width
+        let h = bounds.height
+        switch corner {
+        case .bottomRight:
+            for offset in [CGFloat(7), CGFloat(13)] {
+                ctx.move(to: CGPoint(x: w - offset, y: h - 5))
+                ctx.addLine(to: CGPoint(x: w - 5, y: h - offset))
+            }
+        case .bottomLeft:
+            for offset in [CGFloat(7), CGFloat(13)] {
+                ctx.move(to: CGPoint(x: offset, y: h - 5))
+                ctx.addLine(to: CGPoint(x: 5, y: h - offset))
+            }
+        }
+        ctx.strokePath()
+        ctx.restoreGState()
     }
 }

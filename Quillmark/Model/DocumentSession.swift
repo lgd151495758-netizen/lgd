@@ -35,7 +35,7 @@ final class DocumentSession: ObservableObject {
     }
     @Published var geometryAid: GeometryAid = .none
     @Published var isScratchpadOpen: Bool = false
-    @Published var scratchpadSplitMode: ScratchpadSplitMode = .split
+    @Published var scratchpadSplitMode: ScratchpadSplitMode = .floating
     @Published private(set) var scratchpadPageIndex: Int = 0
     @Published private(set) var scratchpadPageCount: Int = 1
     @Published var scratchpadPaper: ScratchpadPaperStyle = .grid {
@@ -45,6 +45,7 @@ final class DocumentSession: ObservableObject {
             scheduleSave()
         }
     }
+    var savedScratchpadFrame: CGRect? { annotations.scratchpadFrame }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
 
@@ -154,7 +155,13 @@ final class DocumentSession: ObservableObject {
     }
 
     func toggleScratchpadSplitMode() {
-        scratchpadSplitMode = (scratchpadSplitMode == .split) ? .full : .split
+        scratchpadSplitMode = (scratchpadSplitMode == .floating) ? .full : .floating
+    }
+
+    func setScratchpadFrame(_ frame: CGRect) {
+        guard annotations.scratchpadFrame != frame else { return }
+        annotations.scratchpadFrame = frame
+        scheduleSave()
     }
 
     func selectScratchpadPage(_ index: Int) {

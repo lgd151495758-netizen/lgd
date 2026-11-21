@@ -24,8 +24,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private let laserCoreLayer = CAShapeLayer()
     private let geometryOverlay = GeometryToolOverlayView()
     private lazy var scratchpadPanel = ScratchpadPanelView(session: session)
-    private var scratchpadTopConstraint: NSLayoutConstraint?
-    private var scratchpadSplitRatio: CGFloat = 0.42
+    private var stickyNoteFrame: CGRect = .zero
     private var scratchpadLiveOverlay: ScratchpadLiveOverlay?
     private let geometryCache = StrokeGeometryCache()
     private var cancellables = Set<AnyCancellable>()
@@ -213,23 +212,31 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         geometryOverlay.onFingerPanChanged = { [weak self] p in self?.updateFingerGeometryDrag(to: p) }
         geometryOverlay.onFingerPanEnded = { [weak self] _ in self?.endFingerGeometryDrag() }
 
-        // Interactive math scratchpad panel (split half-screen or full-screen; header bar is iPad-only).
-        scratchpadPanel.translatesAutoresizingMaskIntoConstraints = false
+        // Floating movable & resizable math sticky-note window (header bar & resize grips are iPad-only).
         scratchpadPanel.isHidden = !session.isScratchpadOpen
         view.addSubview(scratchpadPanel)
-        let topConstraint = scratchpadPanel.topAnchor.constraint(equalTo: view.topAnchor, constant: 0)
-        scratchpadTopConstraint = topConstraint
-        NSLayoutConstraint.activate([
-            scratchpadPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scratchpadPanel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            topConstraint,
-            scratchpadPanel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
-        scratchpadPanel.onSplitDragDelta = { [weak self] delta in
-            guard let self, self.view.bounds.height > 120 else { return }
-            let nextRatio = (self.view.bounds.height * self.scratchpadSplitRatio + delta) / self.view.bounds.height
-            self.scratchpadSplitRatio = min(max(0.22, nextRatio), 0.74)
-            self.updateScratchpadLayout()
+        scratchpadPanel.onMoveDelta = { [weak self] delta in
+            guard let self, self.view.bounds.width > 0 else { return }
+            let moved = self.stickyNoteFrame.offsetBy(dx: delta.x, dy: delta.y)
+            self.stickyNoteFrame = StickyNoteLayout.clamped(moved, in: self.view.bounds)
+            self.scratchpadPanel.frame = self.stickyNoteFrame
+            PresentationCenter.shared.requestFrameRefresh()
+        }
+        scratchpadPanel.onResizeBottomRight = { [weak self] delta in
+            guard let self, self.view.bounds.width > 0 else { return }
+            self.stickyNoteFrame = StickyNoteLayout.resizingBottomRight(from: self.stickyNoteFrame, delta: delta, in: self.view.bounds)
+            self.scratchpadPanel.frame = self.stickyNoteFrame
+            PresentationCenter.shared.requestFrameRefresh()
+        }
+        scratchpadPanel.onResizeBottomLeft = { [weak self] delta in
+            guard let self, self.view.bounds.width > 0 else { return }
+            self.stickyNoteFrame = StickyNoteLayout.resizingBottomLeft(from: self.stickyNoteFrame, delta: delta, in: self.view.bounds)
+            self.scratchpadPanel.frame = self.stickyNoteFrame
+            PresentationCenter.shared.requestFrameRefresh()
+        }
+        scratchpadPanel.onFrameInteractionEnded = { [weak self] in
+            guard let self else { return }
+            self.session.setScratchpadFrame(self.stickyNoteFrame)
             PresentationCenter.shared.requestFrameRefresh()
         }
         scratchpadPanel.canvas.onLiveOverlayChanged = { [weak self] overlay in
@@ -241,7 +248,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         }
         scratchpadPanel.canvas.onActiveFocusY = { [weak self] localY in
             guard let self else { return }
-            let offsetY: CGFloat = (self.session.scratchpadSplitMode == .full) ? 0 : self.currentScratchpadSplitY()
+            let offsetY: CGFloat = (self.session.scratchpadSplitMode == .full)
+                ? 0
+                : (self.stickyNoteFrame.minY + ScratchpadPanelView.headerHeight)
             self.updatePresentationViewport(focusY: offsetY + localY)
         }
 
@@ -412,30 +421,25 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         }
     }
 
-    private func currentScratchpadSplitY() -> CGFloat {
-        guard view.bounds.height > 0 else { return 0 }
-        return round(view.bounds.height * scratchpadSplitRatio)
+    private func stickyCanvasFrameInView() -> CGRect {
+        let headerH = ScratchpadPanelView.headerHeight
+        return CGRect(x: stickyNoteFrame.minX,
+                      y: stickyNoteFrame.minY + headerH,
+                      width: max(1, stickyNoteFrame.width),
+                      height: max(1, stickyNoteFrame.height - headerH))
     }
 
     private func updateScratchpadLayout() {
         let isOpen = session.isScratchpadOpen
         scratchpadPanel.isHidden = !isOpen
-        let topOffset: CGFloat
-        if !isOpen || session.scratchpadSplitMode == .full {
-            topOffset = 0
-        } else {
-            topOffset = currentScratchpadSplitY()
+        guard view.bounds.width > 0, view.bounds.height > 0 else { return }
+        if stickyNoteFrame == .zero {
+            stickyNoteFrame = session.savedScratchpadFrame ?? StickyNoteLayout.defaultFrame(in: view.bounds)
         }
-        if let constraint = scratchpadTopConstraint, abs(constraint.constant - topOffset) > 0.5 {
-            constraint.constant = topOffset
-        }
-        let splitBottomInset: CGFloat = (isOpen && session.scratchpadSplitMode == .split)
-            ? max(0, view.bounds.height - topOffset)
-            : 0
-        let desiredInset = presentationViewport.extraBottomInset + splitBottomInset
-        if abs(webView.scrollView.contentInset.bottom - desiredInset) > 0.5 {
-            webView.scrollView.contentInset.bottom = desiredInset
-            webView.scrollView.verticalScrollIndicatorInsets.bottom = desiredInset
+        stickyNoteFrame = StickyNoteLayout.clamped(stickyNoteFrame, in: view.bounds)
+        let targetFrame = (session.scratchpadSplitMode == .full) ? view.bounds : stickyNoteFrame
+        if scratchpadPanel.frame != targetFrame {
+            scratchpadPanel.frame = targetFrame
         }
     }
 
@@ -2347,11 +2351,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         guard PresentationCenter.shared.isShowingContentOnly else { return }
         let captureRect = presentationViewport.captureRect.width > 0 ? presentationViewport.captureRect : view.bounds
 
-        // When the scratchpad is actively receiving live input (or open full-screen), project its live ink.
+        // When the sticky note is actively receiving live input (or open full-screen), project its live ink.
         if session.isScratchpadOpen {
             if let scratch = scratchpadLiveOverlay {
-                let offsetY: CGFloat = (session.scratchpadSplitMode == .full) ? 0 : currentScratchpadSplitY()
-                let shifted = scratch.translated(by: CGPoint(x: 0, y: offsetY))
+                let offset: CGPoint = (session.scratchpadSplitMode == .full)
+                    ? .zero
+                    : stickyCanvasFrameInView().origin
+                let shifted = scratch.translated(by: offset)
                 let state = LiveOverlayState(
                     sourceSize: captureRect.size,
                     captureOriginY: captureRect.minY,
@@ -2432,18 +2438,12 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         presentationViewport = viewport
         captureOriginY = viewport.captureRect.minY
 
-        let splitBottomInset: CGFloat = (session.isScratchpadOpen && session.scratchpadSplitMode == .split)
-            ? max(0, visibleSize.height - currentScratchpadSplitY())
-            : 0
         if let heightConstraint = webViewHeightConstraint,
            abs(heightConstraint.constant - viewport.extraBottomInset) > 0.5 {
             heightConstraint.constant = viewport.extraBottomInset
+            webView.scrollView.contentInset.bottom = viewport.extraBottomInset
+            webView.scrollView.verticalScrollIndicatorInsets.bottom = viewport.extraBottomInset
             view.setNeedsLayout()
-        }
-        let desiredBottomInset = viewport.extraBottomInset + splitBottomInset
-        if abs(webView.scrollView.contentInset.bottom - desiredBottomInset) > 0.5 {
-            webView.scrollView.contentInset.bottom = desiredBottomInset
-            webView.scrollView.verticalScrollIndicatorInsets.bottom = desiredBottomInset
         }
         if originChanged {
             pushPresentationOverlay()
@@ -2473,7 +2473,7 @@ extension WebEditorViewController: PresentationContentSource {
             return
         }
 
-        // 1. Full-screen math scratchpad: pure Retina vector render, zero iPad UI chrome.
+        // 1. Full-screen math whiteboard: pure Retina vector render, zero iPad UI chrome.
         if session.isScratchpadOpen && session.scratchpadSplitMode == .full {
             let fullHeight = max(captureRect.maxY, view.bounds.height)
             let fullCanvas = scratchpadPanel.canvas.renderCleanImage(size: CGSize(width: captureRect.width, height: fullHeight))
@@ -2492,54 +2492,52 @@ extension WebEditorViewController: PresentationContentSource {
             return
         }
 
-        // 2. Split-screen mode: top shows live HTML problem, bottom shows clean math scratchpad (no iPad header bar).
-        if session.isScratchpadOpen && session.scratchpadSplitMode == .split {
-            let splitY = currentScratchpadSplitY()
-            let scratchOriginY = splitY - captureRect.minY
-            let scratchRenderHeight = max(1, max(captureRect.maxY, view.bounds.height) - splitY)
-            let scratchImage = scratchpadPanel.canvas.renderCleanImage(
-                size: CGSize(width: captureRect.width, height: scratchRenderHeight)
-            )
+        // 2. Floating sticky-note mode: live HTML page underneath + clean rounded sticky-note card at exact position.
+        if session.isScratchpadOpen && session.scratchpadSplitMode == .floating {
+            let canvasFrame = stickyCanvasFrameInView()
+            let cardRect = canvasFrame.offsetBy(dx: 0, dy: -captureRect.minY)
+            let stickyImage = scratchpadPanel.canvas.renderCleanImage(size: canvasFrame.size)
 
-            let htmlVisibleTop = captureRect.minY
-            let htmlVisibleBottom = min(splitY, captureRect.maxY)
-            let htmlVisibleHeight = htmlVisibleBottom - htmlVisibleTop
-
-            guard htmlVisibleHeight > 1, webView.bounds.width > 0, webView.bounds.height > 0 else {
-                let format = UIGraphicsImageRendererFormat()
-                format.scale = min(max(UIScreen.main.scale, 1), 2)
-                format.opaque = true
-                let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
-                let img = renderer.image { _ in
-                    scratchImage.draw(in: CGRect(x: 0, y: scratchOriginY, width: captureRect.width, height: scratchRenderHeight))
-                }
-                completion(img, captureRect.size)
+            let htmlBounds = webView.bounds
+            let htmlCapture = captureRect.intersection(htmlBounds)
+            guard htmlCapture.width > 0, htmlCapture.height > 0 else {
+                completion(stickyImage, canvasFrame.size)
                 return
             }
-
-            let htmlRect = CGRect(x: 0, y: htmlVisibleTop, width: captureRect.width, height: htmlVisibleHeight)
-                .intersection(webView.bounds)
             let config = WKSnapshotConfiguration()
-            config.rect = htmlRect
+            config.rect = htmlCapture
             let maxWidth = PresentationCenter.shared.preferredSnapshotMaxWidthPoints
-            config.snapshotWidth = NSNumber(value: min(Double(htmlRect.width), maxWidth))
+            config.snapshotWidth = NSNumber(value: min(Double(htmlCapture.width), maxWidth))
             config.afterScreenUpdates = false
             webView.takeSnapshot(with: config) { htmlImage, _ in
                 let format = UIGraphicsImageRendererFormat()
                 format.scale = min(max(UIScreen.main.scale, 1), 2)
                 format.opaque = true
                 let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
-                let composite = renderer.image { ctx in
+                let composite = renderer.image { rendererCtx in
+                    let ctx = rendererCtx.cgContext
                     UIColor.white.setFill()
                     ctx.fill(CGRect(origin: .zero, size: captureRect.size))
                     if let htmlImage {
-                        htmlImage.draw(in: CGRect(x: 0, y: 0, width: captureRect.width, height: htmlVisibleHeight))
+                        htmlImage.draw(in: CGRect(origin: .zero, size: htmlCapture.size))
                     }
-                    scratchImage.draw(in: CGRect(x: 0, y: scratchOriginY, width: captureRect.width, height: scratchRenderHeight))
-                    if scratchOriginY >= 0 && scratchOriginY < captureRect.height {
-                        UIColor.separator.setFill()
-                        ctx.fill(CGRect(x: 0, y: scratchOriginY, width: captureRect.width, height: 1.5))
-                    }
+                    // Soft card elevation shadow + rounded sticky paper card (no iPad header or corner grips).
+                    let rounded = UIBezierPath(roundedRect: cardRect, cornerRadius: 10)
+                    ctx.saveGState()
+                    ctx.setShadow(offset: CGSize(width: 0, height: 4), blur: 12,
+                                  color: UIColor.black.withAlphaComponent(0.18).cgColor)
+                    UIColor.white.setFill()
+                    rounded.fill()
+                    ctx.restoreGState()
+
+                    ctx.saveGState()
+                    rounded.addClip()
+                    stickyImage.draw(in: cardRect)
+                    ctx.restoreGState()
+
+                    UIColor(red: 0.78, green: 0.70, blue: 0.52, alpha: 0.75).setStroke()
+                    rounded.lineWidth = 1.0
+                    rounded.stroke()
                 }
                 completion(composite, captureRect.size)
             }

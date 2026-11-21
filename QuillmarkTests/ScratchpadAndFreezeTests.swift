@@ -31,15 +31,56 @@ final class ScratchpadAndFreezeTests: XCTestCase {
         XCTAssertEqual(idx1, 1)
         ann.updatePage(DocumentAnnotations.scratchpadPageID(1)) { $0.strokes.append(s1) }
         ann.scratchpadPaper = .graph
+        ann.scratchpadFrame = CGRect(x: 320, y: 180, width: 440, height: 320)
 
         XCTAssertTrue(ann.pages.isEmpty, "scratchpad strokes must live in scratchpadPages, not main pages")
         XCTAssertEqual(ann.resolvedScratchpadPageCount, 2)
         XCTAssertEqual(ann.page(DocumentAnnotations.scratchpadPageID(0)).strokes, [s0])
         XCTAssertEqual(ann.page(DocumentAnnotations.scratchpadPageID(1)).strokes, [s1])
+        XCTAssertEqual(ann.scratchpadFrame, CGRect(x: 320, y: 180, width: 440, height: 320))
 
         let encoded = try LibraryStore.encoder.encode(ann)
         let decoded = try LibraryStore.decoder.decode(DocumentAnnotations.self, from: encoded)
         XCTAssertEqual(decoded, ann)
+    }
+
+    func testStickyNoteLayoutDefaultMoveResizeAndRotationClamping() {
+        let landscape = CGRect(x: 0, y: 0, width: 1180, height: 740)
+        let initial = StickyNoteLayout.defaultFrame(in: landscape)
+        XCTAssertGreaterThanOrEqual(initial.width, StickyNoteLayout.minSize.width)
+        XCTAssertGreaterThanOrEqual(initial.height, StickyNoteLayout.minSize.height)
+        XCTAssertTrue(landscape.contains(initial))
+
+        // Dragging past top-left clamps neatly inside edgeMargin.
+        let movedTopLeft = StickyNoteLayout.clamped(initial.offsetBy(dx: -2000, dy: -2000), in: landscape)
+        XCTAssertEqual(movedTopLeft.minX, StickyNoteLayout.edgeMargin, accuracy: 0.5)
+        XCTAssertEqual(movedTopLeft.minY, StickyNoteLayout.edgeMargin, accuracy: 0.5)
+
+        // Bottom-right resize expands & respects minimum size while pinning top-left.
+        let start = CGRect(x: 200, y: 120, width: 400, height: 300)
+        let grown = StickyNoteLayout.resizingBottomRight(from: start, delta: CGPoint(x: 80, y: 60), in: landscape)
+        XCTAssertEqual(grown.minX, 200, accuracy: 0.5)
+        XCTAssertEqual(grown.minY, 120, accuracy: 0.5)
+        XCTAssertEqual(grown.width, 480, accuracy: 0.5)
+        XCTAssertEqual(grown.height, 360, accuracy: 0.5)
+
+        let shrunk = StickyNoteLayout.resizingBottomRight(from: start, delta: CGPoint(x: -500, y: -500), in: landscape)
+        XCTAssertEqual(shrunk.width, StickyNoteLayout.minSize.width, accuracy: 0.5)
+        XCTAssertEqual(shrunk.height, StickyNoteLayout.minSize.height, accuracy: 0.5)
+
+        // Bottom-left resize keeps right edge pinned while resizing width leftward.
+        let leftResized = StickyNoteLayout.resizingBottomLeft(from: start, delta: CGPoint(x: -50, y: 40), in: landscape)
+        XCTAssertEqual(leftResized.maxX, start.maxX, accuracy: 0.5)
+        XCTAssertEqual(leftResized.minX, 150, accuracy: 0.5)
+        XCTAssertEqual(leftResized.width, 450, accuracy: 0.5)
+        XCTAssertEqual(leftResized.height, 340, accuracy: 0.5)
+
+        // Rotating from landscape to narrower portrait keeps the sticky note reachable on screen.
+        let portrait = CGRect(x: 0, y: 0, width: 820, height: 1080)
+        let farRight = CGRect(x: 700, y: 200, width: 420, height: 320)
+        let rotated = StickyNoteLayout.clamped(farRight, in: portrait)
+        XCTAssertLessThanOrEqual(rotated.maxX, portrait.width - StickyNoteLayout.edgeMargin + 0.5)
+        XCTAssertGreaterThanOrEqual(rotated.minX, StickyNoteLayout.edgeMargin - 0.5)
     }
 
     func testDocumentSessionScratchpadMultiPageClearAndUndoRedo() throws {
