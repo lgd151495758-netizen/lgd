@@ -152,14 +152,6 @@ struct ToolbarView: View {
             .buttonStyle(.bordered)
 
         case .laser:
-            Picker("激光笔模式", selection: $session.tool.laserMode) {
-                ForEach(LaserMode.allCases) { mode in
-                    Text(mode.displayName).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 120)
-            divider
             ForEach(ToolSettings.laserPalette, id: \.self) { color in
                 colorButton(color, selected: tool.laserColor == color) { session.tool.laserColor = color }
             }

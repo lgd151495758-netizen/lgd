@@ -191,43 +191,39 @@ final class PresentationToolsTests: XCTestCase {
 
     // MARK: Laser Pointer
 
-    func testLaserTrailDecaysToEmpty() {
+    func testLaserTrailStaysVisibleWhileTouchingAndFadesOnLift() {
         let engine = LaserPointerEngine()
-        engine.begin(at: CGPoint(x: 10, y: 10), mode: .trail, color: ToolSettings.laserPalette[0], now: 10.0)
+        engine.begin(at: CGPoint(x: 10, y: 10), color: ToolSettings.laserPalette[0], now: 10.0)
         engine.move(to: CGPoint(x: 60, y: 20), now: 10.1)
         engine.move(to: CGPoint(x: 110, y: 30), now: 10.2)
 
-        let active = engine.frame(at: 10.25)
-        XCTAssertTrue(active.isActive)
-        XCTAssertNotNil(active.glowPath)
-        XCTAssertNotNil(active.corePath)
+        // Even 5 seconds later while still holding the pen down, the full trail remains intact.
+        let held = engine.frame(at: 15.2)
+        XCTAssertTrue(held.isActive)
+        XCTAssertNotNil(held.glowPath)
+        XCTAssertNotNil(held.corePath)
+        XCTAssertEqual(held.opacity, 1.0, accuracy: 0.001)
+        XCTAssertEqual(engine.samples.count, 3)
 
-        engine.end(now: 10.2)
-        let midFade = engine.frame(at: 10.6)
+        // Lifting the pen starts the smooth fade-out.
+        engine.end(now: 15.2)
+        let midFade = engine.frame(at: 15.2 + LaserPointerEngine.liftFadeDuration * 0.5)
         XCTAssertTrue(midFade.isActive)
-        XCTAssertLessThan(midFade.opacity, 1.0)
+        XCTAssertEqual(midFade.opacity, 0.5, accuracy: 0.05)
 
-        let expired = engine.frame(at: 10.2 + LaserPointerEngine.trailLifetime + 0.05)
+        let expired = engine.frame(at: 15.2 + LaserPointerEngine.liftFadeDuration + 0.05)
         XCTAssertFalse(expired.isActive)
+        XCTAssertTrue(engine.samples.isEmpty)
     }
 
-    func testLaserDotFollowsAndFadesAfterLift() {
+    func testLaserCancelClearsImmediately() {
         let engine = LaserPointerEngine()
-        engine.begin(at: CGPoint(x: 20, y: 20), mode: .dot, color: ToolSettings.laserPalette[1], now: 5.0)
+        engine.begin(at: CGPoint(x: 20, y: 20), color: ToolSettings.laserPalette[1], now: 5.0)
         engine.move(to: CGPoint(x: 150, y: 80), now: 5.1)
+        XCTAssertTrue(engine.frame(at: 5.2).isActive)
 
-        let held = engine.frame(at: 5.2)
-        XCTAssertTrue(held.isActive)
-        XCTAssertEqual(held.glowPath?.boundingBox.midX ?? 0, 150, accuracy: 0.5)
-        XCTAssertEqual(held.opacity, 1, accuracy: 0.001)
-
-        engine.end(now: 5.2)
-        let fading = engine.frame(at: 5.2 + LaserPointerEngine.dotFadeDuration * 0.5)
-        XCTAssertTrue(fading.isActive)
-        XCTAssertEqual(fading.opacity, 0.5, accuracy: 0.05)
-
-        let gone = engine.frame(at: 5.2 + LaserPointerEngine.dotFadeDuration + 0.05)
-        XCTAssertFalse(gone.isActive)
+        engine.cancel()
+        XCTAssertFalse(engine.frame(at: 5.2).isActive)
     }
 
     // MARK: Cover Tape & Backward Compatibility
@@ -296,7 +292,6 @@ final class PresentationToolsTests: XCTestCase {
         settings.drawAndHold = false
         settings.tapeWidth = 42
         settings.tapeStraight = false
-        settings.laserMode = .dot
         settings.laserColor = ToolSettings.laserPalette[2]
         settings.save(to: defaults)
 

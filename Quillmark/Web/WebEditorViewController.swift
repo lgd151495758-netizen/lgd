@@ -678,9 +678,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     // MARK: Laser Pointer
 
     private func laserBegan(_ touch: UITouch) {
-        laserEngine.begin(at: documentPoint(touch), mode: liveTool.laserMode,
-                          color: liveTool.laserColor, now: CACurrentMediaTime())
-        startLaserLoop()
+        stopLaserLoop()
+        laserEngine.begin(at: documentPoint(touch), color: liveTool.laserColor, now: CACurrentMediaTime())
         updateLaserRender()
     }
 
@@ -694,6 +693,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     private func laserEnded(_ touch: UITouch) {
         laserEngine.end(now: CACurrentMediaTime())
+        startLaserLoop()
         updateLaserRender()
     }
 

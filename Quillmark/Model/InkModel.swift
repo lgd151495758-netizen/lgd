@@ -92,20 +92,6 @@ enum StrokeLineStyle: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum LaserMode: String, Codable, CaseIterable, Identifiable {
-    case trail
-    case dot
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .trail: return "拖尾"
-        case .dot: return "光点"
-        }
-    }
-}
-
 enum EraserMode: String, Codable, CaseIterable, Identifiable {
     /// Removes only the touched part of a stroke (splits it).
     case pixel
@@ -231,7 +217,6 @@ struct ToolSettings: Codable, Equatable {
     var tapeStraight: Bool = true
 
     // Laser Pointer
-    var laserMode: LaserMode = .trail
     var laserColor: RGBAColor = ToolSettings.laserPalette[0]
 
     // Eraser
