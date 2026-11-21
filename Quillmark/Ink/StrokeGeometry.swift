@@ -87,9 +87,24 @@ enum StrokeProcessor {
     }
 
     /// Replaces a freehand stroke by a straight segment from its first to its last point
-    /// (highlighter "straight line" mode). Intermediate points keep the outline well formed.
-    static func straightened(_ points: [InkPoint], spacing: Float = 2) -> [InkPoint] {
-        guard let first = points.first, let last = points.last, points.count > 1 else { return points }
+    /// (highlighter / tape straight-line mode). Optionally snaps near-horizontal/vertical lines.
+    static func straightened(_ points: [InkPoint], spacing: Float = 2, snapAngleDegrees: Float = 0) -> [InkPoint] {
+        guard let first = points.first, var last = points.last, points.count > 1 else { return points }
+        if snapAngleDegrees > 0 {
+            let dx = last.x - first.x
+            let dy = last.y - first.y
+            let length = hypotf(dx, dy)
+            if length > 1 {
+                let angle = atan2f(dy, dx)
+                let snapStep = Float.pi / 2 // 0°, 90°, 180°, -90°
+                let nearest = (angle / snapStep).rounded() * snapStep
+                let threshold = snapAngleDegrees * Float.pi / 180
+                if abs(angle - nearest) <= threshold {
+                    last.x = first.x + cosf(nearest) * length
+                    last.y = first.y + sinf(nearest) * length
+                }
+            }
+        }
         let length = hypotf(last.x - first.x, last.y - first.y)
         let steps = max(1, Int(length / spacing))
         return (0...steps).map { i in
@@ -103,6 +118,7 @@ enum StrokeProcessor {
     }
 
     /// Inserts interpolated samples so neighbours are at most `maxSpacing` apart.
+    /// Preserves subpath breaks (`radius <= 0`).
     static func densified(_ samples: [StrokeSample], maxSpacing: CGFloat) -> [StrokeSample] {
         guard samples.count > 1, maxSpacing > 0 else { return samples }
         var result: [StrokeSample] = [samples[0]]
@@ -110,6 +126,10 @@ enum StrokeProcessor {
         for i in 1..<samples.count {
             let a = samples[i - 1]
             let b = samples[i]
+            if a.radius <= 0 || b.radius <= 0 {
+                result.append(b)
+                continue
+            }
             let distance = hypot(b.point.x - a.point.x, b.point.y - a.point.y)
             let extra = Int(distance / maxSpacing)
             if extra > 0 {
@@ -143,17 +163,123 @@ enum StrokeProcessor {
 }
 
 /// Builds a filled outline (two offset curves joined by round caps) from stroke samples.
+/// Supports solid, dashed, and dotted styles as pure filled paths so they render identically
+/// in CoreGraphics, SVG, and external display overlays.
 enum StrokeOutline {
     static let capSegments = 8
+    /// Sentinel sample inserted between disconnected parts of a composite shape (e.g. an arrow shaft and head).
+    static let breakSample = StrokeSample(point: .zero, radius: 0)
 
-    static func path(for samples: [StrokeSample], transform: CGAffineTransform = .identity) -> CGPath {
-        let path = CGMutablePath()
-        guard let first = samples.first else { return path }
+    static func path(for samples: [StrokeSample],
+                     lineStyle: StrokeLineStyle = .solid,
+                     transform: CGAffineTransform = .identity) -> CGPath {
+        let result = CGMutablePath()
+        let runs = splitSubpaths(samples)
+        for run in runs {
+            switch lineStyle {
+            case .solid:
+                appendSolid(run, to: result, transform: transform)
+            case .dashed:
+                appendDashed(run, to: result, transform: transform)
+            case .dotted:
+                appendDotted(run, to: result, transform: transform)
+            }
+        }
+        return result
+    }
+
+    private static func splitSubpaths(_ samples: [StrokeSample]) -> [[StrokeSample]] {
+        var runs: [[StrokeSample]] = []
+        var current: [StrokeSample] = []
+        for s in samples {
+            if s.radius <= 0 {
+                if !current.isEmpty {
+                    runs.append(current)
+                    current = []
+                }
+            } else {
+                current.append(s)
+            }
+        }
+        if !current.isEmpty { runs.append(current) }
+        return runs
+    }
+
+    private static func appendDashed(_ samples: [StrokeSample], to path: CGMutablePath, transform: CGAffineTransform) {
+        guard let first = samples.first else { return }
+        if samples.count == 1 {
+            appendSolid(samples, to: path, transform: transform)
+            return
+        }
+        let avgDiameter = max(1.2, (samples.map(\.radius).reduce(0, +) / CGFloat(samples.count)) * 2)
+        let dashLength = max(7.0, avgDiameter * 3.2)
+        let gapLength = max(5.0, avgDiameter * 2.4)
+        let period = dashLength + gapLength
+
+        let dense = StrokeProcessor.densified(samples, maxSpacing: 1.0)
+        var distance: CGFloat = 0
+        var segment: [StrokeSample] = [first]
+        var drawing = true
+
+        for i in 1..<dense.count {
+            let prev = dense[i - 1]
+            let curr = dense[i]
+            distance += hypot(curr.point.x - prev.point.x, curr.point.y - prev.point.y)
+            let phase = distance.truncatingRemainder(dividingBy: period)
+            let shouldDraw = phase <= dashLength
+            if shouldDraw {
+                if !drawing {
+                    segment = [curr]
+                    drawing = true
+                } else {
+                    segment.append(curr)
+                }
+            } else if drawing {
+                if !segment.isEmpty {
+                    appendSolid(segment, to: path, transform: transform)
+                    segment.removeAll(keepingCapacity: true)
+                }
+                drawing = false
+            }
+        }
+        if drawing, !segment.isEmpty {
+            appendSolid(segment, to: path, transform: transform)
+        }
+    }
+
+    private static func appendDotted(_ samples: [StrokeSample], to path: CGMutablePath, transform: CGAffineTransform) {
+        guard let first = samples.first else { return }
+        let avgDiameter = max(1.2, (samples.map(\.radius).reduce(0, +) / CGFloat(samples.count)) * 2)
+        let spacing = max(4.5, avgDiameter * 2.3)
+
+        func addDot(_ sample: StrokeSample) {
+            let r = max(sample.radius, 0.85)
+            path.addEllipse(in: CGRect(x: sample.point.x - r, y: sample.point.y - r, width: 2 * r, height: 2 * r),
+                            transform: transform)
+        }
+
+        addDot(first)
+        guard samples.count > 1 else { return }
+        let dense = StrokeProcessor.densified(samples, maxSpacing: 1.0)
+        var sinceLastDot: CGFloat = 0
+        for i in 1..<dense.count {
+            let prev = dense[i - 1]
+            let curr = dense[i]
+            sinceLastDot += hypot(curr.point.x - prev.point.x, curr.point.y - prev.point.y)
+            if sinceLastDot >= spacing {
+                addDot(curr)
+                sinceLastDot = 0
+            }
+        }
+    }
+
+    private static func appendSolid(_ samples: [StrokeSample], to path: CGMutablePath, transform: CGAffineTransform) {
+        guard let first = samples.first else { return }
         if samples.count == 1 {
             let r = first.radius
             path.addEllipse(in: CGRect(x: first.point.x - r, y: first.point.y - r, width: 2 * r, height: 2 * r),
                             transform: transform)
-            return path
+            return
         }
 
         let n = samples.count
@@ -196,7 +322,6 @@ enum StrokeOutline {
                normal: CGVector(dx: startTangent.dy, dy: -startTangent.dx),
                direction: CGVector(dx: -startTangent.dx, dy: -startTangent.dy), transform: transform)
         path.closeSubpath()
-        return path
     }
 
     private static func addSmoothCurve(_ path: CGMutablePath, through points: [CGPoint], transform: CGAffineTransform) {
@@ -232,10 +357,12 @@ extension InkStroke {
     func renderSamples(finished: Bool = true) -> [StrokeSample] {
         if let baked { return baked }
         return StrokeProcessor.samples(for: points, pen: pen, width: width, smoothing: smoothing,
-                                       finished: finished, highlighter: isHighlighter)
+                                       finished: finished, highlighter: isHighlighter || isTape)
     }
 
     func outlinePath(transform: CGAffineTransform = .identity, finished: Bool = true) -> CGPath {
-        StrokeOutline.path(for: renderSamples(finished: finished), transform: transform)
+        StrokeOutline.path(for: renderSamples(finished: finished),
+                           lineStyle: resolvedLineStyle,
+                           transform: transform)
     }
 }

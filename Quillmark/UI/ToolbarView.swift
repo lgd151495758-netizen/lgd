@@ -9,7 +9,7 @@ struct ToolbarView: View {
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
+            HStack(spacing: 10) {
                 ForEach(PenKind.allCases) { pen in
                     toolButton(title: pen.displayName, symbol: pen.symbolName,
                                selected: tool.kind == .pen && tool.pen == pen) {
@@ -19,6 +19,12 @@ struct ToolbarView: View {
                 }
                 toolButton(title: "荧光笔", symbol: "highlighter", selected: tool.kind == .highlighter) {
                     session.tool.select(.highlighter)
+                }
+                toolButton(title: "胶带", symbol: "bandage", selected: tool.kind == .tape) {
+                    session.tool.select(.tape)
+                }
+                toolButton(title: "激光笔", symbol: "laser.burst", selected: tool.kind == .laser) {
+                    session.tool.select(.laser)
                 }
                 toolButton(title: "橡皮", symbol: "eraser", selected: tool.kind == .eraser) {
                     session.tool.select(.eraser)
@@ -58,7 +64,7 @@ struct ToolbarView: View {
                 }
             }
             .font(.title3)
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 14)
             .padding(.vertical, 8)
         }
         .background(.regularMaterial, in: Capsule())
@@ -78,6 +84,22 @@ struct ToolbarView: View {
                     session.tool.width = width
                 }
             }
+            divider
+            Picker("线型", selection: $session.tool.lineStyle) {
+                ForEach(StrokeLineStyle.allCases) { style in
+                    Text(style.displayName).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 132)
+            Toggle(isOn: $session.tool.drawAndHold) {
+                Label("成形", systemImage: "square.on.circle")
+                    .labelStyle(.titleAndIcon)
+                    .font(.callout)
+            }
+            .toggleStyle(.button)
+            .accessibilityLabel("画完按住自动成形")
+
         case .highlighter:
             ForEach(ToolSettings.highlighterPalette, id: \.self) { color in
                 colorButton(color, selected: tool.highlighterColor == color) { session.tool.highlighterColor = color }
@@ -95,6 +117,53 @@ struct ToolbarView: View {
                     .font(.callout)
             }
             .toggleStyle(.button)
+
+        case .tape:
+            ForEach(ToolSettings.tapePalette, id: \.self) { color in
+                colorButton(color, selected: tool.tapeColor == color) { session.tool.tapeColor = color }
+            }
+            divider
+            ForEach(ToolSettings.tapeWidthPresets, id: \.self) { width in
+                sizeButton(diameter: CGFloat(width) * 0.45 + 6, selected: tool.tapeWidth == width,
+                           shape: AnyShape(RoundedRectangle(cornerRadius: 3))) {
+                    session.tool.tapeWidth = width
+                }
+            }
+            Toggle(isOn: $session.tool.tapeStraight) {
+                Label("直线", systemImage: "line.diagonal")
+                    .labelStyle(.titleAndIcon)
+                    .font(.callout)
+            }
+            .toggleStyle(.button)
+            divider
+            Button {
+                session.setAllTapesRevealed(false)
+            } label: {
+                Label("全盖", systemImage: "eye.slash")
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+            Button {
+                session.setAllTapesRevealed(true)
+            } label: {
+                Label("全揭", systemImage: "eye")
+                    .font(.callout)
+            }
+            .buttonStyle(.bordered)
+
+        case .laser:
+            Picker("激光笔模式", selection: $session.tool.laserMode) {
+                ForEach(LaserMode.allCases) { mode in
+                    Text(mode.displayName).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 120)
+            divider
+            ForEach(ToolSettings.laserPalette, id: \.self) { color in
+                colorButton(color, selected: tool.laserColor == color) { session.tool.laserColor = color }
+            }
+
         case .eraser:
             Picker("橡皮模式", selection: $session.tool.eraserMode) {
                 ForEach(EraserMode.allCases) { mode in
@@ -125,7 +194,7 @@ struct ToolbarView: View {
                 Image(systemName: symbol)
                 Text(title).font(.caption2)
             }
-            .frame(minWidth: 44)
+            .frame(minWidth: 42)
             .padding(.vertical, 2)
             .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
         }
@@ -139,7 +208,7 @@ struct ToolbarView: View {
             Circle()
                 .fill(Color(cgColor: color.cgColor))
                 .frame(width: 24, height: 24)
-                .overlay(Circle().stroke(Color.primary.opacity(selected ? 0.9 : 0), lineWidth: 2).padding(-4))
+                .overlay(Circle().stroke(Color.primary.opacity(selected ? 0.9 : 0.15), lineWidth: selected ? 2 : 0.8).padding(selected ? -4 : 0))
         }
         .buttonStyle(.plain)
     }

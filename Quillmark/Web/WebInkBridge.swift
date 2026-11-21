@@ -20,6 +20,7 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
     private(set) var placements: [UUID: Placement] = [:]
     var onReady: (() -> Void)?
     var onPlacementsChanged: (() -> Void)?
+    var onToggleTape: ((UUID) -> Void)?
 
     /// What the page currently shows, to send only differences.
     private var rendered: [UUID: InkStroke] = [:]
@@ -113,9 +114,13 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
         return AnchorPick(anchor: anchor, origin: CGPoint(x: x, y: y))
     }
 
-    /// Makes the page show exactly `strokes` (in this z-order).
-    func sync(_ strokes: [InkStroke]) {
-        guard isReady else { return }
+    /// Makes the page show exactly `strokes` (in this z-order). Calls `completion` once the page
+    /// has applied the DOM update.
+    func sync(_ strokes: [InkStroke], completion: (() -> Void)? = nil) {
+        guard isReady else {
+            completion?()
+            return
+        }
         var add: [[String: Any]] = []
         var seen = Set<UUID>()
         for stroke in strokes {
@@ -133,14 +138,19 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
         let order = strokes.map(\.id)
         let orderChanged = order != renderedOrder
         renderedOrder = order
-        guard !add.isEmpty || !remove.isEmpty || orderChanged else { return }
+        guard !add.isEmpty || !remove.isEmpty || orderChanged else {
+            completion?()
+            return
+        }
 
         var ops: [String: Any] = ["add": add, "remove": remove.map(\.uuidString)]
         if orderChanged {
             ops["order"] = order.map(\.uuidString)
         }
         webView.callAsyncJavaScript("return window.__qm ? window.__qm.apply(ops) : -1;", arguments: ["ops": ops],
-                                    in: nil, in: .page) { _ in }
+                                    in: nil, in: .page) { _ in
+            completion?()
+        }
     }
 
     static func payload(for stroke: InkStroke) -> [String: Any] {
@@ -150,6 +160,8 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
             "d": SVGPath.string(from: stroke.outlinePath()),
             "color": stroke.color.cssString,
             "hl": stroke.isHighlighter,
+            "tape": stroke.isTape,
+            "revealed": stroke.isRevealed,
             "anchor": ["selector": anchor.selector, "fingerprint": anchor.fingerprint, "tag": anchor.tag],
         ]
     }
@@ -176,6 +188,10 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
             }
             placements = updated
             onPlacementsChanged?()
+        case "toggleTape":
+            if let raw = body["id"] as? String, let id = UUID(uuidString: raw) {
+                onToggleTape?(id)
+            }
         default:
             break
         }

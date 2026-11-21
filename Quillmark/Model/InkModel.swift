@@ -71,7 +71,39 @@ struct RGBAColor: Codable, Equatable, Hashable {
 enum ToolKind: String, Codable, CaseIterable {
     case pen
     case highlighter
+    case tape
+    case laser
     case eraser
+}
+
+enum StrokeLineStyle: String, Codable, CaseIterable, Identifiable {
+    case solid
+    case dashed
+    case dotted
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .solid: return "实线"
+        case .dashed: return "虚线"
+        case .dotted: return "点线"
+        }
+    }
+}
+
+enum LaserMode: String, Codable, CaseIterable, Identifiable {
+    case trail
+    case dot
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .trail: return "拖尾"
+        case .dot: return "光点"
+        }
+    }
 }
 
 enum EraserMode: String, Codable, CaseIterable, Identifiable {
@@ -94,6 +126,7 @@ enum EraserMode: String, Codable, CaseIterable, Identifiable {
 enum InkTool: String, Codable {
     case pen
     case highlighter
+    case tape
 }
 
 /// Where a stroke written on a live web page is attached. Points of an anchored stroke are
@@ -119,13 +152,20 @@ struct InkStroke: Codable, Equatable, Identifiable {
     var points: [InkPoint]
     /// `nil` for pen strokes written before highlighters existed.
     var tool: InkTool?
-    /// Already-processed centerline. Set for pieces left over by the precise eraser, which must
-    /// keep their exact shape instead of being re-smoothed from raw points.
+    /// Already-processed centerline. Set for pieces left over by the precise eraser or snapped
+    /// shapes, which must keep their exact geometry instead of being re-smoothed from raw points.
     var baked: [StrokeSample]?
     /// Set for strokes on live web documents.
     var anchor: WebAnchor?
+    /// Solid, dashed or dotted. `nil` means `.solid`.
+    var lineStyle: StrokeLineStyle?
+    /// For `.tape` strokes: whether the tape is currently peeled/revealed to show content underneath.
+    var revealed: Bool?
 
     var isHighlighter: Bool { tool == .highlighter }
+    var isTape: Bool { tool == .tape }
+    var isRevealed: Bool { revealed == true }
+    var resolvedLineStyle: StrokeLineStyle { lineStyle ?? .solid }
 
     /// The same stroke moved by `offset` (used to switch between page and anchor coordinates).
     func translated(by offset: CGPoint) -> InkStroke {
@@ -175,6 +215,8 @@ struct ToolSettings: Codable, Equatable {
     var pen: PenKind = .fountain
     var color: RGBAColor = .ink
     var width: Float = 1.8
+    var lineStyle: StrokeLineStyle = .solid
+    var drawAndHold: Bool = true
     var smoothing: Float = 0.45
     var prediction: Bool = true
 
@@ -182,6 +224,15 @@ struct ToolSettings: Codable, Equatable {
     var highlighterColor: RGBAColor = ToolSettings.highlighterPalette[0]
     var highlighterWidth: Float = 14
     var highlighterStraight: Bool = false
+
+    // Cover Tape
+    var tapeColor: RGBAColor = ToolSettings.tapePalette[0]
+    var tapeWidth: Float = 26
+    var tapeStraight: Bool = true
+
+    // Laser Pointer
+    var laserMode: LaserMode = .trail
+    var laserColor: RGBAColor = ToolSettings.laserPalette[0]
 
     // Eraser
     var eraserMode: EraserMode = .pixel
@@ -192,6 +243,7 @@ struct ToolSettings: Codable, Equatable {
 
     static let widthPresets: [Float] = [1.0, 1.8, 3.0]
     static let highlighterWidthPresets: [Float] = [8, 14, 22]
+    static let tapeWidthPresets: [Float] = [18, 26, 42]
     static let eraserRadiusPresets: [Float] = [4, 8, 16]
 
     static let palette: [RGBAColor] = [
@@ -209,6 +261,21 @@ struct ToolSettings: Codable, Equatable {
         RGBAColor(1.00, 0.55, 0.75),
         RGBAColor(0.45, 0.80, 1.00),
         RGBAColor(1.00, 0.70, 0.30),
+    ]
+
+    static let tapePalette: [RGBAColor] = [
+        RGBAColor(0.95, 0.89, 0.68), // masking tape beige
+        RGBAColor(0.76, 0.86, 0.96), // soft sky
+        RGBAColor(0.76, 0.91, 0.81), // soft mint
+        RGBAColor(0.96, 0.80, 0.84), // soft rose
+        RGBAColor(0.84, 0.85, 0.88), // neutral gray
+    ]
+
+    static let laserPalette: [RGBAColor] = [
+        RGBAColor(0.98, 0.16, 0.18), // classic red
+        RGBAColor(0.15, 0.55, 1.00), // electric blue
+        RGBAColor(0.10, 0.82, 0.42), // emerald
+        RGBAColor(1.00, 0.58, 0.08), // amber
     ]
 
     /// Selects a tool and remembers the one being left for double-tap "switch to previous".
@@ -236,7 +303,7 @@ struct ToolSettings: Codable, Equatable {
         kind = target == kind ? .pen : target
     }
 
-    private static let defaultsKey = "toolSettings.v2"
+    private static let defaultsKey = "toolSettings.v3"
 
     static func load(from defaults: UserDefaults = .standard) -> ToolSettings {
         guard let data = defaults.data(forKey: defaultsKey),

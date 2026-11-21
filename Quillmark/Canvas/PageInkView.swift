@@ -116,7 +116,8 @@ final class PageInkView: UIView, InkInputDelegate {
                 strokeLayers[stroke.id] = shape
             }
             if renderedStrokes[stroke.id] != stroke {
-                Self.applyAppearance(highlighter: stroke.isHighlighter, color: stroke.color, to: shape)
+                Self.applyAppearance(highlighter: stroke.isHighlighter, tape: stroke.isTape,
+                                     revealed: stroke.isRevealed, color: stroke.color, to: shape)
                 shape.path = stroke.outlinePath(transform: transform)
                 renderedStrokes[stroke.id] = stroke
             }
@@ -127,14 +128,25 @@ final class PageInkView: UIView, InkInputDelegate {
         CATransaction.commit()
     }
 
-    private static func applyAppearance(highlighter: Bool, color: RGBAColor, to shape: CAShapeLayer) {
+    private static func applyAppearance(highlighter: Bool, tape: Bool = false, revealed: Bool = false,
+                                        color: RGBAColor, to shape: CAShapeLayer) {
         shape.fillColor = color.cgColor
         if highlighter {
             shape.opacity = highlighterOpacity
             shape.compositingFilter = "multiplyBlendMode"
+            shape.strokeColor = nil
+            shape.lineDashPattern = nil
+        } else if tape {
+            shape.opacity = revealed ? 0.16 : 0.96
+            shape.compositingFilter = nil
+            shape.strokeColor = UIColor.black.withAlphaComponent(0.25).cgColor
+            shape.lineWidth = 1
+            shape.lineDashPattern = [5, 3]
         } else {
             shape.opacity = 1
             shape.compositingFilter = nil
+            shape.strokeColor = nil
+            shape.lineDashPattern = nil
         }
     }
 
@@ -145,6 +157,9 @@ final class PageInkView: UIView, InkInputDelegate {
         liveTool = session.tool
         if liveTool.kind == .eraser {
             eraseBegan(touch, event: event)
+        } else if liveTool.kind == .laser {
+            // Legacy PDF pages simply show a temporary laser path until lifted.
+            drawBegan(touch, event: event)
         } else {
             drawBegan(touch, event: event)
         }
@@ -162,6 +177,8 @@ final class PageInkView: UIView, InkInputDelegate {
         if liveTool.kind == .eraser {
             eraseMoved(touch, event: event)
             eraseEnded()
+        } else if liveTool.kind == .laser {
+            inkCancelled()
         } else {
             append(event?.coalescedTouches(for: touch) ?? [touch])
             commitLiveStroke()
@@ -192,11 +209,12 @@ final class PageInkView: UIView, InkInputDelegate {
         lastCommitted = nil
         liveStartTime = touch.timestamp
         let highlighter = liveTool.kind == .highlighter
+        let tape = liveTool.kind == .tape
+        let color: RGBAColor = highlighter ? liveTool.highlighterColor
+            : (tape ? liveTool.tapeColor : (liveTool.kind == .laser ? liveTool.laserColor : liveTool.color))
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        Self.applyAppearance(highlighter: highlighter,
-                             color: highlighter ? liveTool.highlighterColor : liveTool.color,
-                             to: liveLayer)
+        Self.applyAppearance(highlighter: highlighter, tape: tape, color: color, to: liveLayer)
         CATransaction.commit()
         append(event?.coalescedTouches(for: touch) ?? [touch])
         updateLiveStroke(predicted: [])
@@ -268,8 +286,14 @@ final class PageInkView: UIView, InkInputDelegate {
             return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
                              width: liveTool.highlighterWidth, smoothing: 0.7, points: shaped, tool: .highlighter)
         }
+        if liveTool.kind == .tape {
+            let shaped = liveTool.tapeStraight ? StrokeProcessor.straightened(points, snapAngleDegrees: 8) : points
+            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.tapeColor,
+                             width: liveTool.tapeWidth, smoothing: 0.7, points: shaped, tool: .tape, revealed: false)
+        }
         return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
-                         smoothing: liveTool.smoothing, points: points, tool: .pen)
+                         smoothing: liveTool.smoothing, points: points, tool: .pen,
+                         lineStyle: liveTool.lineStyle)
     }
 
     private func updateLiveStroke(predicted: [UITouch]) {

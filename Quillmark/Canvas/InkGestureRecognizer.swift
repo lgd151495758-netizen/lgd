@@ -12,6 +12,9 @@ protocol InkInputDelegate: AnyObject {
 /// Tracks a single drawing touch. By default only Apple Pencil draws; fingers keep scrolling
 /// and zooming the page. With finger drawing on, one finger draws and a second finger cancels
 /// the stroke so the user can pan/zoom.
+///
+/// Explicitly refuses to be prevented by system/WebKit gesture recognizers so fast strokes are
+/// never hijacked or cancelled mid-flight.
 final class InkGestureRecognizer: UIGestureRecognizer {
     weak var inkDelegate: InkInputDelegate?
 
@@ -37,17 +40,34 @@ final class InkGestureRecognizer: UIGestureRecognizer {
         allowedTouchTypes = types
     }
 
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        if let tracked = trackedTouch, tracked.type == .pencil {
+            return true
+        }
+        return allowsFingerDrawing
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
         if let tracked = trackedTouch {
-            if tracked.type == .direct, touches.contains(where: { $0.type == .direct }) {
-                inkDelegate?.inkCancelled()
-                state = .cancelled
+            // If UIKit hasn't called reset() after a rapid previous stroke, start fresh cleanly.
+            if tracked.phase == .ended || tracked.phase == .cancelled {
+                trackedTouch = nil
+            } else {
+                if tracked.type == .direct, touches.contains(where: { $0.type == .direct }) {
+                    trackedTouch = nil
+                    inkDelegate?.inkCancelled()
+                    state = .cancelled
+                    return
+                }
+                for touch in touches where touch !== tracked {
+                    ignore(touch, for: event)
+                }
                 return
             }
-            for touch in touches where touch !== tracked {
-                ignore(touch, for: event)
-            }
-            return
         }
         let fingers = touches.filter { $0.type == .direct }
         if fingers.count > 1 {
@@ -71,12 +91,14 @@ final class InkGestureRecognizer: UIGestureRecognizer {
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = trackedTouch, touches.contains(touch) else { return }
+        trackedTouch = nil
         inkDelegate?.inkEnded(touch, event: event)
         state = .ended
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = trackedTouch, touches.contains(touch) else { return }
+        trackedTouch = nil
         inkDelegate?.inkCancelled()
         state = .cancelled
     }

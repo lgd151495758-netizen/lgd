@@ -20,7 +20,7 @@ final class StrokeGeometryCache {
         }
         let samples = stroke.renderSamples()
         var bounds = CGRect.null
-        for s in samples {
+        for s in samples where s.radius > 0 {
             bounds = bounds.union(CGRect(x: s.point.x - s.radius, y: s.point.y - s.radius,
                                          width: 2 * s.radius, height: 2 * s.radius))
         }
@@ -63,7 +63,7 @@ enum EraserEngine {
             switch mode {
             case .stroke:
                 let hit = cache.samples(for: stroke).contains { sample in
-                    distance(from: sample.point, toSegment: a, b) <= radius + sample.radius
+                    sample.radius > 0 && distance(from: sample.point, toSegment: a, b) <= radius + sample.radius
                 }
                 if hit {
                     changed = true
@@ -90,6 +90,13 @@ enum EraserEngine {
         var current: [StrokeSample] = []
         var hit = false
         for sample in dense {
+            if sample.radius <= 0 {
+                if !current.isEmpty {
+                    runs.append(current)
+                    current = []
+                }
+                continue
+            }
             if distance(from: sample.point, toSegment: a, b) <= radius + sample.radius * 0.6 {
                 hit = true
                 if !current.isEmpty {

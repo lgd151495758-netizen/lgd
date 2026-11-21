@@ -10,8 +10,15 @@ protocol PresentationContentSource: AnyObject {
     func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void)
 }
 
-/// Real-time vector ink state mirrored directly onto the external display at 60 fps while drawing
-/// or erasing, so strokes appear immediately on the external screen without waiting for a snapshot.
+struct PendingOverlayStroke {
+    var path: CGPath
+    var color: CGColor?
+    var opacity: Float
+    var isHighlighter: Bool
+}
+
+/// Real-time vector ink state mirrored directly onto the external display at 60 fps while drawing,
+/// erasing, or using the laser pointer, so marks appear immediately without waiting for a snapshot.
 struct LiveOverlayState {
     /// Size of the captured rectangle (matches the image passed to `PresentationViewController`).
     var sourceSize: CGSize = .zero
@@ -21,11 +28,12 @@ struct LiveOverlayState {
     var strokeColor: CGColor?
     var strokeOpacity: Float = 1
     var isHighlighter: Bool = false
-    var pendingPath: CGPath?
-    var pendingColor: CGColor?
-    var pendingOpacity: Float = 1
-    var pendingIsHighlighter: Bool = false
+    var pendingStrokes: [PendingOverlayStroke] = []
     var cursorPath: CGPath?
+    var laserGlowPath: CGPath?
+    var laserCorePath: CGPath?
+    var laserColor: CGColor?
+    var laserOpacity: Float = 1
 
     static let empty = LiveOverlayState()
 }
@@ -586,9 +594,12 @@ final class PresentationViewController: UIViewController {
 
     private let imageView = UIImageView()
     private let overlayContainer = CALayer()
-    private let pendingLayer = CAShapeLayer()
+    private let pendingContainer = CALayer()
+    private var pendingLayers: [CAShapeLayer] = []
     private let liveStrokeLayer = CAShapeLayer()
     private let eraserCursorLayer = CAShapeLayer()
+    private let laserGlowLayer = CAShapeLayer()
+    private let laserCoreLayer = CAShapeLayer()
 
     private var sourceSize: CGSize = .zero
     private var lastBoundsSize: CGSize = .zero
@@ -606,15 +617,23 @@ final class PresentationViewController: UIViewController {
         overlayContainer.masksToBounds = true
         view.layer.addSublayer(overlayContainer)
 
-        pendingLayer.fillRule = .nonZero
         liveStrokeLayer.fillRule = .nonZero
         eraserCursorLayer.fillColor = UIColor.systemGray.withAlphaComponent(0.18).cgColor
         eraserCursorLayer.strokeColor = UIColor.systemGray.cgColor
         eraserCursorLayer.lineWidth = 1.5
 
-        overlayContainer.addSublayer(pendingLayer)
+        laserGlowLayer.fillRule = .nonZero
+        laserGlowLayer.shadowOffset = .zero
+        laserGlowLayer.shadowRadius = 10
+        laserGlowLayer.shadowOpacity = 0.9
+        laserCoreLayer.fillRule = .nonZero
+        laserCoreLayer.fillColor = UIColor.white.cgColor
+
+        overlayContainer.addSublayer(pendingContainer)
         overlayContainer.addSublayer(liveStrokeLayer)
         overlayContainer.addSublayer(eraserCursorLayer)
+        overlayContainer.addSublayer(laserGlowLayer)
+        overlayContainer.addSublayer(laserCoreLayer)
     }
 
     override func viewDidLayoutSubviews() {
@@ -645,9 +664,12 @@ final class PresentationViewController: UIViewController {
         CATransaction.setDisableActions(true)
         imageView.frame = target
         overlayContainer.frame = target
-        pendingLayer.frame = overlayContainer.bounds
+        pendingContainer.frame = overlayContainer.bounds
+        for layer in pendingLayers { layer.frame = pendingContainer.bounds }
         liveStrokeLayer.frame = overlayContainer.bounds
         eraserCursorLayer.frame = overlayContainer.bounds
+        laserGlowLayer.frame = overlayContainer.bounds
+        laserCoreLayer.frame = overlayContainer.bounds
         CATransaction.commit()
         applyOverlay()
     }
@@ -658,8 +680,10 @@ final class PresentationViewController: UIViewController {
         let refSize = lastOverlay.sourceSize.width > 0 ? lastOverlay.sourceSize : sourceSize
         guard refSize.width > 0, overlayContainer.bounds.width > 0 else {
             liveStrokeLayer.path = nil
-            pendingLayer.path = nil
             eraserCursorLayer.path = nil
+            laserGlowLayer.path = nil
+            laserCoreLayer.path = nil
+            for layer in pendingLayers { layer.path = nil }
             CATransaction.commit()
             return
         }
@@ -667,18 +691,46 @@ final class PresentationViewController: UIViewController {
         var transform = CGAffineTransform(a: scale, b: 0, c: 0, d: scale,
                                           tx: 0, ty: -lastOverlay.captureOriginY * scale)
 
-        applyShape(layer: pendingLayer, path: lastOverlay.pendingPath, color: lastOverlay.pendingColor,
-                   opacity: lastOverlay.pendingOpacity, isHighlighter: lastOverlay.pendingIsHighlighter,
-                   transform: &transform)
+        // Reuse or add shape layers for all pending strokes being committed to WebKit.
+        while pendingLayers.count < lastOverlay.pendingStrokes.count {
+            let layer = CAShapeLayer()
+            layer.fillRule = .nonZero
+            layer.frame = pendingContainer.bounds
+            pendingContainer.addSublayer(layer)
+            pendingLayers.append(layer)
+        }
+        for i in 0..<pendingLayers.count {
+            if i < lastOverlay.pendingStrokes.count {
+                let item = lastOverlay.pendingStrokes[i]
+                applyShape(layer: pendingLayers[i], path: item.path, color: item.color,
+                           opacity: item.opacity, isHighlighter: item.isHighlighter, transform: &transform)
+            } else {
+                pendingLayers[i].path = nil
+            }
+        }
+
         applyShape(layer: liveStrokeLayer, path: lastOverlay.strokePath, color: lastOverlay.strokeColor,
                    opacity: lastOverlay.strokeOpacity, isHighlighter: lastOverlay.isHighlighter,
                    transform: &transform)
+
         if let cursorPath = lastOverlay.cursorPath {
             eraserCursorLayer.path = cursorPath.copy(using: &transform)
             eraserCursorLayer.isHidden = false
         } else {
             eraserCursorLayer.path = nil
             eraserCursorLayer.isHidden = true
+        }
+
+        if let glowPath = lastOverlay.laserGlowPath {
+            laserGlowLayer.fillColor = lastOverlay.laserColor
+            laserGlowLayer.shadowColor = lastOverlay.laserColor
+            laserGlowLayer.opacity = lastOverlay.laserOpacity
+            laserGlowLayer.path = glowPath.copy(using: &transform)
+            laserCoreLayer.opacity = lastOverlay.laserOpacity
+            laserCoreLayer.path = lastOverlay.laserCorePath?.copy(using: &transform)
+        } else {
+            laserGlowLayer.path = nil
+            laserCoreLayer.path = nil
         }
         CATransaction.commit()
     }

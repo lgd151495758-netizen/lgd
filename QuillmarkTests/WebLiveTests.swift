@@ -144,4 +144,37 @@ final class WebLiveTests: XCTestCase {
                                                                   arguments: [:], in: nil, contentWorld: .page) as? Int
         XCTAssertEqual(width, 800)
     }
+
+    func testCoverTapeClickTogglesAndAnchorPickPassesThrough() async throws {
+        let picked = await bridge.pickAnchor(at: CGPoint(x: 40, y: 130))
+        let pick = try XCTUnwrap(picked)
+        XCTAssertEqual(pick.anchor.selector, "#note")
+
+        let points = (0..<20).map { i in
+            InkPoint(x: Float(20 + i * 4), y: 130, force: 0.5, t: Float(i) / 240)
+        }
+        var tape = InkStroke(id: UUID(), pen: .ballpoint, color: ToolSettings.tapePalette[0],
+                             width: 26, smoothing: 0.5, points: points, tool: .tape,
+                             lineStyle: .solid, revealed: false)
+        tape = tape.translated(by: CGPoint(x: -pick.origin.x, y: -pick.origin.y))
+        tape.anchor = pick.anchor
+
+        var toggledID: UUID?
+        bridge.onToggleTape = { toggledID = $0 }
+        bridge.sync([tape])
+        let placed = await waitUntil { self.bridge.placements[tape.id]?.visible == true }
+        XCTAssertTrue(placed)
+
+        // Clicking the tape SVG path must post toggleTape back to Swift.
+        try await run("""
+        var p = document.querySelector('#__qm_layer path');
+        if (p) { p.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }
+        """)
+        let toggled = await waitUntil { toggledID == tape.id }
+        XCTAssertTrue(toggled, "clicking a cover tape must notify WebInkBridge.onToggleTape")
+
+        // Picking an anchor on top of an existing interactive cover tape must still find #note underneath.
+        let pickedThrough = await bridge.pickAnchor(at: CGPoint(x: 40, y: 130))
+        XCTAssertEqual(pickedThrough?.anchor.selector, "#note")
+    }
 }

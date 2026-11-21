@@ -81,6 +81,50 @@ final class DocumentSession: ObservableObject {
         perform(.replace(page: page, before: before, after: after))
     }
 
+    /// Flips a single cover tape between hidden (opaque) and revealed (translucent) without
+    /// adding an undo entry, so tapping answers during a lecture never disturbs ink undo.
+    func toggleTape(id: UUID, page: Int) {
+        var changed = false
+        annotations.updatePage(page) { pageAnnotations in
+            if let index = pageAnnotations.strokes.firstIndex(where: { $0.id == id && $0.isTape }) {
+                pageAnnotations.strokes[index].revealed = !pageAnnotations.strokes[index].isRevealed
+                changed = true
+            }
+        }
+        guard changed else { return }
+        pageDidChange?(page)
+        scheduleSave()
+    }
+
+    /// Covers (`revealed == false`) or reveals (`revealed == true`) every tape on `page`
+    /// (or across all annotated pages when `page == nil`).
+    func setAllTapesRevealed(_ revealed: Bool, page: Int? = nil) {
+        let targetPages: [Int]
+        if let page {
+            targetPages = [page]
+        } else {
+            targetPages = annotations.pages.keys.compactMap(Int.init).sorted()
+        }
+        var changedPages: [Int] = []
+        for p in targetPages {
+            var changed = false
+            annotations.updatePage(p) { pageAnnotations in
+                for i in pageAnnotations.strokes.indices where pageAnnotations.strokes[i].isTape {
+                    if pageAnnotations.strokes[i].isRevealed != revealed {
+                        pageAnnotations.strokes[i].revealed = revealed
+                        changed = true
+                    }
+                }
+            }
+            if changed { changedPages.append(p) }
+        }
+        guard !changedPages.isEmpty else { return }
+        for p in changedPages {
+            pageDidChange?(p)
+        }
+        scheduleSave()
+    }
+
     /// Apple Pencil (2nd generation) double-tap, following the user's system preference.
     func handlePencilDoubleTap(_ action: UIPencilPreferredAction) {
         switch action {

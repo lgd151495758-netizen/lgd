@@ -7,7 +7,8 @@
 
   var NS = 'http://www.w3.org/2000/svg';
   var Z_HIGHLIGHT = '2147483000';
-  var Z_INK = '2147483001';
+  var Z_TAPE = '2147483001';
+  var Z_INK = '2147483002';
 
   // No z-index on the layer: it must not create a stacking context, otherwise the
   // highlighter's multiply blend could not reach the page underneath.
@@ -131,19 +132,60 @@
     var svg = document.createElementNS(NS, 'svg');
     svg.setAttribute('width', '1');
     svg.setAttribute('height', '1');
-    svg.style.cssText = 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none;' +
-      (stroke.hl ? 'z-index:' + Z_HIGHLIGHT + ';mix-blend-mode:multiply;opacity:0.6;' : 'z-index:' + Z_INK + ';');
+    var style = 'position:absolute;left:0;top:0;overflow:visible;pointer-events:none;';
+    if (stroke.hl) {
+      style += 'z-index:' + Z_HIGHLIGHT + ';mix-blend-mode:multiply;opacity:0.6;';
+    } else if (stroke.tape) {
+      style += 'z-index:' + Z_TAPE + ';';
+    } else {
+      style += 'z-index:' + Z_INK + ';';
+    }
+    svg.style.cssText = style;
     var path = document.createElementNS(NS, 'path');
     path.setAttribute('d', stroke.d);
     path.setAttribute('fill', stroke.color);
+    if (stroke.tape) {
+      path.style.pointerEvents = 'auto';
+      path.style.cursor = 'pointer';
+      if (stroke.revealed) {
+        path.setAttribute('fill-opacity', '0.14');
+        path.setAttribute('stroke', 'rgba(0,0,0,0.28)');
+        path.setAttribute('stroke-width', '1.2');
+        path.setAttribute('stroke-dasharray', '4 4');
+      } else {
+        path.setAttribute('fill-opacity', '0.98');
+        path.setAttribute('stroke', 'rgba(0,0,0,0.22)');
+        path.setAttribute('stroke-width', '1');
+        path.setAttribute('stroke-dasharray', '5 3');
+      }
+      path.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        post({ type: 'toggleTape', id: stroke.id });
+      });
+    }
     svg.appendChild(path);
     return svg;
   }
 
   function pickAnchor(x, y) {
-    var el = document.elementFromPoint(x - window.scrollX, y - window.scrollY) || document.body;
+    var vx = x - window.scrollX;
+    var vy = y - window.scrollY;
+    var el = null;
+    if (document.elementsFromPoint) {
+      var stack = document.elementsFromPoint(vx, vy) || [];
+      for (var i = 0; i < stack.length; i++) {
+        if (stack[i] !== layer && !layer.contains(stack[i])) {
+          el = stack[i];
+          break;
+        }
+      }
+    }
+    if (!el) {
+      el = document.elementFromPoint(vx, vy) || document.body;
+    }
     while (el && el !== document.body && el !== document.documentElement) {
-      if (!layer.contains(el)) {
+      if (el !== layer && !layer.contains(el)) {
         var display = getComputedStyle(el).display;
         var r = el.getBoundingClientRect();
         if (display !== 'inline' && display !== 'contents' && r.width >= 12 && r.height >= 12) { break; }
@@ -209,6 +251,14 @@
   document.addEventListener('transitionend', schedule, true);
   document.addEventListener('animationend', schedule, true);
   document.addEventListener('toggle', schedule, true);
+
+  // Prevent WebKit text selection / Scribble from reacting to Apple Pencil touches.
+  window.addEventListener('pointerdown', function (e) {
+    if (e.pointerType === 'pen') { e.preventDefault(); }
+  }, { passive: false, capture: true });
+  window.addEventListener('touchstart', function (e) {
+    if (e.touches && e.touches.length === 1 && e.touches[0].touchType === 'stylus') { e.preventDefault(); }
+  }, { passive: false, capture: true });
 
   ensureLayer();
   post({ type: 'ready' });
