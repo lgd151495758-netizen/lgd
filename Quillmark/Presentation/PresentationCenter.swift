@@ -15,6 +15,8 @@ struct PendingOverlayStroke {
     var color: CGColor?
     var opacity: Float
     var isHighlighter: Bool
+    var fillPath: CGPath? = nil
+    var fillColor: CGColor? = nil
 }
 
 /// Real-time vector ink state mirrored directly onto the external display at 60 fps while drawing,
@@ -28,6 +30,8 @@ struct LiveOverlayState {
     var strokeColor: CGColor?
     var strokeOpacity: Float = 1
     var isHighlighter: Bool = false
+    var fillPath: CGPath? = nil
+    var fillColor: CGColor? = nil
     var pendingStrokes: [PendingOverlayStroke] = []
     var cursorPath: CGPath?
     var laserGlowPath: CGPath?
@@ -594,8 +598,11 @@ final class PresentationViewController: UIViewController {
 
     private let imageView = UIImageView()
     private let overlayContainer = CALayer()
+    private let pendingFillContainer = CALayer()
     private let pendingContainer = CALayer()
+    private var pendingFillLayers: [CAShapeLayer] = []
     private var pendingLayers: [CAShapeLayer] = []
+    private let liveFillLayer = CAShapeLayer()
     private let liveStrokeLayer = CAShapeLayer()
     private let eraserCursorLayer = CAShapeLayer()
     private let laserGlowLayer = CAShapeLayer()
@@ -617,6 +624,8 @@ final class PresentationViewController: UIViewController {
         overlayContainer.masksToBounds = true
         view.layer.addSublayer(overlayContainer)
 
+        liveFillLayer.fillRule = .nonZero
+        liveFillLayer.opacity = 0.18
         liveStrokeLayer.fillRule = .nonZero
         eraserCursorLayer.fillColor = UIColor.systemGray.withAlphaComponent(0.18).cgColor
         eraserCursorLayer.strokeColor = UIColor.systemGray.cgColor
@@ -629,7 +638,9 @@ final class PresentationViewController: UIViewController {
         laserCoreLayer.fillRule = .nonZero
         laserCoreLayer.fillColor = UIColor.white.cgColor
 
+        overlayContainer.addSublayer(pendingFillContainer)
         overlayContainer.addSublayer(pendingContainer)
+        overlayContainer.addSublayer(liveFillLayer)
         overlayContainer.addSublayer(liveStrokeLayer)
         overlayContainer.addSublayer(eraserCursorLayer)
         overlayContainer.addSublayer(laserGlowLayer)
@@ -664,8 +675,11 @@ final class PresentationViewController: UIViewController {
         CATransaction.setDisableActions(true)
         imageView.frame = target
         overlayContainer.frame = target
+        pendingFillContainer.frame = overlayContainer.bounds
         pendingContainer.frame = overlayContainer.bounds
+        for layer in pendingFillLayers { layer.frame = pendingFillContainer.bounds }
         for layer in pendingLayers { layer.frame = pendingContainer.bounds }
+        liveFillLayer.frame = overlayContainer.bounds
         liveStrokeLayer.frame = overlayContainer.bounds
         eraserCursorLayer.frame = overlayContainer.bounds
         laserGlowLayer.frame = overlayContainer.bounds
@@ -679,10 +693,12 @@ final class PresentationViewController: UIViewController {
         CATransaction.setDisableActions(true)
         let refSize = lastOverlay.sourceSize.width > 0 ? lastOverlay.sourceSize : sourceSize
         guard refSize.width > 0, overlayContainer.bounds.width > 0 else {
+            liveFillLayer.path = nil
             liveStrokeLayer.path = nil
             eraserCursorLayer.path = nil
             laserGlowLayer.path = nil
             laserCoreLayer.path = nil
+            for layer in pendingFillLayers { layer.path = nil }
             for layer in pendingLayers { layer.path = nil }
             CATransaction.commit()
             return
@@ -693,6 +709,13 @@ final class PresentationViewController: UIViewController {
 
         // Reuse or add shape layers for all pending strokes being committed to WebKit.
         while pendingLayers.count < lastOverlay.pendingStrokes.count {
+            let fillLayer = CAShapeLayer()
+            fillLayer.fillRule = .nonZero
+            fillLayer.opacity = 0.18
+            fillLayer.frame = pendingFillContainer.bounds
+            pendingFillContainer.addSublayer(fillLayer)
+            pendingFillLayers.append(fillLayer)
+
             let layer = CAShapeLayer()
             layer.fillRule = .nonZero
             layer.frame = pendingContainer.bounds
@@ -702,13 +725,18 @@ final class PresentationViewController: UIViewController {
         for i in 0..<pendingLayers.count {
             if i < lastOverlay.pendingStrokes.count {
                 let item = lastOverlay.pendingStrokes[i]
+                applyShape(layer: pendingFillLayers[i], path: item.fillPath, color: item.fillColor,
+                           opacity: 0.18, isHighlighter: false, transform: &transform)
                 applyShape(layer: pendingLayers[i], path: item.path, color: item.color,
                            opacity: item.opacity, isHighlighter: item.isHighlighter, transform: &transform)
             } else {
+                pendingFillLayers[i].path = nil
                 pendingLayers[i].path = nil
             }
         }
 
+        applyShape(layer: liveFillLayer, path: lastOverlay.fillPath, color: lastOverlay.fillColor,
+                   opacity: 0.18, isHighlighter: false, transform: &transform)
         applyShape(layer: liveStrokeLayer, path: lastOverlay.strokePath, color: lastOverlay.strokeColor,
                    opacity: lastOverlay.strokeOpacity, isHighlighter: lastOverlay.isHighlighter,
                    transform: &transform)

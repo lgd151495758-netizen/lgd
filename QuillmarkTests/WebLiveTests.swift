@@ -177,4 +177,25 @@ final class WebLiveTests: XCTestCase {
         let pickedThrough = await bridge.pickAnchor(at: CGPoint(x: 40, y: 130))
         XCTAssertEqual(pickedThrough?.anchor.selector, "#note")
     }
+
+    func testShadedGeometricShapeRendersFillAndOutlinePaths() async throws {
+        let picked = await bridge.pickAnchor(at: CGPoint(x: 40, y: 130))
+        let pick = try XCTUnwrap(picked)
+
+        let built = ShapeBuilder.build(preset: .rightTriangle, from: CGPoint(x: 20, y: 120), to: CGPoint(x: 120, y: 200))
+        var shapeStroke = InkStroke(id: UUID(), pen: .ballpoint, color: ToolSettings.palette[1],
+                                    width: 2, smoothing: 0, points: [], tool: .pen,
+                                    lineStyle: .dashed, geometry: built.primitive, fillColor: ToolSettings.palette[1])
+        shapeStroke = shapeStroke.translated(by: CGPoint(x: -pick.origin.x, y: -pick.origin.y))
+        shapeStroke.anchor = pick.anchor
+
+        bridge.sync([shapeStroke])
+        let placed = await waitUntil { self.bridge.placements[shapeStroke.id]?.visible == true }
+        XCTAssertTrue(placed)
+
+        let pathCount = try await bridge.webView.callAsyncJavaScript(
+            "return document.querySelectorAll('#__qm_layer svg path').length;",
+            arguments: [:], in: nil, contentWorld: .page) as? Int
+        XCTAssertEqual(pathCount, 2, "shaded geometric stroke must render both fill and outline SVG paths")
+    }
 }

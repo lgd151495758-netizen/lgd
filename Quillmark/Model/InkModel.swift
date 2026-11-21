@@ -72,8 +72,48 @@ enum ToolKind: String, Codable, CaseIterable {
     case pen
     case highlighter
     case tape
+    case shape
     case laser
     case eraser
+}
+
+enum ShapePreset: String, Codable, CaseIterable, Identifiable {
+    case segment
+    case arrow
+    case rightTriangle
+    case isoscelesTriangle
+    case equilateralTriangle
+    case rectangle
+    case parallelogram
+    case rhombus
+    case trapezoid
+    case circle
+    case axes
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .segment: return "线段"
+        case .arrow: return "箭头"
+        case .rightTriangle: return "直角△"
+        case .isoscelesTriangle: return "等腰△"
+        case .equilateralTriangle: return "等边△"
+        case .rectangle: return "矩形"
+        case .parallelogram: return "平行四边"
+        case .rhombus: return "菱形"
+        case .trapezoid: return "梯形"
+        case .circle: return "圆"
+        case .axes: return "坐标系"
+        }
+    }
+
+    var supportsFill: Bool {
+        switch self {
+        case .segment, .arrow, .axes: return false
+        default: return true
+        }
+    }
 }
 
 enum StrokeLineStyle: String, Codable, CaseIterable, Identifiable {
@@ -147,8 +187,10 @@ struct InkStroke: Codable, Equatable, Identifiable {
     var lineStyle: StrokeLineStyle?
     /// For `.tape` strokes: whether the tape is currently peeled/revealed to show content underneath.
     var revealed: Bool?
-    /// Parametric geometric representation for ruler lines, compass arcs/circles, and snapped shapes.
+    /// Parametric geometric representation for standard shapes, compass arcs/circles, and snapped shapes.
     var geometry: GeometricPrimitive?
+    /// Optional translucent shading fill color for closed geometric shapes (e.g. shaded area problems).
+    var fillColor: RGBAColor?
 
     var isHighlighter: Bool { tool == .highlighter }
     var isTape: Bool { tool == .tape }
@@ -218,6 +260,10 @@ struct ToolSettings: Codable, Equatable {
     var tapeColor: RGBAColor = ToolSettings.tapePalette[0]
     var tapeWidth: Float = 26
     var tapeStraight: Bool = true
+
+    // Standard Geometric Shapes
+    var shapePreset: ShapePreset = .rightTriangle
+    var shapeFilled: Bool = false
 
     // Laser Pointer
     var laserColor: RGBAColor = ToolSettings.laserPalette[0]
@@ -291,7 +337,7 @@ struct ToolSettings: Codable, Equatable {
         kind = target == kind ? .pen : target
     }
 
-    private static let defaultsKey = "toolSettings.v3"
+    private static let defaultsKey = "toolSettings.v4"
 
     static func load(from defaults: UserDefaults = .standard) -> ToolSettings {
         guard let data = defaults.data(forKey: defaultsKey),

@@ -121,6 +121,7 @@ enum EraserEngine {
                 piece.points = []
                 piece.baked = run
                 piece.geometry = nil
+                piece.fillColor = nil
                 return piece
             }
     }

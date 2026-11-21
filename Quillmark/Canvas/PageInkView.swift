@@ -291,6 +291,13 @@ final class PageInkView: UIView, InkInputDelegate {
             return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.tapeColor,
                              width: liveTool.tapeWidth, smoothing: 0.7, points: shaped, tool: .tape, revealed: false)
         }
+        if liveTool.kind == .shape, let first = points.first, let last = points.last, points.count >= 2 {
+            let built = ShapeBuilder.build(preset: liveTool.shapePreset, from: first.location, to: last.location)
+            let fill = (liveTool.shapeFilled && built.primitive.supportsFill) ? liveTool.color : nil
+            return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
+                             smoothing: 0, points: [], tool: .pen, lineStyle: liveTool.lineStyle,
+                             geometry: built.primitive, fillColor: fill)
+        }
         return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
                          smoothing: liveTool.smoothing, points: points, tool: .pen,
                          lineStyle: liveTool.lineStyle)

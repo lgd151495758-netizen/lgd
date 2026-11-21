@@ -155,7 +155,7 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
 
     static func payload(for stroke: InkStroke) -> [String: Any] {
         let anchor = stroke.anchor ?? .body
-        return [
+        var dict: [String: Any] = [
             "id": stroke.id.uuidString,
             "d": SVGPath.string(from: stroke.outlinePath()),
             "color": stroke.color.cssString,
@@ -164,6 +164,11 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
             "revealed": stroke.isRevealed,
             "anchor": ["selector": anchor.selector, "fingerprint": anchor.fingerprint, "tag": anchor.tag],
         ]
+        if let fillColor = stroke.fillColor, let fillPath = stroke.fillPath() {
+            dict["fillD"] = SVGPath.string(from: fillPath)
+            dict["fillColor"] = fillColor.cssString
+        }
+        return dict
     }
 
     // MARK: WKScriptMessageHandler

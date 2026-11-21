@@ -23,6 +23,7 @@ final class GeometryConstructionTests: XCTestCase {
             .arc(center: CGPoint(x: 120, y: 120), radius: 60, startAngle: 0, endAngle: .pi / 2, clockwise: true, showCenterMark: true),
             .ellipse(center: CGPoint(x: 80, y: 90), rx: 40, ry: 20, rotation: 0.4),
             .polygon(vertices: [CGPoint(x: 0, y: 0), CGPoint(x: 50, y: 0), CGPoint(x: 25, y: 40)], closed: true),
+            .axes(origin: CGPoint(x: 150, y: 150), xMin: -80, xMax: 100, yMin: -90, yMax: 70, tickSpacing: 25),
         ]
         for prim in primitives {
             let stroke = InkStroke(id: UUID(), pen: .ballpoint, color: .ink, width: 2, smoothing: 0,
@@ -185,5 +186,118 @@ final class GeometryConstructionTests: XCTestCase {
         XCTAssertEqual(session.tool.kind, .pen, "enabling compass switches away from eraser to pen")
         session.toggleGeometryAid(.compass)
         XCTAssertEqual(session.geometryAid, .none)
+    }
+
+    // MARK: v0.8 Standard Math Shapes, Shading & Vertex Editing
+
+    func testAllStandardShapePresetsBuildValidGeometryAndInvariants() {
+        let start = CGPoint(x: 40, y: 40)
+        let end = CGPoint(x: 200, y: 160)
+
+        for preset in ShapePreset.allCases {
+            let built = ShapeBuilder.build(preset: preset, from: start, to: end)
+            let fill: RGBAColor? = preset.supportsFill ? ToolSettings.palette[1] : nil
+            let stroke = InkStroke(id: UUID(), pen: .ballpoint, color: ToolSettings.palette[1], width: 2,
+                                   smoothing: 0, points: [], tool: .pen, lineStyle: .solid,
+                                   geometry: built.primitive, fillColor: fill)
+            let outlineBox = stroke.outlinePath().boundingBox
+            XCTAssertFalse(outlineBox.isNull, "preset \(preset) must produce non-null outline")
+            XCTAssertTrue(outlineBox.width.isFinite && outlineBox.height.isFinite)
+            XCTAssertGreaterThan(built.primitive.controlHandles().count, 1)
+            XCTAssertEqual(stroke.fillPath() != nil, preset.supportsFill)
+        }
+
+        // Exact equilateral triangle: all 3 sides equal.
+        if case let .polygon(v, true) = ShapeBuilder.build(preset: .equilateralTriangle, from: start, to: end).primitive {
+            XCTAssertEqual(v.count, 3)
+            let s01 = hypot(v[1].x - v[0].x, v[1].y - v[0].y)
+            let s12 = hypot(v[2].x - v[1].x, v[2].y - v[1].y)
+            let s20 = hypot(v[0].x - v[2].x, v[0].y - v[2].y)
+            XCTAssertEqual(s01, s12, accuracy: 0.01)
+            XCTAssertEqual(s12, s20, accuracy: 0.01)
+        } else {
+            XCTFail("Expected equilateral triangle polygon")
+        }
+
+        // Exact right triangle: legs perpendicular (dot product == 0).
+        if case let .polygon(v, true) = ShapeBuilder.build(preset: .rightTriangle, from: start, to: end).primitive {
+            let leg1 = CGPoint(x: v[0].x - v[1].x, y: v[0].y - v[1].y)
+            let leg2 = CGPoint(x: v[2].x - v[1].x, y: v[2].y - v[1].y)
+            XCTAssertEqual(leg1.x * leg2.x + leg1.y * leg2.y, 0, accuracy: 0.01)
+        } else {
+            XCTFail("Expected right triangle polygon")
+        }
+
+        // Exact rhombus: all 4 sides equal.
+        if case let .polygon(v, true) = ShapeBuilder.build(preset: .rhombus, from: start, to: end).primitive {
+            XCTAssertEqual(v.count, 4)
+            let sides = (0..<4).map { i -> CGFloat in
+                let a = v[i], b = v[(i + 1) % 4]
+                return hypot(b.x - a.x, b.y - a.y)
+            }
+            XCTAssertEqual(sides[0], sides[1], accuracy: 0.01)
+            XCTAssertEqual(sides[1], sides[2], accuracy: 0.01)
+            XCTAssertEqual(sides[2], sides[3], accuracy: 0.01)
+        } else {
+            XCTFail("Expected rhombus polygon")
+        }
+
+        // Near-square rectangle snaps to exact square.
+        if case let .polygon(v, true) = ShapeBuilder.build(preset: .rectangle,
+                                                           from: CGPoint(x: 10, y: 10),
+                                                           to: CGPoint(x: 112, y: 110)).primitive {
+            let w = hypot(v[1].x - v[0].x, v[1].y - v[0].y)
+            let h = hypot(v[2].x - v[1].x, v[2].y - v[1].y)
+            XCTAssertEqual(w, h, accuracy: 0.01)
+        } else {
+            XCTFail("Expected square rectangle")
+        }
+    }
+
+    func testVertexEditingSnappingAxesHandlesAndOverlayHitTesting() {
+        let tri = GeometricPrimitive.polygon(vertices: [
+            CGPoint(x: 100, y: 40),
+            CGPoint(x: 180, y: 160),
+            CGPoint(x: 20, y: 160),
+        ], closed: true)
+        XCTAssertTrue(tri.hitTestBody(CGPoint(x: 100, y: 120)))
+        XCTAssertFalse(tri.hitTestBody(CGPoint(x: 300, y: 300)))
+
+        // Dragging vertex 0 near an intersection snaps straight to it.
+        let targetSnap = SnapPoint(point: CGPoint(x: 130, y: 55), kind: .intersection)
+        let moved = tri.movingHandle(at: 0, to: CGPoint(x: 133, y: 52), snapPoints: [targetSnap], snapThreshold: 10)
+        XCTAssertEqual(moved.snapped, targetSnap)
+        if case let .polygon(verts, _) = moved.primitive {
+            XCTAssertEqual(verts[0], targetSnap.point)
+        } else {
+            XCTFail("Expected polygon")
+        }
+
+        // Axes origin handle slides origin while preserving outer frame; right arm extends cleanly.
+        let axes = GeometricPrimitive.axes(origin: CGPoint(x: 200, y: 200),
+                                           xMin: -100, xMax: 100, yMin: -100, yMax: 100, tickSpacing: 25)
+        let origBox = axes.boundingBox()
+        let shiftedOrigin = axes.movingHandle(at: 0, to: CGPoint(x: 170, y: 230), snapPoints: []).primitive
+        XCTAssertEqual(shiftedOrigin.boundingBox().minX, origBox.minX, accuracy: 0.01)
+        XCTAssertEqual(shiftedOrigin.boundingBox().maxX, origBox.maxX, accuracy: 0.01)
+        XCTAssertEqual(shiftedOrigin.boundingBox().minY, origBox.minY, accuracy: 0.01)
+        XCTAssertEqual(shiftedOrigin.boundingBox().maxY, origBox.maxY, accuracy: 0.01)
+
+        // Axes participate in snap points with origin as `.center`.
+        let axisSnaps = GeometrySnapEngine.snapPoints(from: [axes])
+        XCTAssertTrue(axisSnaps.contains { $0.kind == .center && $0.point == CGPoint(x: 200, y: 200) })
+
+        // SelectedShapeOverlay hit-tests handles & action bar accurately.
+        let bounds = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        let overlay = SelectedShapeOverlay(strokeID: UUID(), handles: tri.controlHandles(),
+                                           boundingBox: tri.boundingBox(), lineStyle: .solid,
+                                           supportsFill: true, isFilled: false,
+                                           isCircularWithCenterMark: false, showsCenterMark: false)
+        XCTAssertEqual(overlay.hitTest(CGPoint(x: 100, y: 40), in: bounds, bodyHit: true), .handle(0))
+        let buttons = overlay.actionButtons(in: bounds)
+        XCTAssertEqual(buttons.count, 4)
+        let fillBtn = buttons[1]
+        XCTAssertEqual(overlay.hitTest(CGPoint(x: fillBtn.1.midX, y: fillBtn.1.midY), in: bounds, bodyHit: false),
+                       .action(.toggleFillOrCenter))
     }
 }

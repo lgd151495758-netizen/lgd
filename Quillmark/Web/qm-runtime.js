@@ -141,6 +141,13 @@
       style += 'z-index:' + Z_INK + ';';
     }
     svg.style.cssText = style;
+    if (stroke.fillD && stroke.fillColor) {
+      var fillEl = document.createElementNS(NS, 'path');
+      fillEl.setAttribute('d', stroke.fillD);
+      fillEl.setAttribute('fill', stroke.fillColor);
+      fillEl.setAttribute('fill-opacity', '0.18');
+      svg.appendChild(fillEl);
+    }
     var path = document.createElementNS(NS, 'path');
     path.setAttribute('d', stroke.d);
     path.setAttribute('fill', stroke.color);

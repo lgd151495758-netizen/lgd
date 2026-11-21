@@ -366,4 +366,9 @@ extension InkStroke {
                            lineStyle: resolvedLineStyle,
                            transform: transform)
     }
+
+    func fillPath(transform: CGAffineTransform = .identity) -> CGPath? {
+        guard fillColor != nil else { return nil }
+        return geometry?.fillPath(transform: transform)
+    }
 }

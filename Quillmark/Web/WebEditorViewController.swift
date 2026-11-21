@@ -13,7 +13,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private var webView: WKWebView { bridge.webView }
 
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
+    private let pendingFillContainer = CALayer()
     private let pendingContainer = CALayer()
+    private let liveFillLayer = CAShapeLayer()
     private let liveLayer = CAShapeLayer()
     private let eraserCursor = CAShapeLayer()
     private let laserGlowLayer = CAShapeLayer()
@@ -31,7 +33,17 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private struct PendingItem {
         let id: UUID
         let layer: CAShapeLayer
+        let fillLayer: CAShapeLayer?
         let isHighlighter: Bool
+    }
+
+    private struct ShapeEditContext {
+        let strokeID: UUID
+        let originalStrokes: [InkStroke]
+        let originalStroke: InkStroke
+        let anchorOrigin: CGPoint
+        let baseDocPrimitive: GeometricPrimitive
+        var currentDocPrimitive: GeometricPrimitive
     }
 
     private enum ActiveInteraction {
@@ -41,10 +53,16 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case compassResize
         case compassButton(CompassState.HitZone, startPoint: CGPoint)
         case compassDraw(sweep: CompassSweep, crossedCloseHaptic: Bool)
+        case shapeCreate(preset: ShapePreset, startDoc: CGPoint, rawStartView: CGPoint, currentPrimitive: GeometricPrimitive?)
+        case selectedHandle(index: Int, context: ShapeEditContext)
+        case selectedBody(startDoc: CGPoint, context: ShapeEditContext)
+        case selectedAction(SelectedShapeOverlay.ActionButton, startPoint: CGPoint)
     }
 
-    // Virtual Compass state & snap points (iPad-only UI; never projected to external display)
+    // Virtual Compass, Selected Shape & Snap Points (iPad-only UI; never projected to external display)
     private var compassState = CompassState()
+    private var selectedStrokeID: UUID?
+    private var selectedAnchorFallbackOrigin: CGPoint = .zero
     private var activeInteraction: ActiveInteraction = .none
     private var fingerControlInteraction: ActiveInteraction = .none
     private var cachedDocSnapPoints: [SnapPoint] = []
@@ -114,7 +132,12 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         view.addInteraction(UIScribbleInteraction(delegate: self))
         webView.addInteraction(UIScribbleInteraction(delegate: self))
 
+        view.layer.addSublayer(pendingFillContainer)
         view.layer.addSublayer(pendingContainer)
+
+        liveFillLayer.fillRule = .nonZero
+        liveFillLayer.opacity = 0.18
+        view.layer.addSublayer(liveFillLayer)
 
         liveLayer.fillRule = .nonZero
         view.layer.addSublayer(liveLayer)
@@ -163,6 +186,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             self?.applyGestureRules()
             self?.pushStrokes()
         }
+        bridge.onPlacementsChanged = { [weak self] in
+            self?.refreshSelectedShapeOverlay()
+        }
         bridge.onToggleTape = { [weak self] id in
             guard let self else { return }
             self.session.toggleTape(id: id, page: Self.page)
@@ -170,6 +196,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         }
         session.pageDidChange = { [weak self] _ in
             self?.pushStrokes()
+            self?.refreshSelectedShapeOverlay()
         }
         session.$tool
             .sink { [weak self] _ in
@@ -179,10 +206,27 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                 }
             }
             .store(in: &cancellables)
+        session.$tool
+            .map(\.kind)
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.clearSelectedShape() }
+            }
+            .store(in: &cancellables)
         session.$geometryAid
             .removeDuplicates()
             .sink { [weak self] aid in
                 DispatchQueue.main.async { self?.applyGeometryAid(aid) }
+            }
+            .store(in: &cancellables)
+        webView.scrollView.publisher(for: \.contentOffset)
+            .sink { [weak self] _ in
+                self?.refreshSelectedShapeOverlay()
+            }
+            .store(in: &cancellables)
+        webView.scrollView.publisher(for: \.zoomScale)
+            .sink { [weak self] _ in
+                self?.refreshSelectedShapeOverlay()
             }
             .store(in: &cancellables)
 
@@ -193,7 +237,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         super.viewDidLayoutSubviews()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        pendingFillContainer.frame = view.bounds
         pendingContainer.frame = view.bounds
+        liveFillLayer.frame = view.bounds
         liveLayer.frame = view.bounds
         eraserCursor.frame = view.bounds
         laserGlowLayer.frame = view.bounds
@@ -201,6 +247,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         CATransaction.commit()
         updatePresentationViewport(focusY: nil)
         clampGeometryAidsToBounds()
+        refreshSelectedShapeOverlay()
         applyGestureRules()
     }
 
@@ -258,6 +305,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         pendingItems.removeAll { item in
             if ids.contains(item.id) {
                 item.layer.removeFromSuperlayer()
+                item.fillLayer?.removeFromSuperlayer()
                 removed = true
                 return true
             }
@@ -406,8 +454,25 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         let viewPoint = touch.location(in: view)
         updatePresentationViewport(focusY: viewPoint.y)
 
+        // 1. Selected shape handles, mini-bar buttons, or body drag take priority.
+        if let editInteraction = beginSelectedShapeInteraction(at: viewPoint) {
+            activeInteraction = editInteraction
+            return
+        }
+        // Touching outside the selected shape exits edit mode immediately with zero friction.
+        if selectedStrokeID != nil {
+            clearSelectedShape()
+        }
+
+        // 2. Virtual compass handles, buttons, or circle sweep.
         if let aidInteraction = beginGeometryAidInteraction(at: viewPoint, allowDrawing: canDrawWithGeometryAid) {
             activeInteraction = aidInteraction
+            return
+        }
+
+        // 3. Standard geometric shape tool (drag to create, or quick tap to select existing shape).
+        if liveTool.kind == .shape {
+            activeInteraction = beginShapeCreation(at: viewPoint)
             return
         }
 
@@ -417,7 +482,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             eraseBegan(touch)
         case .laser:
             laserBegan(touch)
-        case .pen, .highlighter, .tape:
+        case .pen, .highlighter, .tape, .shape:
             drawBegan(touch, event: event)
         }
     }
@@ -435,7 +500,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             eraseMoved(touch, event: event)
         case .laser:
             laserMoved(touch, event: event)
-        case .pen, .highlighter, .tape:
+        case .pen, .highlighter, .tape, .shape:
             drawMoved(touch, event: event)
         }
     }
@@ -453,7 +518,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case .laser:
             laserMoved(touch, event: event)
             laserEnded(touch)
-        case .pen, .highlighter, .tape:
+        case .pen, .highlighter, .tape, .shape:
             drawEnded(touch, event: event)
         }
     }
@@ -479,7 +544,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case .laser:
             laserEngine.cancel()
             updateLaserRender()
-        case .pen, .highlighter, .tape:
+        case .pen, .highlighter, .tape, .shape:
             livePoints.removeAll()
             pendingEstimates.removeAll()
             setLivePath(nil)
@@ -496,11 +561,11 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         }
     }
 
-    // MARK: Virtual Compass & Snap Points (One-Handed Apple Pencil + Optional Finger)
+    // MARK: Virtual Compass, Standard Shapes & Selected Shape Editing (One-Handed Apple Pencil)
 
     private var canDrawWithGeometryAid: Bool {
         switch liveTool.kind {
-        case .pen, .highlighter, .tape: return true
+        case .pen, .highlighter, .tape, .shape: return true
         case .eraser, .laser: return false
         }
     }
@@ -508,6 +573,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private func applyGeometryAid(_ aid: GeometryAid) {
         cancelGeometryAidInteraction()
         if aid == .compass {
+            clearSelectedShape()
             let bounds = view.bounds
             if bounds.width > 0, bounds.height > 0,
                compassState.center == .zero || !bounds.insetBy(dx: 24, dy: 24).contains(compassState.center) {
@@ -541,9 +607,11 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         geometryOverlay.activeStrokeColor = UIColor(cgColor: color.cgColor)
     }
 
-    private func refreshViewSnapPoints() {
+    private func refreshViewSnapPoints(excludingStrokeID: UUID? = nil) {
         let origins = bridge.placements.compactMapValues { $0.visible ? $0.origin : nil }
-        let docSnaps = GeometrySnapEngine.snapPoints(from: session.strokes(onPage: Self.page), origins: origins)
+        let docSnaps = GeometrySnapEngine.snapPoints(from: session.strokes(onPage: Self.page),
+                                                     origins: origins,
+                                                     excludingStrokeID: excludingStrokeID)
         let transform = viewTransform()
         cachedDocSnapPoints = docSnaps
         cachedViewSnapPoints = docSnaps.map { SnapPoint(point: $0.point.applying(transform), kind: $0.kind) }
@@ -566,6 +634,295 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private func documentPoint(fromViewPoint p: CGPoint) -> CGPoint {
         bridge.documentPoint(fromView: CGPoint(x: p.x - webView.frame.minX, y: p.y - webView.frame.minY))
     }
+
+    // MARK: Selected Shape State & Helpers
+
+    private func selectStroke(_ id: UUID, fallbackOrigin: CGPoint = .zero) {
+        selectedStrokeID = id
+        selectedAnchorFallbackOrigin = fallbackOrigin
+        refreshSelectedShapeOverlay()
+    }
+
+    private func clearSelectedShape() {
+        guard selectedStrokeID != nil || geometryOverlay.selectedShape != nil else { return }
+        selectedStrokeID = nil
+        geometryOverlay.isEditingSelectedShape = false
+        geometryOverlay.selectedShape = nil
+    }
+
+    private func anchorOrigin(for stroke: InkStroke) -> CGPoint {
+        if let placement = bridge.placements[stroke.id] {
+            return placement.origin
+        }
+        if stroke.id == selectedStrokeID {
+            return selectedAnchorFallbackOrigin
+        }
+        return .zero
+    }
+
+    private func overlayModel(for stroke: InkStroke, docPrimitive: GeometricPrimitive) -> SelectedShapeOverlay {
+        let transform = viewTransform()
+        let handles = docPrimitive.controlHandles().map { $0.applying(transform) }
+        let box = docPrimitive.boundingBox().applying(transform)
+        return SelectedShapeOverlay(
+            strokeID: stroke.id,
+            handles: handles,
+            boundingBox: box,
+            lineStyle: stroke.resolvedLineStyle,
+            supportsFill: docPrimitive.supportsFill,
+            isFilled: stroke.fillColor != nil,
+            isCircularWithCenterMark: docPrimitive.isCircularWithCenterMark,
+            showsCenterMark: docPrimitive.showsCenterMark
+        )
+    }
+
+    private func refreshSelectedShapeOverlay() {
+        guard let id = selectedStrokeID else {
+            if geometryOverlay.selectedShape != nil {
+                geometryOverlay.selectedShape = nil
+            }
+            return
+        }
+        // While actively dragging a vertex or body, the drag handler drives the live overlay.
+        switch activeInteraction {
+        case .selectedHandle, .selectedBody:
+            return
+        default:
+            break
+        }
+        guard let stroke = session.strokes(onPage: Self.page).first(where: { $0.id == id }),
+              let geom = stroke.geometry else {
+            clearSelectedShape()
+            return
+        }
+        if let placement = bridge.placements[id], !placement.visible {
+            clearSelectedShape()
+            return
+        }
+        let origin = anchorOrigin(for: stroke)
+        let docPrimitive = geom.translated(by: origin)
+        geometryOverlay.selectedShape = overlayModel(for: stroke, docPrimitive: docPrimitive)
+    }
+
+    private func beginSelectedShapeInteraction(at viewPoint: CGPoint) -> ActiveInteraction? {
+        guard let id = selectedStrokeID,
+              let overlay = geometryOverlay.selectedShape,
+              overlay.strokeID == id,
+              let stroke = session.strokes(onPage: Self.page).first(where: { $0.id == id }),
+              let geom = stroke.geometry else { return nil }
+
+        let origin = anchorOrigin(for: stroke)
+        let docPrimitive = geom.translated(by: origin)
+        let docPoint = documentPoint(fromViewPoint: viewPoint)
+        let docTol = 14 / max(webView.scrollView.zoomScale, 0.25)
+        let bodyHit = docPrimitive.hitTestBody(docPoint, tolerance: docTol)
+        let hit = overlay.hitTest(viewPoint, in: view.bounds, bodyHit: bodyHit)
+
+        switch hit {
+        case .none:
+            return nil
+        case let .action(button):
+            return .selectedAction(button, startPoint: viewPoint)
+        case let .handle(index):
+            let context = startEditingSelectedStroke(stroke, origin: origin, docPrimitive: docPrimitive)
+            return .selectedHandle(index: index, context: context)
+        case .body:
+            let context = startEditingSelectedStroke(stroke, origin: origin, docPrimitive: docPrimitive)
+            return .selectedBody(startDoc: docPoint, context: context)
+        }
+    }
+
+    private func startEditingSelectedStroke(_ stroke: InkStroke, origin: CGPoint,
+                                            docPrimitive: GeometricPrimitive) -> ShapeEditContext {
+        let originalStrokes = session.strokes(onPage: Self.page)
+        refreshViewSnapPoints(excludingStrokeID: stroke.id)
+        // Temporarily hide the original SVG in WebKit while dragging at 60fps in native live layers.
+        bridge.sync(originalStrokes.filter { $0.id != stroke.id })
+        geometryOverlay.isEditingSelectedShape = true
+        configureLiveLayer(for: stroke)
+        renderEditedShape(stroke: stroke, docPrimitive: docPrimitive)
+        return ShapeEditContext(
+            strokeID: stroke.id,
+            originalStrokes: originalStrokes,
+            originalStroke: stroke,
+            anchorOrigin: origin,
+            baseDocPrimitive: docPrimitive,
+            currentDocPrimitive: docPrimitive
+        )
+    }
+
+    private func configureLiveLayer(for stroke: InkStroke) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if stroke.isHighlighter {
+            liveLayer.fillColor = stroke.color.cgColor
+            liveLayer.opacity = PageInkView.highlighterOpacity
+            liveLayer.compositingFilter = "multiplyBlendMode"
+            liveLayer.strokeColor = nil
+            liveLayer.lineDashPattern = nil
+        } else if stroke.isTape {
+            liveLayer.fillColor = stroke.color.cgColor
+            liveLayer.opacity = 0.96
+            liveLayer.compositingFilter = nil
+            liveLayer.strokeColor = UIColor.black.withAlphaComponent(0.25).cgColor
+            liveLayer.lineWidth = 1
+            liveLayer.lineDashPattern = [5, 3]
+        } else {
+            liveLayer.fillColor = stroke.color.cgColor
+            liveLayer.opacity = 1
+            liveLayer.compositingFilter = nil
+            liveLayer.strokeColor = nil
+            liveLayer.lineDashPattern = nil
+        }
+        CATransaction.commit()
+    }
+
+    private func renderEditedShape(stroke: InkStroke, docPrimitive: GeometricPrimitive) {
+        var preview = stroke
+        preview.geometry = docPrimitive
+        preview.baked = nil
+        preview.points = []
+        let transform = viewTransform()
+        let outline = preview.outlinePath(transform: transform, finished: true)
+        let fill = preview.fillPath(transform: transform)
+        setLivePath(outline, fillPath: fill, fillColor: preview.fillColor?.cgColor)
+        geometryOverlay.selectedShape = overlayModel(for: stroke, docPrimitive: docPrimitive)
+    }
+
+    private func commitEditedShape(_ context: ShapeEditContext) {
+        let updatedLocal = context.currentDocPrimitive.translated(by: CGPoint(x: -context.anchorOrigin.x,
+                                                                              y: -context.anchorOrigin.y))
+        var updated = context.originalStroke
+        updated.geometry = updatedLocal
+        updated.baked = nil
+        updated.points = []
+
+        if updated == context.originalStroke {
+            setLivePath(nil)
+            pushStrokes()
+            refreshSelectedShapeOverlay()
+            return
+        }
+
+        // Keep a pending native layer across the WebKit sync so there is zero flash.
+        var docPreview = updated
+        docPreview.geometry = context.currentDocPrimitive
+        let transform = viewTransform()
+        let pending = CAShapeLayer()
+        pending.frame = pendingContainer.bounds
+        pending.fillRule = .nonZero
+        pending.path = docPreview.outlinePath(transform: transform, finished: true)
+        pending.fillColor = liveLayer.fillColor
+        pending.opacity = liveLayer.opacity
+        pending.compositingFilter = liveLayer.compositingFilter
+        pendingContainer.addSublayer(pending)
+
+        var pendingFill: CAShapeLayer?
+        if let fillColor = docPreview.fillColor, let fillPath = docPreview.fillPath(transform: transform) {
+            let fl = CAShapeLayer()
+            fl.frame = pendingFillContainer.bounds
+            fl.fillRule = .nonZero
+            fl.opacity = 0.18
+            fl.fillColor = fillColor.cgColor
+            fl.path = fillPath
+            pendingFillContainer.addSublayer(fl)
+            pendingFill = fl
+        }
+        pendingItems.append(PendingItem(id: updated.id, layer: pending, fillLayer: pendingFill,
+                                        isHighlighter: updated.isHighlighter))
+        setLivePath(nil)
+
+        let after = context.originalStrokes.map { $0.id == updated.id ? updated : $0 }
+        session.replaceStrokes(onPage: Self.page, before: context.originalStrokes, after: after)
+        refreshSelectedShapeOverlay()
+    }
+
+    private func executeSelectedShapeAction(_ action: SelectedShapeOverlay.ActionButton) {
+        guard let id = selectedStrokeID else { return }
+        let before = session.strokes(onPage: Self.page)
+        guard let idx = before.firstIndex(where: { $0.id == id }) else {
+            clearSelectedShape()
+            return
+        }
+        var stroke = before[idx]
+
+        switch action {
+        case .cycleLineStyle:
+            let styles = StrokeLineStyle.allCases
+            let nextIdx = ((styles.firstIndex(of: stroke.resolvedLineStyle) ?? 0) + 1) % styles.count
+            stroke.lineStyle = styles[nextIdx]
+            var after = before
+            after[idx] = stroke
+            session.replaceStrokes(onPage: Self.page, before: before, after: after)
+            haptic.impactOccurred()
+
+        case .toggleFillOrCenter:
+            guard let geom = stroke.geometry else { return }
+            if geom.supportsFill {
+                stroke.fillColor = (stroke.fillColor == nil) ? stroke.color : nil
+            } else if geom.isCircularWithCenterMark {
+                stroke.geometry = geom.togglingCenterMark()
+            } else {
+                return
+            }
+            var after = before
+            after[idx] = stroke
+            session.replaceStrokes(onPage: Self.page, before: before, after: after)
+            haptic.impactOccurred()
+
+        case .duplicate:
+            var copy = stroke.translated(by: CGPoint(x: 24, y: 24))
+            copy.id = UUID()
+            let fallbackOrigin = anchorOrigin(for: stroke)
+            session.addStroke(copy, page: Self.page)
+            selectStroke(copy.id, fallbackOrigin: fallbackOrigin)
+            haptic.impactOccurred()
+
+        case .delete:
+            var after = before
+            after.remove(at: idx)
+            clearSelectedShape()
+            session.replaceStrokes(onPage: Self.page, before: before, after: after)
+            haptic.impactOccurred()
+        }
+    }
+
+    private func hitTestExistingGeometricStroke(atDoc docPoint: CGPoint) -> InkStroke? {
+        let tolerance = 14 / max(webView.scrollView.zoomScale, 0.25)
+        let strokes = session.strokes(onPage: Self.page)
+        for stroke in strokes.reversed() {
+            guard let geom = stroke.geometry else { continue }
+            if let placement = bridge.placements[stroke.id], !placement.visible { continue }
+            let origin = bridge.placements[stroke.id]?.origin ?? .zero
+            if geom.translated(by: origin).hitTestBody(docPoint, tolerance: tolerance) {
+                return stroke
+            }
+        }
+        return nil
+    }
+
+    private func beginShapeCreation(at viewPoint: CGPoint) -> ActiveInteraction {
+        refreshViewSnapPoints()
+        let rawDoc = documentPoint(fromViewPoint: viewPoint)
+        let docThreshold = 10 / max(webView.scrollView.zoomScale, 0.25)
+        let startSnap = GeometrySnapEngine.nearestPoint(to: rawDoc, in: cachedDocSnapPoints, threshold: docThreshold)
+        let startDoc = startSnap?.point ?? rawDoc
+        if let startSnap {
+            updateSnapFeedback(SnapPoint(point: startSnap.point.applying(viewTransform()), kind: startSnap.kind))
+        }
+        configureLiveLayerForCurrentTool()
+        return .shapeCreate(preset: liveTool.shapePreset, startDoc: startDoc, rawStartView: viewPoint, currentPrimitive: nil)
+    }
+
+    private func renderShapeCreationPreview(_ primitive: GeometricPrimitive) {
+        let stroke = makeGeometricStroke(primitive, allowFill: liveTool.shapeFilled)
+        let transform = viewTransform()
+        setLivePath(stroke.outlinePath(transform: transform, finished: true),
+                    fillPath: stroke.fillPath(transform: transform),
+                    fillColor: stroke.fillColor?.cgColor)
+    }
+
+    // MARK: Compass & Active Geometry Interaction Dispatch
 
     private func beginGeometryAidInteraction(at viewPoint: CGPoint, allowDrawing: Bool) -> ActiveInteraction? {
         guard session.geometryAid == .compass else { return nil }
@@ -614,7 +971,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             updateSnapFeedback(snap)
             return true
 
-        case .compassButton:
+        case .compassButton, .selectedAction:
             return true
 
         case var .compassDraw(sweep, crossedCloseHaptic):
@@ -628,6 +985,45 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             }
             activeInteraction = .compassDraw(sweep: sweep, crossedCloseHaptic: crossedCloseHaptic)
             renderCompassLiveSweep(sweep)
+            return true
+
+        case let .shapeCreate(preset, startDoc, rawStartView, _):
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            let docThreshold = 10 / max(webView.scrollView.zoomScale, 0.25)
+            let built = ShapeBuilder.build(preset: preset, from: startDoc, to: currentDoc,
+                                           snapPoints: cachedDocSnapPoints, snapThreshold: docThreshold)
+            if let snap = built.snapped {
+                updateSnapFeedback(SnapPoint(point: snap.point.applying(viewTransform()), kind: snap.kind))
+            } else {
+                updateSnapFeedback(nil)
+            }
+            activeInteraction = .shapeCreate(preset: preset, startDoc: startDoc,
+                                             rawStartView: rawStartView, currentPrimitive: built.primitive)
+            renderShapeCreationPreview(built.primitive)
+            return true
+
+        case var .selectedHandle(index, context):
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            let docThreshold = 10 / max(webView.scrollView.zoomScale, 0.25)
+            let moved = context.baseDocPrimitive.movingHandle(at: index, to: currentDoc,
+                                                              snapPoints: cachedDocSnapPoints,
+                                                              snapThreshold: docThreshold)
+            context.currentDocPrimitive = moved.primitive
+            if let snap = moved.snapped {
+                updateSnapFeedback(SnapPoint(point: snap.point.applying(viewTransform()), kind: snap.kind))
+            } else {
+                updateSnapFeedback(nil)
+            }
+            activeInteraction = .selectedHandle(index: index, context: context)
+            renderEditedShape(stroke: context.originalStroke, docPrimitive: context.currentDocPrimitive)
+            return true
+
+        case var .selectedBody(startDoc, context):
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            let delta = CGPoint(x: currentDoc.x - startDoc.x, y: currentDoc.y - startDoc.y)
+            context.currentDocPrimitive = context.baseDocPrimitive.translated(by: delta)
+            activeInteraction = .selectedBody(startDoc: startDoc, context: context)
+            renderEditedShape(stroke: context.originalStroke, docPrimitive: context.currentDocPrimitive)
             return true
         }
     }
@@ -649,6 +1045,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             finishGeometryAidInteraction()
             return true
 
+        case let .selectedAction(action, startPoint):
+            if hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y) < 28 {
+                executeSelectedShapeAction(action)
+            }
+            finishGeometryAidInteraction()
+            return true
+
         case var .compassDraw(sweep, _):
             sweep.advance(to: viewPoint, center: compassState.center)
             finishGeometryAidInteraction()
@@ -663,6 +1066,31 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                 setLivePath(nil)
             }
             return true
+
+        case let .shapeCreate(preset, startDoc, rawStartView, _):
+            finishGeometryAidInteraction()
+            let dragDist = hypot(viewPoint.x - rawStartView.x, viewPoint.y - rawStartView.y)
+            if dragDist < 8 {
+                setLivePath(nil)
+                let docPoint = documentPoint(fromViewPoint: viewPoint)
+                if let hitStroke = hitTestExistingGeometricStroke(atDoc: docPoint) {
+                    selectStroke(hitStroke.id, fallbackOrigin: bridge.placements[hitStroke.id]?.origin ?? .zero)
+                    haptic.impactOccurred()
+                }
+                return true
+            }
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            let docThreshold = 10 / max(webView.scrollView.zoomScale, 0.25)
+            let built = ShapeBuilder.build(preset: preset, from: startDoc, to: currentDoc,
+                                           snapPoints: cachedDocSnapPoints, snapThreshold: docThreshold)
+            let stroke = makeGeometricStroke(built.primitive, allowFill: liveTool.shapeFilled)
+            commitPreparedStroke(stroke, selectAfterCommit: true)
+            return true
+
+        case let .selectedHandle(_, context), let .selectedBody(_, context):
+            finishGeometryAidInteraction()
+            commitEditedShape(context)
+            return true
         }
     }
 
@@ -670,14 +1098,22 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         activeInteraction = .none
         geometryOverlay.activeCompassSweep = nil
         geometryOverlay.isResizingCompass = false
+        geometryOverlay.isEditingSelectedShape = false
         updateSnapFeedback(nil)
     }
 
     private func cancelGeometryAidInteraction() {
-        if case .compassDraw = activeInteraction {
+        switch activeInteraction {
+        case .compassDraw, .shapeCreate:
             setLivePath(nil)
+        case .selectedHandle, .selectedBody:
+            setLivePath(nil)
+            pushStrokes()
+        default:
+            break
         }
         finishGeometryAidInteraction()
+        refreshSelectedShapeOverlay()
     }
 
     private func executeCompassButton(_ button: CompassState.HitZone) {
@@ -706,6 +1142,11 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func handleGeometryControlTap(at viewPoint: CGPoint) {
+        if let selected = geometryOverlay.selectedShape,
+           case let .action(button) = selected.hitTest(viewPoint, in: view.bounds, bodyHit: false) {
+            executeSelectedShapeAction(button)
+            return
+        }
         guard session.geometryAid == .compass else { return }
         let hit = compassState.hitTest(viewPoint, in: view.bounds)
         if hit == .lockButton || hit == .centerMarkButton || hit == .fullCircleButton {
@@ -714,6 +1155,10 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func beginFingerGeometryDrag(at viewPoint: CGPoint) {
+        if let edit = beginSelectedShapeInteraction(at: viewPoint) {
+            fingerControlInteraction = edit
+            return
+        }
         fingerControlInteraction = beginGeometryAidInteraction(at: viewPoint, allowDrawing: false) ?? .none
     }
 
@@ -726,9 +1171,19 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func endFingerGeometryDrag() {
+        let saved = activeInteraction
+        activeInteraction = fingerControlInteraction
+        switch activeInteraction {
+        case let .selectedHandle(_, context), let .selectedBody(_, context):
+            finishGeometryAidInteraction()
+            commitEditedShape(context)
+        default:
+            geometryOverlay.isResizingCompass = false
+            geometryOverlay.isEditingSelectedShape = false
+            updateSnapFeedback(nil)
+        }
         fingerControlInteraction = .none
-        geometryOverlay.isResizingCompass = false
-        updateSnapFeedback(nil)
+        activeInteraction = saved
     }
 
     private func renderCompassLiveSweep(_ sweep: CompassSweep) {
@@ -744,7 +1199,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         setLivePath(stroke.outlinePath(transform: viewTransform(), finished: true))
     }
 
-    private func makeGeometricStroke(_ primitive: GeometricPrimitive) -> InkStroke {
+    private func makeGeometricStroke(_ primitive: GeometricPrimitive, allowFill: Bool = false) -> InkStroke {
         if liveTool.kind == .highlighter {
             return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
                              width: liveTool.highlighterWidth, smoothing: 0, points: [],
@@ -755,9 +1210,10 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                              width: liveTool.tapeWidth, smoothing: 0, points: [],
                              tool: .tape, lineStyle: .solid, revealed: false, geometry: primitive)
         }
+        let fill = (allowFill && primitive.supportsFill) ? liveTool.color : nil
         return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color,
                          width: liveTool.width, smoothing: 0, points: [],
-                         tool: .pen, lineStyle: liveTool.lineStyle, geometry: primitive)
+                         tool: .pen, lineStyle: liveTool.lineStyle, geometry: primitive, fillColor: fill)
     }
 
     // MARK: Drawing (Pen, Highlighter, Tape & Draw-and-Hold)
@@ -994,10 +1450,12 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         setLivePath(stroke.outlinePath(transform: viewTransform(), finished: false))
     }
 
-    private func setLivePath(_ path: CGPath?) {
+    private func setLivePath(_ path: CGPath?, fillPath: CGPath? = nil, fillColor: CGColor? = nil) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         liveLayer.path = path
+        liveFillLayer.path = fillPath
+        liveFillLayer.fillColor = fillColor
         CATransaction.commit()
         pushPresentationOverlay()
     }
@@ -1013,8 +1471,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         commitPreparedStroke(stroke)
     }
 
-    private func commitPreparedStroke(_ stroke: InkStroke) {
-        let finalViewPath = stroke.outlinePath(transform: viewTransform(), finished: true)
+    private func commitPreparedStroke(_ stroke: InkStroke, selectAfterCommit: Bool = false) {
+        let transform = viewTransform()
+        let finalViewPath = stroke.outlinePath(transform: transform, finished: true)
         let pending = CAShapeLayer()
         pending.frame = pendingContainer.bounds
         pending.fillRule = .nonZero
@@ -1027,7 +1486,19 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         pending.lineDashPattern = liveLayer.lineDashPattern
         pendingContainer.addSublayer(pending)
 
-        let item = PendingItem(id: stroke.id, layer: pending, isHighlighter: stroke.isHighlighter)
+        var pendingFill: CAShapeLayer?
+        if let fillColor = stroke.fillColor, let fillPath = stroke.fillPath(transform: transform) {
+            let fl = CAShapeLayer()
+            fl.frame = pendingFillContainer.bounds
+            fl.fillRule = .nonZero
+            fl.opacity = 0.18
+            fl.fillColor = fillColor.cgColor
+            fl.path = fillPath
+            pendingFillContainer.addSublayer(fl)
+            pendingFill = fl
+        }
+
+        let item = PendingItem(id: stroke.id, layer: pending, fillLayer: pendingFill, isHighlighter: stroke.isHighlighter)
         pendingItems.append(item)
         setLivePath(nil)
 
@@ -1045,6 +1516,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             var anchored = stroke.translated(by: CGPoint(x: -(pick?.origin.x ?? 0), y: -(pick?.origin.y ?? 0)))
             anchored.anchor = pick?.anchor ?? .body
             self.session.addStroke(anchored, page: Self.page)
+            if selectAfterCommit {
+                self.selectStroke(anchored.id, fallbackOrigin: pick?.origin ?? .zero)
+            }
             // Safety cleanup if the page reloaded before sync completed.
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             self.removePendingItems(matching: [stroke.id])
@@ -1194,7 +1668,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         let pendingOverlays: [PendingOverlayStroke] = pendingItems.compactMap { item in
             guard let path = item.layer.path else { return nil }
             return PendingOverlayStroke(path: path, color: item.layer.fillColor,
-                                        opacity: item.layer.opacity, isHighlighter: item.isHighlighter)
+                                        opacity: item.layer.opacity, isHighlighter: item.isHighlighter,
+                                        fillPath: item.fillLayer?.path, fillColor: item.fillLayer?.fillColor)
         }
         let state = LiveOverlayState(
             sourceSize: captureRect.size,
@@ -1203,6 +1678,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             strokeColor: liveLayer.fillColor,
             strokeOpacity: liveLayer.opacity,
             isHighlighter: liveTool.kind == .highlighter,
+            fillPath: liveFillLayer.path,
+            fillColor: liveFillLayer.fillColor,
             pendingStrokes: pendingOverlays,
             cursorPath: eraserCursor.isHidden ? nil : eraserCursor.path,
             laserGlowPath: laserFrame.glowPath,

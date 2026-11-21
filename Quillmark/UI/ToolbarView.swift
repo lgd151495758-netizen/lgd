@@ -23,6 +23,9 @@ struct ToolbarView: View {
                 toolButton(title: "胶带", symbol: "bandage", selected: tool.kind == .tape) {
                     session.tool.select(.tape)
                 }
+                toolButton(title: "图形", symbol: "square.on.circle", selected: tool.kind == .shape) {
+                    session.tool.select(.shape)
+                }
                 toolButton(title: "激光笔", symbol: "laser.burst", selected: tool.kind == .laser) {
                     session.tool.select(.laser)
                 }
@@ -155,6 +158,40 @@ struct ToolbarView: View {
             }
             .buttonStyle(.bordered)
 
+        case .shape:
+            ForEach(ShapePreset.allCases) { preset in
+                shapePresetButton(preset, selected: tool.shapePreset == preset) {
+                    session.tool.shapePreset = preset
+                }
+            }
+            divider
+            ForEach(ToolSettings.palette, id: \.self) { color in
+                colorButton(color, selected: tool.color == color) { session.tool.color = color }
+            }
+            divider
+            ForEach(ToolSettings.widthPresets, id: \.self) { width in
+                sizeButton(diameter: CGFloat(width) * 3 + 2, selected: tool.width == width) {
+                    session.tool.width = width
+                }
+            }
+            divider
+            Picker("线型", selection: $session.tool.lineStyle) {
+                ForEach(StrokeLineStyle.allCases) { style in
+                    Text(style.displayName).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 132)
+            if tool.shapePreset.supportsFill {
+                Toggle(isOn: $session.tool.shapeFilled) {
+                    Label("阴影", systemImage: "square.fill.on.square")
+                        .labelStyle(.titleAndIcon)
+                        .font(.callout)
+                }
+                .toggleStyle(.button)
+                .accessibilityLabel("半透明阴影填充")
+            }
+
         case .laser:
             ForEach(ToolSettings.laserPalette, id: \.self) { color in
                 colorButton(color, selected: tool.laserColor == color) { session.tool.laserColor = color }
@@ -182,6 +219,23 @@ struct ToolbarView: View {
 
     private var divider: some View {
         Divider().frame(height: 26)
+    }
+
+    private func shapePresetButton(_ preset: ShapePreset, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 2) {
+                ShapePresetIcon(preset: preset)
+                    .frame(width: 20, height: 16)
+                Text(preset.displayName).font(.caption2)
+            }
+            .frame(minWidth: 42)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 3)
+            .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(selected ? Color.accentColor : Color.primary)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func toolButton(title: String, symbol: String, selected: Bool, action: @escaping () -> Void) -> some View {
@@ -223,5 +277,88 @@ struct ToolbarView: View {
             .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: Circle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Crisp mini vector icon for each standard mathematical shape preset.
+private struct ShapePresetIcon: View {
+    let preset: ShapePreset
+
+    var body: some View {
+        Canvas { ctx, size in
+            let w = size.width
+            let h = size.height
+            let pad: CGFloat = 2
+            let stroke = StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round)
+
+            var path = Path()
+            switch preset {
+            case .segment:
+                path.move(to: CGPoint(x: pad, y: h - pad))
+                path.addLine(to: CGPoint(x: w - pad, y: pad))
+            case .arrow:
+                path.move(to: CGPoint(x: pad, y: h - pad))
+                path.addLine(to: CGPoint(x: w - pad, y: pad))
+                path.move(to: CGPoint(x: w - pad - 5, y: pad + 0.5))
+                path.addLine(to: CGPoint(x: w - pad, y: pad))
+                path.addLine(to: CGPoint(x: w - pad - 1, y: pad + 5))
+            case .rightTriangle:
+                path.move(to: CGPoint(x: pad + 1, y: pad))
+                path.addLine(to: CGPoint(x: pad + 1, y: h - pad))
+                path.addLine(to: CGPoint(x: w - pad, y: h - pad))
+                path.closeSubpath()
+                path.move(to: CGPoint(x: pad + 1, y: h - pad - 4))
+                path.addLine(to: CGPoint(x: pad + 5, y: h - pad - 4))
+                path.addLine(to: CGPoint(x: pad + 5, y: h - pad))
+            case .isoscelesTriangle:
+                path.move(to: CGPoint(x: w / 2, y: pad))
+                path.addLine(to: CGPoint(x: w - pad - 2, y: h - pad))
+                path.addLine(to: CGPoint(x: pad + 2, y: h - pad))
+                path.closeSubpath()
+            case .equilateralTriangle:
+                path.move(to: CGPoint(x: w / 2, y: pad + 0.5))
+                path.addLine(to: CGPoint(x: w - pad, y: h - pad))
+                path.addLine(to: CGPoint(x: pad, y: h - pad))
+                path.closeSubpath()
+            case .rectangle:
+                path.addRect(CGRect(x: pad, y: pad + 1, width: w - 2 * pad, height: h - 2 * pad - 2))
+            case .parallelogram:
+                path.move(to: CGPoint(x: pad + 4, y: pad + 1))
+                path.addLine(to: CGPoint(x: w - pad, y: pad + 1))
+                path.addLine(to: CGPoint(x: w - pad - 4, y: h - pad - 1))
+                path.addLine(to: CGPoint(x: pad, y: h - pad - 1))
+                path.closeSubpath()
+            case .rhombus:
+                path.move(to: CGPoint(x: w / 2, y: pad))
+                path.addLine(to: CGPoint(x: w - pad, y: h / 2))
+                path.addLine(to: CGPoint(x: w / 2, y: h - pad))
+                path.addLine(to: CGPoint(x: pad, y: h / 2))
+                path.closeSubpath()
+            case .trapezoid:
+                path.move(to: CGPoint(x: pad + 3.5, y: pad + 1))
+                path.addLine(to: CGPoint(x: w - pad - 3.5, y: pad + 1))
+                path.addLine(to: CGPoint(x: w - pad, y: h - pad - 1))
+                path.addLine(to: CGPoint(x: pad, y: h - pad - 1))
+                path.closeSubpath()
+            case .circle:
+                let d = min(w, h) - 2 * pad
+                path.addEllipse(in: CGRect(x: (w - d) / 2, y: (h - d) / 2, width: d, height: d))
+                path.addEllipse(in: CGRect(x: w / 2 - 1, y: h / 2 - 1, width: 2, height: 2))
+            case .axes:
+                // X axis + arrow
+                path.move(to: CGPoint(x: pad, y: h / 2))
+                path.addLine(to: CGPoint(x: w - pad, y: h / 2))
+                path.move(to: CGPoint(x: w - pad - 3, y: h / 2 - 2.5))
+                path.addLine(to: CGPoint(x: w - pad, y: h / 2))
+                path.addLine(to: CGPoint(x: w - pad - 3, y: h / 2 + 2.5))
+                // Y axis + arrow
+                path.move(to: CGPoint(x: w / 2, y: h - pad))
+                path.addLine(to: CGPoint(x: w / 2, y: pad))
+                path.move(to: CGPoint(x: w / 2 - 2.5, y: pad + 3))
+                path.addLine(to: CGPoint(x: w / 2, y: pad))
+                path.addLine(to: CGPoint(x: w / 2 + 2.5, y: pad + 3))
+            }
+            ctx.stroke(path, with: .foreground, style: stroke)
+        }
     }
 }

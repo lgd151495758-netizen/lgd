@@ -1,16 +1,27 @@
 import UIKit
 
-/// Renders the virtual Compass and magnetic snap indicators on the iPad screen.
-/// Lives as a sibling above `WKWebView` (never inside the web view and never mirrored in
-/// `LiveOverlayState`), so students on the external display only see the crisp drawn lines/arcs.
+/// Renders the virtual Compass, selected shape edit handles/mini-bar, and magnetic snap indicators
+/// on the iPad screen. Lives as a sibling above `WKWebView` (never inside the web view and never
+/// mirrored in `LiveOverlayState`), so students on the external display only see crisp geometry.
 final class GeometryToolOverlayView: UIView {
     var aid: GeometryAid = .none {
         didSet {
-            isHidden = (aid == .none && activeSnapPoint == nil)
+            updateVisibility()
             setNeedsDisplay()
         }
     }
     var compass = CompassState() {
+        didSet { setNeedsDisplay() }
+    }
+    /// Selected geometric shape for post-creation vertex editing & quick actions (iPad-only).
+    var selectedShape: SelectedShapeOverlay? {
+        didSet {
+            updateVisibility()
+            setNeedsDisplay()
+        }
+    }
+    /// Hides the floating mini-bar while actively dragging a vertex/shape for an unobstructed view.
+    var isEditingSelectedShape = false {
         didSet { setNeedsDisplay() }
     }
     /// Active sweep readout while drawing an arc with the compass.
@@ -24,7 +35,7 @@ final class GeometryToolOverlayView: UIView {
     /// Currently snapped target in view coordinates (rendered as an emerald crosshair).
     var activeSnapPoint: CGPoint? {
         didSet {
-            isHidden = (aid == .none && activeSnapPoint == nil)
+            updateVisibility()
             setNeedsDisplay()
         }
     }
@@ -33,6 +44,10 @@ final class GeometryToolOverlayView: UIView {
     }
     var activeStrokeColor: UIColor = .label {
         didSet { setNeedsDisplay() }
+    }
+
+    private func updateVisibility() {
+        isHidden = (aid == .none && selectedShape == nil && activeSnapPoint == nil)
     }
 
     // Optional finger callbacks (in addition to primary one-handed Apple Pencil control).
@@ -72,6 +87,14 @@ final class GeometryToolOverlayView: UIView {
     /// Returns `true` only on manipulative control handles/buttons so finger touches elsewhere
     /// fall straight through to `WKWebView` (scrolling, zooming, page buttons, cover tapes).
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if let selected = selectedShape {
+            switch selected.hitTest(point, in: bounds, bodyHit: false) {
+            case .action, .handle:
+                return true
+            case .none, .body:
+                break
+            }
+        }
         switch aid {
         case .none:
             return false
@@ -108,11 +131,95 @@ final class GeometryToolOverlayView: UIView {
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        if let selected = selectedShape {
+            drawSelectedShape(selected, in: ctx)
+        }
         if aid == .compass {
             drawCompass(in: ctx)
         }
         if let snap = activeSnapPoint {
             drawSnapIndicator(at: snap, kind: activeSnapKind, in: ctx)
+        }
+    }
+
+    private func drawSelectedShape(_ selected: SelectedShapeOverlay, in ctx: CGContext) {
+        // Subtle dashed selection bounding frame
+        let box = selected.boundingBox.insetBy(dx: -6, dy: -6)
+        if box.width > 0, box.height > 0 {
+            ctx.saveGState()
+            ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(0.35).cgColor)
+            ctx.setLineWidth(1.0)
+            ctx.setLineDash(phase: 0, lengths: [4, 4])
+            ctx.stroke(box)
+            ctx.restoreGState()
+        }
+
+        // Crisp draggable vertex / control point handles
+        for (idx, pt) in selected.handles.enumerated() {
+            let r: CGFloat = (idx == 0 && selected.isCircularWithCenterMark) ? 8.5 : 8.0
+            let rect = CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2)
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4,
+                          color: UIColor.black.withAlphaComponent(0.22).cgColor)
+            UIColor.white.setFill()
+            ctx.fillEllipse(in: rect)
+            ctx.restoreGState()
+
+            UIColor.systemBlue.setStroke()
+            ctx.setLineWidth(2.2)
+            ctx.strokeEllipse(in: rect)
+
+            if idx == 0, selected.isCircularWithCenterMark {
+                UIColor.systemBlue.setFill()
+                ctx.fillEllipse(in: CGRect(x: pt.x - 2.5, y: pt.y - 2.5, width: 5, height: 5))
+            }
+        }
+
+        guard !isEditingSelectedShape else { return }
+        let bar = selected.actionBarFrame(in: bounds)
+        let buttons = selected.actionButtons(in: bounds)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8,
+                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
+        let bg = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        UIColor.systemBackground.withAlphaComponent(0.95).setFill()
+        bg.fill()
+        ctx.restoreGState()
+
+        UIColor.separator.withAlphaComponent(0.6).setStroke()
+        let border = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        border.lineWidth = 0.8
+        border.stroke()
+
+        let font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        for (i, pair) in buttons.enumerated() {
+            let (action, rect) = pair
+            if i > 0 {
+                ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
+                ctx.setLineWidth(0.8)
+                ctx.move(to: CGPoint(x: rect.minX, y: bar.minY + 7))
+                ctx.addLine(to: CGPoint(x: rect.minX, y: bar.maxY - 7))
+                ctx.strokePath()
+            }
+            switch action {
+            case .cycleLineStyle:
+                let title = selected.lineStyle.displayName
+                drawCenteredText(title, in: rect, font: font, color: .label)
+            case .toggleFillOrCenter:
+                let isActive = selected.supportsFill ? selected.isFilled : selected.showsCenterMark
+                if isActive {
+                    let pill = UIBezierPath(roundedRect: rect.insetBy(dx: 3, dy: 3), cornerRadius: 14)
+                    UIColor.systemBlue.withAlphaComponent(0.18).setFill()
+                    pill.fill()
+                }
+                let title = selected.supportsFill ? "阴影" : "⊙圆心"
+                drawCenteredText(title, in: rect, font: font, color: isActive ? .systemBlue : .secondaryLabel)
+            case .duplicate:
+                drawCenteredText("复制", in: rect, font: font, color: .label)
+            case .delete:
+                drawCenteredText("删除", in: rect, font: font, color: .systemRed)
+            }
         }
     }
 
