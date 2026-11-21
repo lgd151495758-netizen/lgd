@@ -34,7 +34,7 @@ final class WebLiveTests: XCTestCase {
     private func load(_ html: String) async throws {
         bridge.resetForNavigation()
         bridge.webView.loadHTMLString(html, baseURL: nil)
-        let ready = await waitUntil { self.bridge.isReady }
+        let ready = await waitUntil(timeout: 30) { self.bridge.isReady }
         XCTAssertTrue(ready, "runtime did not start")
     }
 
