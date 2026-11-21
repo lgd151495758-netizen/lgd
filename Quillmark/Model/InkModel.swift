@@ -222,6 +222,31 @@ struct InkStroke: Codable, Equatable, Identifiable {
     }
 }
 
+enum ScratchpadPaperStyle: String, Codable, CaseIterable, Identifiable {
+    case blank
+    case grid
+    case dot
+    case graph
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .blank: return "空白"
+        case .grid: return "方格"
+        case .dot: return "点阵"
+        case .graph: return "坐标纸"
+        }
+    }
+}
+
+enum ScratchpadSplitMode: String, Codable, Equatable {
+    /// Top shows the live HTML problem; bottom is the interactive math scratchpad.
+    case split
+    /// Full-screen math whiteboard.
+    case full
+}
+
 struct PageAnnotations: Codable, Equatable {
     var strokes: [InkStroke] = []
 }
@@ -230,15 +255,55 @@ struct DocumentAnnotations: Codable, Equatable {
     var version: Int = 1
     /// Keyed by zero-based page index as a string, so the JSON stays a plain object.
     var pages: [String: PageAnnotations] = [:]
+    /// Per-document multi-page math scratchpad pages (optional for backward compatibility).
+    var scratchpadPages: [PageAnnotations]?
+    /// Preferred background paper style for this document's scratchpad.
+    var scratchpadPaper: ScratchpadPaperStyle?
+
+    /// Negative page indices (`-1, -2, ...`) map to zero-based scratchpad pages (`0, 1, ...`).
+    static func scratchpadPageID(_ scratchpadIndex: Int) -> Int {
+        -(max(0, scratchpadIndex) + 1)
+    }
+
+    var resolvedScratchpadPageCount: Int {
+        max(1, scratchpadPages?.count ?? 0)
+    }
 
     func page(_ index: Int) -> PageAnnotations {
-        pages[String(index)] ?? PageAnnotations()
+        if index < 0 {
+            let sIdx = -index - 1
+            guard let list = scratchpadPages, sIdx >= 0, sIdx < list.count else {
+                return PageAnnotations()
+            }
+            return list[sIdx]
+        }
+        return pages[String(index)] ?? PageAnnotations()
     }
 
     mutating func updatePage(_ index: Int, _ body: (inout PageAnnotations) -> Void) {
+        if index < 0 {
+            let sIdx = -index - 1
+            var list = scratchpadPages ?? [PageAnnotations()]
+            while list.count <= sIdx {
+                list.append(PageAnnotations())
+            }
+            var target = list[sIdx]
+            body(&target)
+            list[sIdx] = target
+            scratchpadPages = list
+            return
+        }
         var page = page(index)
         body(&page)
         pages[String(index)] = page.strokes.isEmpty ? nil : page
+    }
+
+    @discardableResult
+    mutating func appendScratchpadPage() -> Int {
+        var list = scratchpadPages ?? [PageAnnotations()]
+        list.append(PageAnnotations())
+        scratchpadPages = list
+        return list.count - 1
     }
 }
 

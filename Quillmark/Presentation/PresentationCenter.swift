@@ -216,6 +216,20 @@ final class PresentationCenter: ObservableObject {
         }
     }
 
+    /// On: freezes the external display on its current frame so the teacher can scroll or look up
+    /// answers on the iPad privately, then unfreeze to resume live projection immediately.
+    @Published var isFrozen: Bool = false {
+        didSet {
+            guard isFrozen != oldValue else { return }
+            if isFrozen {
+                presenter?.updateLiveOverlay(.empty)
+            } else {
+                updateOverlayVisibility()
+                requestFrameRefresh()
+            }
+        }
+    }
+
     static let framesPerSecond: Float = 24
     private static let contentOnlyKey = "presentation.contentOnly"
     private static let fillModeKey = "presentation.fillMode.v2"
@@ -433,6 +447,9 @@ final class PresentationCenter: ObservableObject {
         attachmentKind = .none
         isCapturingFrame = false
         isExternalDisplayConnected = false
+        if isFrozen {
+            isFrozen = false
+        }
         updateSummary()
         notifyViewportChanged()
     }
@@ -451,18 +468,21 @@ final class PresentationCenter: ObservableObject {
         guard contentSource === source else { return }
         contentSource = nil
         liveOverlay = .empty
+        if isFrozen {
+            isFrozen = false
+        }
         presenter?.updateLiveOverlay(.empty)
         requestFrameRefresh()
     }
 
     func updateLiveOverlay(_ state: LiveOverlayState) {
         liveOverlay = state
-        guard isShowingContentOnly else { return }
+        guard isShowingContentOnly, !isFrozen else { return }
         presenter?.updateLiveOverlay(state)
     }
 
     func requestFrameRefresh() {
-        guard presenter != nil else { return }
+        guard presenter != nil, !isFrozen else { return }
         captureNextFrame()
     }
 
@@ -471,7 +491,7 @@ final class PresentationCenter: ObservableObject {
     }
 
     private func updateOverlayVisibility() {
-        presenter?.updateLiveOverlay(isShowingContentOnly ? liveOverlay : .empty)
+        presenter?.updateLiveOverlay((isShowingContentOnly && !isFrozen) ? liveOverlay : .empty)
     }
 
     private func updateSummary() {
@@ -517,7 +537,7 @@ final class PresentationCenter: ObservableObject {
     }
 
     private func captureNextFrame() {
-        guard let presenter else { return }
+        guard let presenter, !isFrozen else { return }
         let now = CFAbsoluteTimeGetCurrent()
         if isCapturingFrame {
             if now - captureStartedAt < 2.0 { return }
@@ -530,6 +550,7 @@ final class PresentationCenter: ObservableObject {
             source.capturePresentationFrame { [weak self] image, size in
                 guard let self else { return }
                 self.isCapturingFrame = false
+                guard !self.isFrozen else { return }
                 guard let image, size.width > 0, size.height > 0 else { return }
                 guard self.isShowingContentOnly else { return }
                 self.presenter?.show(image: image, sourceSize: size)
@@ -547,6 +568,7 @@ final class PresentationCenter: ObservableObject {
             source.capturePresentationFrame { [weak self] contentImage, _ in
                 guard let self else { return }
                 self.isCapturingFrame = false
+                guard !self.isFrozen else { return }
                 let composite = Self.renderWindow(mainWindow, replacing: contentFrame, with: contentImage)
                 self.presenter?.show(image: composite, sourceSize: mainWindow.bounds.size)
             }

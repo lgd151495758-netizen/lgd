@@ -23,6 +23,10 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private let laserGlowLayer = CAShapeLayer()
     private let laserCoreLayer = CAShapeLayer()
     private let geometryOverlay = GeometryToolOverlayView()
+    private lazy var scratchpadPanel = ScratchpadPanelView(session: session)
+    private var scratchpadTopConstraint: NSLayoutConstraint?
+    private var scratchpadSplitRatio: CGFloat = 0.42
+    private var scratchpadLiveOverlay: ScratchpadLiveOverlay?
     private let geometryCache = StrokeGeometryCache()
     private var cancellables = Set<AnyCancellable>()
     private var documentURL: URL?
@@ -209,6 +213,38 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         geometryOverlay.onFingerPanChanged = { [weak self] p in self?.updateFingerGeometryDrag(to: p) }
         geometryOverlay.onFingerPanEnded = { [weak self] _ in self?.endFingerGeometryDrag() }
 
+        // Interactive math scratchpad panel (split half-screen or full-screen; header bar is iPad-only).
+        scratchpadPanel.translatesAutoresizingMaskIntoConstraints = false
+        scratchpadPanel.isHidden = !session.isScratchpadOpen
+        view.addSubview(scratchpadPanel)
+        let topConstraint = scratchpadPanel.topAnchor.constraint(equalTo: view.topAnchor, constant: 0)
+        scratchpadTopConstraint = topConstraint
+        NSLayoutConstraint.activate([
+            scratchpadPanel.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scratchpadPanel.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            topConstraint,
+            scratchpadPanel.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        scratchpadPanel.onSplitDragDelta = { [weak self] delta in
+            guard let self, self.view.bounds.height > 120 else { return }
+            let nextRatio = (self.view.bounds.height * self.scratchpadSplitRatio + delta) / self.view.bounds.height
+            self.scratchpadSplitRatio = min(max(0.22, nextRatio), 0.74)
+            self.updateScratchpadLayout()
+            PresentationCenter.shared.requestFrameRefresh()
+        }
+        scratchpadPanel.canvas.onLiveOverlayChanged = { [weak self] overlay in
+            self?.scratchpadLiveOverlay = overlay
+            self?.pushPresentationOverlay()
+        }
+        scratchpadPanel.canvas.onContentDidMutate = {
+            PresentationCenter.shared.requestFrameRefresh()
+        }
+        scratchpadPanel.canvas.onActiveFocusY = { [weak self] localY in
+            guard let self else { return }
+            let offsetY: CGFloat = (self.session.scratchpadSplitMode == .full) ? 0 : self.currentScratchpadSplitY()
+            self.updatePresentationViewport(focusY: offsetY + localY)
+        }
+
         inkRecognizer.inkDelegate = self
         inkRecognizer.delegate = self
         // Pencil touches must never reach the page (no accidental clicks, Scribble, or text selection).
@@ -232,16 +268,23 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             self.session.toggleTape(id: id, page: Self.page)
             PresentationCenter.shared.requestFrameRefresh()
         }
-        session.pageDidChange = { [weak self] _ in
-            self?.pushStrokes()
-            self?.refreshSelectedShapeOverlay()
-            self?.refreshLassoSelectionOverlay()
+        session.pageDidChange = { [weak self] changedPage in
+            guard let self else { return }
+            if changedPage < 0 {
+                self.scratchpadPanel.canvas.syncCommittedStrokes()
+                PresentationCenter.shared.requestFrameRefresh()
+            } else {
+                self.pushStrokes()
+                self.refreshSelectedShapeOverlay()
+                self.refreshLassoSelectionOverlay()
+            }
         }
         session.$tool
             .sink { [weak self] _ in
                 DispatchQueue.main.async {
                     self?.applyGestureRules()
                     self?.syncGeometryOverlayAppearance()
+                    self?.scratchpadPanel.canvas.applyToolConfiguration()
                 }
             }
             .store(in: &cancellables)
@@ -252,13 +295,69 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                 DispatchQueue.main.async {
                     self?.clearSelectedShape()
                     self?.clearLassoSelection()
+                    self?.scratchpadPanel.canvas.toolKindDidChange()
                 }
             }
             .store(in: &cancellables)
         session.$geometryAid
             .removeDuplicates()
-            .sink { [weak self] aid in
-                DispatchQueue.main.async { self?.applyGeometryAid(aid) }
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.syncGeometryAidTarget() }
+            }
+            .store(in: &cancellables)
+        session.$isScratchpadOpen
+            .removeDuplicates()
+            .sink { [weak self] isOpen in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if !isOpen {
+                        self.scratchpadPanel.canvas.deactivate()
+                        self.scratchpadLiveOverlay = nil
+                    } else {
+                        self.clearSelectedShape()
+                        self.clearLassoSelection()
+                        self.scratchpadPanel.refreshHeaderState()
+                        self.scratchpadPanel.canvas.syncCommittedStrokes()
+                    }
+                    self.updateScratchpadLayout()
+                    self.syncGeometryAidTarget()
+                    self.pushPresentationOverlay()
+                    PresentationCenter.shared.requestFrameRefresh()
+                }
+            }
+            .store(in: &cancellables)
+        session.$scratchpadSplitMode
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.scratchpadPanel.refreshHeaderState()
+                    self.updateScratchpadLayout()
+                    self.pushPresentationOverlay()
+                    PresentationCenter.shared.requestFrameRefresh()
+                }
+            }
+            .store(in: &cancellables)
+        session.$scratchpadPageIndex
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    self.scratchpadPanel.refreshHeaderState()
+                    self.scratchpadPanel.canvas.handlePageSwitch()
+                }
+            }
+            .store(in: &cancellables)
+        session.$scratchpadPageCount
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.scratchpadPanel.refreshHeaderState() }
+            }
+            .store(in: &cancellables)
+        session.$scratchpadPaper
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.scratchpadPanel.refreshHeaderState() }
             }
             .store(in: &cancellables)
         webView.scrollView.publisher(for: \.contentOffset)
@@ -296,10 +395,48 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         laserCoreLayer.frame = view.bounds
         CATransaction.commit()
         updatePresentationViewport(focusY: nil)
+        updateScratchpadLayout()
         clampGeometryAidsToBounds()
         refreshSelectedShapeOverlay()
         refreshLassoSelectionOverlay()
         applyGestureRules()
+    }
+
+    private func syncGeometryAidTarget() {
+        if session.isScratchpadOpen {
+            applyGeometryAid(.none)
+            scratchpadPanel.canvas.applyGeometryAid(session.geometryAid)
+        } else {
+            scratchpadPanel.canvas.applyGeometryAid(.none)
+            applyGeometryAid(session.geometryAid)
+        }
+    }
+
+    private func currentScratchpadSplitY() -> CGFloat {
+        guard view.bounds.height > 0 else { return 0 }
+        return round(view.bounds.height * scratchpadSplitRatio)
+    }
+
+    private func updateScratchpadLayout() {
+        let isOpen = session.isScratchpadOpen
+        scratchpadPanel.isHidden = !isOpen
+        let topOffset: CGFloat
+        if !isOpen || session.scratchpadSplitMode == .full {
+            topOffset = 0
+        } else {
+            topOffset = currentScratchpadSplitY()
+        }
+        if let constraint = scratchpadTopConstraint, abs(constraint.constant - topOffset) > 0.5 {
+            constraint.constant = topOffset
+        }
+        let splitBottomInset: CGFloat = (isOpen && session.scratchpadSplitMode == .split)
+            ? max(0, view.bounds.height - topOffset)
+            : 0
+        let desiredInset = presentationViewport.extraBottomInset + splitBottomInset
+        if abs(webView.scrollView.contentInset.bottom - desiredInset) > 0.5 {
+            webView.scrollView.contentInset.bottom = desiredInset
+            webView.scrollView.verticalScrollIndicatorInsets.bottom = desiredInset
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -312,6 +449,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         super.viewWillDisappear(animated)
         stopLaserLoop()
         holdTimer?.cancel()
+        scratchpadPanel.canvas.deactivate()
         PresentationCenter.shared.clearContentSource(self)
         PresentationCenter.shared.unregisterSceneAccessory(from: self)
         saveThumbnail()
@@ -469,6 +607,16 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     func scribbleInteraction(_ interaction: UIScribbleInteraction, shouldBeginAt location: CGPoint) -> Bool {
         false
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        if gestureRecognizer === inkRecognizer, session.isScratchpadOpen {
+            let pt = touch.location(in: scratchpadPanel)
+            if scratchpadPanel.bounds.contains(pt) {
+                return false
+            }
+        }
+        return true
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
@@ -2198,6 +2346,36 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private func pushPresentationOverlay() {
         guard PresentationCenter.shared.isShowingContentOnly else { return }
         let captureRect = presentationViewport.captureRect.width > 0 ? presentationViewport.captureRect : view.bounds
+
+        // When the scratchpad is actively receiving live input (or open full-screen), project its live ink.
+        if session.isScratchpadOpen {
+            if let scratch = scratchpadLiveOverlay {
+                let offsetY: CGFloat = (session.scratchpadSplitMode == .full) ? 0 : currentScratchpadSplitY()
+                let shifted = scratch.translated(by: CGPoint(x: 0, y: offsetY))
+                let state = LiveOverlayState(
+                    sourceSize: captureRect.size,
+                    captureOriginY: captureRect.minY,
+                    strokePath: shifted.strokePath,
+                    strokeColor: shifted.strokeColor,
+                    strokeOpacity: shifted.strokeOpacity,
+                    isHighlighter: false,
+                    fillPath: shifted.fillPath,
+                    fillColor: shifted.fillColor,
+                    pendingStrokes: shifted.pendingStrokes,
+                    cursorPath: shifted.cursorPath,
+                    laserGlowPath: shifted.laserGlowPath,
+                    laserCorePath: shifted.laserCorePath,
+                    laserColor: shifted.laserColor,
+                    laserOpacity: shifted.laserOpacity
+                )
+                PresentationCenter.shared.updateLiveOverlay(state)
+                return
+            } else if session.scratchpadSplitMode == .full {
+                PresentationCenter.shared.updateLiveOverlay(.empty)
+                return
+            }
+        }
+
         var pendingOverlays: [PendingOverlayStroke] = pendingItems.compactMap { item in
             guard let path = item.layer.path else { return nil }
             return PendingOverlayStroke(path: path, color: item.layer.fillColor,
@@ -2254,12 +2432,18 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         presentationViewport = viewport
         captureOriginY = viewport.captureRect.minY
 
+        let splitBottomInset: CGFloat = (session.isScratchpadOpen && session.scratchpadSplitMode == .split)
+            ? max(0, visibleSize.height - currentScratchpadSplitY())
+            : 0
         if let heightConstraint = webViewHeightConstraint,
            abs(heightConstraint.constant - viewport.extraBottomInset) > 0.5 {
             heightConstraint.constant = viewport.extraBottomInset
-            webView.scrollView.contentInset.bottom = viewport.extraBottomInset
-            webView.scrollView.verticalScrollIndicatorInsets.bottom = viewport.extraBottomInset
             view.setNeedsLayout()
+        }
+        let desiredBottomInset = viewport.extraBottomInset + splitBottomInset
+        if abs(webView.scrollView.contentInset.bottom - desiredBottomInset) > 0.5 {
+            webView.scrollView.contentInset.bottom = desiredBottomInset
+            webView.scrollView.verticalScrollIndicatorInsets.bottom = desiredBottomInset
         }
         if originChanged {
             pushPresentationOverlay()
@@ -2277,29 +2461,109 @@ extension WebEditorViewController: PresentationContentSource {
 
     func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void) {
         updatePresentationViewport(focusY: nil)
-        let bounds = webView.bounds
-        guard bounds.width > 0, bounds.height > 0 else {
-            completion(nil, .zero)
-            return
-        }
         let target = presentationViewport.captureRect
         let captureRect: CGRect
         if target.width > 0, target.height > 0 {
-            captureRect = target.intersection(bounds)
+            captureRect = target
         } else {
-            captureRect = bounds
+            captureRect = view.bounds
         }
         guard captureRect.width > 0, captureRect.height > 0 else {
             completion(nil, .zero)
             return
         }
+
+        // 1. Full-screen math scratchpad: pure Retina vector render, zero iPad UI chrome.
+        if session.isScratchpadOpen && session.scratchpadSplitMode == .full {
+            let fullHeight = max(captureRect.maxY, view.bounds.height)
+            let fullCanvas = scratchpadPanel.canvas.renderCleanImage(size: CGSize(width: captureRect.width, height: fullHeight))
+            if captureRect.minY <= 0.5 && abs(fullHeight - captureRect.height) <= 0.5 {
+                completion(fullCanvas, captureRect.size)
+            } else {
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = min(max(UIScreen.main.scale, 1), 2)
+                format.opaque = true
+                let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+                let sliced = renderer.image { _ in
+                    fullCanvas.draw(in: CGRect(x: 0, y: -captureRect.minY, width: captureRect.width, height: fullHeight))
+                }
+                completion(sliced, captureRect.size)
+            }
+            return
+        }
+
+        // 2. Split-screen mode: top shows live HTML problem, bottom shows clean math scratchpad (no iPad header bar).
+        if session.isScratchpadOpen && session.scratchpadSplitMode == .split {
+            let splitY = currentScratchpadSplitY()
+            let scratchOriginY = splitY - captureRect.minY
+            let scratchRenderHeight = max(1, max(captureRect.maxY, view.bounds.height) - splitY)
+            let scratchImage = scratchpadPanel.canvas.renderCleanImage(
+                size: CGSize(width: captureRect.width, height: scratchRenderHeight)
+            )
+
+            let htmlVisibleTop = captureRect.minY
+            let htmlVisibleBottom = min(splitY, captureRect.maxY)
+            let htmlVisibleHeight = htmlVisibleBottom - htmlVisibleTop
+
+            guard htmlVisibleHeight > 1, webView.bounds.width > 0, webView.bounds.height > 0 else {
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = min(max(UIScreen.main.scale, 1), 2)
+                format.opaque = true
+                let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+                let img = renderer.image { _ in
+                    scratchImage.draw(in: CGRect(x: 0, y: scratchOriginY, width: captureRect.width, height: scratchRenderHeight))
+                }
+                completion(img, captureRect.size)
+                return
+            }
+
+            let htmlRect = CGRect(x: 0, y: htmlVisibleTop, width: captureRect.width, height: htmlVisibleHeight)
+                .intersection(webView.bounds)
+            let config = WKSnapshotConfiguration()
+            config.rect = htmlRect
+            let maxWidth = PresentationCenter.shared.preferredSnapshotMaxWidthPoints
+            config.snapshotWidth = NSNumber(value: min(Double(htmlRect.width), maxWidth))
+            config.afterScreenUpdates = false
+            webView.takeSnapshot(with: config) { htmlImage, _ in
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = min(max(UIScreen.main.scale, 1), 2)
+                format.opaque = true
+                let renderer = UIGraphicsImageRenderer(size: captureRect.size, format: format)
+                let composite = renderer.image { ctx in
+                    UIColor.white.setFill()
+                    ctx.fill(CGRect(origin: .zero, size: captureRect.size))
+                    if let htmlImage {
+                        htmlImage.draw(in: CGRect(x: 0, y: 0, width: captureRect.width, height: htmlVisibleHeight))
+                    }
+                    scratchImage.draw(in: CGRect(x: 0, y: scratchOriginY, width: captureRect.width, height: scratchRenderHeight))
+                    if scratchOriginY >= 0 && scratchOriginY < captureRect.height {
+                        UIColor.separator.setFill()
+                        ctx.fill(CGRect(x: 0, y: scratchOriginY, width: captureRect.width, height: 1.5))
+                    }
+                }
+                completion(composite, captureRect.size)
+            }
+            return
+        }
+
+        // 3. Normal live HTML document mode.
+        let bounds = webView.bounds
+        guard bounds.width > 0, bounds.height > 0 else {
+            completion(nil, .zero)
+            return
+        }
+        let htmlCapture = captureRect.intersection(bounds)
+        guard htmlCapture.width > 0, htmlCapture.height > 0 else {
+            completion(nil, .zero)
+            return
+        }
         let configuration = WKSnapshotConfiguration()
-        configuration.rect = captureRect
+        configuration.rect = htmlCapture
         let maxWidth = PresentationCenter.shared.preferredSnapshotMaxWidthPoints
-        configuration.snapshotWidth = NSNumber(value: min(Double(captureRect.width), maxWidth))
+        configuration.snapshotWidth = NSNumber(value: min(Double(htmlCapture.width), maxWidth))
         configuration.afterScreenUpdates = false
         webView.takeSnapshot(with: configuration) { image, _ in
-            completion(image, captureRect.size)
+            completion(image, htmlCapture.size)
         }
     }
 }

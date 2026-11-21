@@ -34,11 +34,27 @@ final class DocumentSession: ObservableObject {
         didSet { tool.save() }
     }
     @Published var geometryAid: GeometryAid = .none
+    @Published var isScratchpadOpen: Bool = false
+    @Published var scratchpadSplitMode: ScratchpadSplitMode = .split
+    @Published private(set) var scratchpadPageIndex: Int = 0
+    @Published private(set) var scratchpadPageCount: Int = 1
+    @Published var scratchpadPaper: ScratchpadPaperStyle = .grid {
+        didSet {
+            guard scratchpadPaper != oldValue else { return }
+            annotations.scratchpadPaper = scratchpadPaper
+            scheduleSave()
+        }
+    }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
 
-    /// Called after the strokes of a page changed (page index).
+    /// Called after the strokes of a page changed (page index; negative values are scratchpad pages).
     var pageDidChange: ((Int) -> Void)?
+
+    /// Negative page ID for the currently active scratchpad page (`-1, -2, ...`).
+    var currentScratchpadPageID: Int {
+        DocumentAnnotations.scratchpadPageID(scratchpadPageIndex)
+    }
 
     private(set) var annotations: DocumentAnnotations
     private var undoStack: [Command] = []
@@ -53,7 +69,10 @@ final class DocumentSession: ObservableObject {
         self.meta = meta
         self.library = library
         self.tool = tool
-        self.annotations = library.loadAnnotations(for: meta.id)
+        let loaded = library.loadAnnotations(for: meta.id)
+        self.annotations = loaded
+        self.scratchpadPageCount = loaded.resolvedScratchpadPageCount
+        self.scratchpadPaper = loaded.scratchpadPaper ?? .grid
         self.pdfDocument = PDFDocument(url: library.pdfURL(for: meta.id))
         let observer = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification,
                                                               object: nil, queue: .main) { [weak self] _ in
@@ -104,7 +123,9 @@ final class DocumentSession: ObservableObject {
         if let page {
             targetPages = [page]
         } else {
-            targetPages = annotations.pages.keys.compactMap(Int.init).sorted()
+            let mainPages = annotations.pages.keys.compactMap(Int.init).sorted()
+            let scratchIDs = (0..<scratchpadPageCount).map { DocumentAnnotations.scratchpadPageID($0) }
+            targetPages = mainPages + scratchIDs
         }
         var changedPages: [Int] = []
         for p in targetPages {
@@ -124,6 +145,36 @@ final class DocumentSession: ObservableObject {
             pageDidChange?(p)
         }
         scheduleSave()
+    }
+
+    // MARK: Scratchpad Pages
+
+    func toggleScratchpad() {
+        isScratchpadOpen.toggle()
+    }
+
+    func toggleScratchpadSplitMode() {
+        scratchpadSplitMode = (scratchpadSplitMode == .split) ? .full : .split
+    }
+
+    func selectScratchpadPage(_ index: Int) {
+        let clamped = min(max(0, index), max(0, scratchpadPageCount - 1))
+        guard clamped != scratchpadPageIndex else { return }
+        scratchpadPageIndex = clamped
+    }
+
+    func addScratchpadPage() {
+        let newIdx = annotations.appendScratchpadPage()
+        scratchpadPageCount = annotations.resolvedScratchpadPageCount
+        scratchpadPageIndex = newIdx
+        scheduleSave()
+    }
+
+    func clearCurrentScratchpadPage() {
+        let pageID = currentScratchpadPageID
+        let current = strokes(onPage: pageID)
+        guard !current.isEmpty else { return }
+        replaceStrokes(onPage: pageID, before: current, after: [])
     }
 
     func toggleGeometryAid(_ aid: GeometryAid) {

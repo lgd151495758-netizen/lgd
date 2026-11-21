@@ -16,6 +16,23 @@ struct EditorView: View {
             ToolbarView(session: session)
                 .padding(.horizontal)
                 .padding(.vertical, 6)
+            if presentation.isFrozen {
+                Button {
+                    presentation.isFrozen = false
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "snowflake")
+                        Text("大屏画面已冻结 · 可在 iPad 自由翻页，轻点此处恢复实时同步")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(Color.orange)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("恢复大屏实时同步")
+            }
             editor
         }
         .ignoresSafeArea(edges: .bottom)
@@ -23,25 +40,44 @@ struct EditorView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    presentation.scanDisplays()
-                    showPresentationPopover = true
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "airplayvideo")
-                        if presentation.isExternalDisplayConnected {
-                            Text(presentation.contentOnly ? "投屏中" : "镜像中")
-                                .font(.caption.weight(.medium))
+                HStack(spacing: 8) {
+                    if presentation.isExternalDisplayConnected {
+                        Button {
+                            presentation.isFrozen.toggle()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: presentation.isFrozen ? "snowflake" : "pause.circle")
+                                Text(presentation.isFrozen ? "已冻结" : "冻结")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .foregroundStyle(presentation.isFrozen ? Color.white : Color.primary)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(presentation.isFrozen ? Color.orange : Color.secondary.opacity(0.16),
+                                        in: Capsule())
                         }
+                        .accessibilityLabel(presentation.isFrozen ? "取消冻结大屏" : "冻结大屏画面")
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(presentation.isExternalDisplayConnected ? Color.accentColor.opacity(0.18) : Color.clear,
-                                in: Capsule())
-                }
-                .accessibilityLabel("投屏设置")
-                .popover(isPresented: $showPresentationPopover) {
-                    PresentationPopover(presentation: presentation)
+                    Button {
+                        presentation.scanDisplays()
+                        showPresentationPopover = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "airplayvideo")
+                            if presentation.isExternalDisplayConnected {
+                                Text(presentation.contentOnly ? "投屏中" : "镜像中")
+                                    .font(.caption.weight(.medium))
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(presentation.isExternalDisplayConnected ? Color.accentColor.opacity(0.18) : Color.clear,
+                                    in: Capsule())
+                    }
+                    .accessibilityLabel("投屏设置")
+                    .popover(isPresented: $showPresentationPopover) {
+                        PresentationPopover(presentation: presentation)
+                    }
                 }
             }
         }
@@ -80,6 +116,14 @@ private struct PresentationPopover: View {
                     }
                 }
                 .pickerStyle(.segmented)
+            }
+
+            if presentation.isExternalDisplayConnected {
+                Toggle("冻结大屏画面", isOn: $presentation.isFrozen)
+                Text("冻结后学生端大屏保持当前题目不变，你可以在 iPad 上自由翻页看答案或下一题，关闭后立即恢复同步。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
