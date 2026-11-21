@@ -340,10 +340,32 @@ private struct ShapePresetIcon: View {
                 path.addLine(to: CGPoint(x: w - pad, y: h - pad - 1))
                 path.addLine(to: CGPoint(x: pad, y: h - pad - 1))
                 path.closeSubpath()
+            case .pentagon:
+                let r = min(w, h) * 0.44
+                let cx = w / 2, cy = h / 2 + 0.5
+                for i in 0..<5 {
+                    let a = -CGFloat.pi / 2 + 2 * CGFloat.pi * CGFloat(i) / 5
+                    let pt = CGPoint(x: cx + r * cos(a), y: cy + r * sin(a))
+                    if i == 0 { path.move(to: pt) } else { path.addLine(to: pt) }
+                }
+                path.closeSubpath()
+            case .hexagon:
+                let r = min(w, h) * 0.44
+                let cx = w / 2, cy = h / 2
+                for i in 0..<6 {
+                    let a = 2 * CGFloat.pi * CGFloat(i) / 6
+                    let pt = CGPoint(x: cx + r * cos(a), y: cy + r * sin(a))
+                    if i == 0 { path.move(to: pt) } else { path.addLine(to: pt) }
+                }
+                path.closeSubpath()
             case .circle:
                 let d = min(w, h) - 2 * pad
                 path.addEllipse(in: CGRect(x: (w - d) / 2, y: (h - d) / 2, width: d, height: d))
                 path.addEllipse(in: CGRect(x: w / 2 - 1, y: h / 2 - 1, width: 2, height: 2))
+            case .parabola:
+                path.move(to: CGPoint(x: pad + 1, y: pad + 1))
+                path.addQuadCurve(to: CGPoint(x: w - pad - 1, y: pad + 1),
+                                  control: CGPoint(x: w / 2, y: h * 1.35))
             case .axes:
                 // X axis + arrow
                 path.move(to: CGPoint(x: pad, y: h / 2))

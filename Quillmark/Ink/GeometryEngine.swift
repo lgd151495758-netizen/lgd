@@ -18,6 +18,11 @@ enum GeometricPrimitive: Codable, Equatable {
              clockwise: Bool, showCenterMark: Bool = true)
     case ellipse(center: CGPoint, rx: CGFloat, ry: CGFloat, rotation: CGFloat)
     case polygon(vertices: [CGPoint], closed: Bool = true)
+    /// Exact mathematical parabola:
+    /// `P(s) = vertex + (s * halfWidth) * perp + (s^2 * height) * axis` for `s ∈ [-1, 1]`,
+    /// where `axis = (cos(axisAngle), sin(axisAngle))` points toward the opening
+    /// (`-π/2` opens UP in UIKit +Y down, `+π/2` opens DOWN, `0` opens RIGHT, `π` opens LEFT).
+    case parabola(vertex: CGPoint, axisAngle: CGFloat, halfWidth: CGFloat, height: CGFloat)
     /// 2D Cartesian coordinate system (`xMin < 0 < xMax`, `yMin < 0 < yMax` in UIKit +Y down).
     case axes(origin: CGPoint, xMin: CGFloat, xMax: CGFloat, yMin: CGFloat, yMax: CGFloat, tickSpacing: CGFloat = 28)
 
@@ -25,7 +30,7 @@ enum GeometricPrimitive: Codable, Equatable {
         switch self {
         case .circle, .ellipse: return true
         case let .polygon(_, closed): return closed
-        case .segment, .arc, .axes: return false
+        case .segment, .arc, .parabola, .axes: return false
         }
     }
 
@@ -70,6 +75,8 @@ enum GeometricPrimitive: Codable, Equatable {
             return .ellipse(center: shift(center), rx: rx, ry: ry, rotation: rotation)
         case let .polygon(vertices, closed):
             return .polygon(vertices: vertices.map(shift), closed: closed)
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            return .parabola(vertex: shift(vertex), axisAngle: axisAngle, halfWidth: halfWidth, height: height)
         case let .axes(origin, xMin, xMax, yMin, yMax, tick):
             return .axes(origin: shift(origin), xMin: xMin, xMax: xMax, yMin: yMin, yMax: yMax, tickSpacing: tick)
         }
@@ -110,7 +117,7 @@ enum GeometricPrimitive: Codable, Equatable {
             p.closeSubpath()
             return p
 
-        case .segment, .arc, .axes:
+        case .segment, .arc, .parabola, .axes:
             return nil
         }
     }
@@ -149,6 +156,15 @@ enum GeometricPrimitive: Codable, Equatable {
                 minY = min(minY, v.y); maxY = max(maxY, v.y)
             }
             return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        case .parabola:
+            let pts = samples(radius: 1).map(\.point)
+            guard let first = pts.first else { return .zero }
+            var minX = first.x, maxX = first.x, minY = first.y, maxY = first.y
+            for p in pts {
+                minX = min(minX, p.x); maxX = max(maxX, p.x)
+                minY = min(minY, p.y); maxY = max(maxY, p.y)
+            }
+            return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
         case let .axes(o, xMin, xMax, yMin, yMax, _):
             return CGRect(x: o.x + xMin, y: o.y + yMin, width: xMax - xMin, height: yMax - yMin)
         }
@@ -175,6 +191,12 @@ enum GeometricPrimitive: Codable, Equatable {
             ]
         case let .polygon(vertices, _):
             return vertices
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            return [
+                vertex,
+                Self.parabolaPoint(vertex: vertex, axisAngle: axisAngle, halfWidth: halfWidth, height: height, s: 1),
+                Self.parabolaPoint(vertex: vertex, axisAngle: axisAngle, halfWidth: halfWidth, height: height, s: -1),
+            ]
         case let .axes(o, xMin, xMax, yMin, yMax, _):
             return [
                 o,
@@ -270,6 +292,30 @@ enum GeometricPrimitive: Codable, Equatable {
             vertices[index] = adjusted
             return (.polygon(vertices: vertices, closed: closed), nil)
 
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            if index == 0 {
+                let snap = GeometrySnapEngine.nearestPoint(to: target, in: snapPoints, threshold: snapThreshold)
+                return (.parabola(vertex: snap?.point ?? target, axisAngle: axisAngle,
+                                  halfWidth: halfWidth, height: height), snap)
+            } else if index == 1 || index == 2 {
+                let snap = GeometrySnapEngine.nearestPoint(to: target, in: snapPoints,
+                                                           threshold: snapThreshold, excluding: vertex, excludeRadius: 12)
+                let p = snap?.point ?? target
+                let dx = p.x - vertex.x
+                let dy = p.y - vertex.y
+                let ax = cos(axisAngle), ay = sin(axisAngle)
+                let px = -ay, py = ax
+                let u = dx * px + dy * py
+                let v = dx * ax + dy * ay
+                let newHalfW = max(12, abs(u))
+                if v < -14 {
+                    let flipped = atan2(-ay, -ax)
+                    return (.parabola(vertex: vertex, axisAngle: flipped, halfWidth: newHalfW, height: max(12, -v)), snap)
+                }
+                return (.parabola(vertex: vertex, axisAngle: axisAngle, halfWidth: newHalfW, height: max(12, v)), snap)
+            }
+            return (self, nil)
+
         case let .axes(o, xMin, xMax, yMin, yMax, tick):
             switch index {
             case 0:
@@ -327,6 +373,18 @@ enum GeometricPrimitive: Codable, Equatable {
             }
             if closed, let path = fillPath() {
                 return path.contains(point)
+            }
+            return false
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            let steps = 36
+            var prev = Self.parabolaPoint(vertex: vertex, axisAngle: axisAngle, halfWidth: halfWidth, height: height, s: -1)
+            for i in 1...steps {
+                let s = -1 + 2 * CGFloat(i) / CGFloat(steps)
+                let curr = Self.parabolaPoint(vertex: vertex, axisAngle: axisAngle, halfWidth: halfWidth, height: height, s: s)
+                if EraserEngine.distance(from: point, toSegment: prev, curr) <= tolerance {
+                    return true
+                }
+                prev = curr
             }
             return false
         case let .axes(o, xMin, xMax, yMin, yMax, _):
@@ -413,6 +471,19 @@ enum GeometricPrimitive: Codable, Equatable {
             }
             return result
 
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            let hw = max(4, halfWidth)
+            let h = max(4, height)
+            let approxLen = 2 * hypot(hw, h)
+            let rawSteps = max(36, min(140, Int(ceil(approxLen / 2.2))))
+            // Ensure an even step count so s = 0 (the exact vertex) is always sampled cleanly.
+            let steps = rawSteps + (rawSteps % 2)
+            return (0...steps).map { i in
+                let s = -1 + 2 * CGFloat(i) / CGFloat(steps)
+                let p = Self.parabolaPoint(vertex: vertex, axisAngle: axisAngle, halfWidth: hw, height: h, s: s)
+                return StrokeSample(point: p, radius: r)
+            }
+
         case let .axes(origin, xMin, xMax, yMin, yMax, tickSpacing):
             var result: [StrokeSample] = []
             let xStart = CGPoint(x: origin.x + xMin, y: origin.y)
@@ -465,6 +536,22 @@ enum GeometricPrimitive: Codable, Equatable {
             }
             return result
         }
+    }
+
+    /// Evaluates a point along a parametric parabola for `s ∈ [-1, 1]` (`s = 0` is the exact vertex).
+    static func parabolaPoint(vertex: CGPoint,
+                              axisAngle: CGFloat,
+                              halfWidth: CGFloat,
+                              height: CGFloat,
+                              s: CGFloat) -> CGPoint {
+        let ax = cos(axisAngle)
+        let ay = sin(axisAngle)
+        let px = -ay
+        let py = ax
+        let u = s * halfWidth
+        let v = s * s * height
+        return CGPoint(x: vertex.x + u * px + v * ax,
+                       y: vertex.y + u * py + v * ay)
     }
 
     /// Computes signed angular sweep in UIKit coordinates (+Y down: clockwise means increasing angle).
@@ -621,6 +708,15 @@ enum GeometrySnapEngine {
                     points.append(SnapPoint(point: CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2), kind: .midpoint))
                     segments.append(Segment(a: a, b: b))
                 }
+
+            case let .parabola(vertex, axisAngle, halfWidth, height):
+                points.append(SnapPoint(point: vertex, kind: .center))
+                points.append(SnapPoint(point: GeometricPrimitive.parabolaPoint(vertex: vertex, axisAngle: axisAngle,
+                                                                                halfWidth: halfWidth, height: height, s: -1),
+                                        kind: .endpoint))
+                points.append(SnapPoint(point: GeometricPrimitive.parabolaPoint(vertex: vertex, axisAngle: axisAngle,
+                                                                                halfWidth: halfWidth, height: height, s: 1),
+                                        kind: .endpoint))
 
             case let .axes(origin, xMin, xMax, yMin, yMax, _):
                 points.append(SnapPoint(point: origin, kind: .center))
@@ -1045,6 +1141,37 @@ enum ShapeBuilder {
                 CGPoint(x: maxX, y: maxY),
                 CGPoint(x: minX, y: maxY),
             ], closed: true), endSnap)
+
+        case .pentagon:
+            let minX = min(start.x, resolvedEnd.x), maxX = max(start.x, resolvedEnd.x)
+            let minY = min(start.y, resolvedEnd.y), maxY = max(start.y, resolvedEnd.y)
+            let cx = (minX + maxX) / 2
+            let cy = (minY + maxY) / 2
+            let r = max(14, max(maxX - minX, maxY - minY) / 2)
+            let startAngle: CGFloat = (resolvedEnd.y >= start.y) ? -CGFloat.pi / 2 : CGFloat.pi / 2
+            let verts = (0..<5).map { i -> CGPoint in
+                let a = startAngle + 2 * CGFloat.pi * CGFloat(i) / 5
+                return CGPoint(x: cx + r * cos(a), y: cy + r * sin(a))
+            }
+            return (.polygon(vertices: verts, closed: true), endSnap)
+
+        case .hexagon:
+            let minX = min(start.x, resolvedEnd.x), maxX = max(start.x, resolvedEnd.x)
+            let minY = min(start.y, resolvedEnd.y), maxY = max(start.y, resolvedEnd.y)
+            let cx = (minX + maxX) / 2
+            let cy = (minY + maxY) / 2
+            let r = max(14, max(maxX - minX, maxY - minY) / 2)
+            let verts = (0..<6).map { i -> CGPoint in
+                let a = 2 * CGFloat.pi * CGFloat(i) / 6
+                return CGPoint(x: cx + r * cos(a), y: cy + r * sin(a))
+            }
+            return (.polygon(vertices: verts, closed: true), endSnap)
+
+        case .parabola:
+            let halfW = max(16, abs(resolvedEnd.x - start.x))
+            let height = max(16, abs(resolvedEnd.y - start.y))
+            let axisAngle: CGFloat = (resolvedEnd.y >= start.y) ? CGFloat.pi / 2 : -CGFloat.pi / 2
+            return (.parabola(vertex: start, axisAngle: axisAngle, halfWidth: halfW, height: height), endSnap)
 
         case .axes:
             let minX = min(start.x, resolvedEnd.x), maxX = max(start.x, resolvedEnd.x)

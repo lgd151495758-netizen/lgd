@@ -1286,8 +1286,28 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                     snappedCurrentShape = baseShape.adjusted(to: currentDoc, initialAnchor: snapDragOriginDocPoint)
                     updateSnapFeedback(nil)
                 }
-            case .ellipse, .polygon:
+            case let .circle(center, _):
+                if let snap = GeometrySnapEngine.nearestPoint(to: currentDoc, in: cachedDocSnapPoints,
+                                                              threshold: docThreshold, excluding: center, excludeRadius: 12) {
+                    let r = max(12, hypot(snap.point.x - center.x, snap.point.y - center.y))
+                    snappedCurrentShape = .circle(center: center, radius: r)
+                    updateSnapFeedback(SnapPoint(point: snap.point.applying(viewTransform()), kind: snap.kind))
+                } else {
+                    snappedCurrentShape = baseShape.adjusted(to: currentDoc, initialAnchor: snapDragOriginDocPoint)
+                    updateSnapFeedback(nil)
+                }
+            case let .parabola(vertex, _, _, _):
+                if let snap = GeometrySnapEngine.nearestPoint(to: currentDoc, in: cachedDocSnapPoints,
+                                                              threshold: docThreshold, excluding: vertex, excludeRadius: 12) {
+                    snappedCurrentShape = baseShape.adjusted(to: snap.point, initialAnchor: snapDragOriginDocPoint)
+                    updateSnapFeedback(SnapPoint(point: snap.point.applying(viewTransform()), kind: snap.kind))
+                } else {
+                    snappedCurrentShape = baseShape.adjusted(to: currentDoc, initialAnchor: snapDragOriginDocPoint)
+                    updateSnapFeedback(nil)
+                }
+            case .rectangle, .polygon:
                 snappedCurrentShape = baseShape.adjusted(to: currentDoc, initialAnchor: snapDragOriginDocPoint)
+                updateSnapFeedback(nil)
             }
             renderSnappedLiveShape()
             return
@@ -1368,7 +1388,17 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             } else {
                 shape = .arrow(start: s, end: end)
             }
-        case .ellipse, .polygon:
+        case let .circle(center, radius):
+            if let centerSnap = GeometrySnapEngine.nearestPoint(to: center, in: cachedDocSnapPoints, threshold: docThreshold) {
+                shape = .circle(center: centerSnap.point, radius: radius)
+                updateSnapFeedback(SnapPoint(point: centerSnap.point.applying(viewTransform()), kind: centerSnap.kind))
+            }
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            if let vertexSnap = GeometrySnapEngine.nearestPoint(to: vertex, in: cachedDocSnapPoints, threshold: docThreshold) {
+                shape = .parabola(vertex: vertexSnap.point, axisAngle: axisAngle, halfWidth: halfWidth, height: height)
+                updateSnapFeedback(SnapPoint(point: vertexSnap.point.applying(viewTransform()), kind: vertexSnap.kind))
+            }
+        case .rectangle, .polygon:
             break
         }
         snappedBaseShape = shape

@@ -87,7 +87,10 @@ enum ShapePreset: String, Codable, CaseIterable, Identifiable {
     case parallelogram
     case rhombus
     case trapezoid
+    case pentagon
+    case hexagon
     case circle
+    case parabola
     case axes
 
     var id: String { rawValue }
@@ -103,14 +106,17 @@ enum ShapePreset: String, Codable, CaseIterable, Identifiable {
         case .parallelogram: return "平行四边"
         case .rhombus: return "菱形"
         case .trapezoid: return "梯形"
+        case .pentagon: return "正五边"
+        case .hexagon: return "正六边"
         case .circle: return "圆"
+        case .parabola: return "抛物线"
         case .axes: return "坐标系"
         }
     }
 
     var supportsFill: Bool {
         switch self {
-        case .segment, .arrow, .axes: return false
+        case .segment, .arrow, .parabola, .axes: return false
         default: return true
         }
     }

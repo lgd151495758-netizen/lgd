@@ -23,6 +23,7 @@ final class GeometryConstructionTests: XCTestCase {
             .arc(center: CGPoint(x: 120, y: 120), radius: 60, startAngle: 0, endAngle: .pi / 2, clockwise: true, showCenterMark: true),
             .ellipse(center: CGPoint(x: 80, y: 90), rx: 40, ry: 20, rotation: 0.4),
             .polygon(vertices: [CGPoint(x: 0, y: 0), CGPoint(x: 50, y: 0), CGPoint(x: 25, y: 40)], closed: true),
+            .parabola(vertex: CGPoint(x: 120, y: 180), axisAngle: -.pi / 2, halfWidth: 60, height: 90),
             .axes(origin: CGPoint(x: 150, y: 150), xMin: -80, xMax: 100, yMin: -90, yMax: 70, tickSpacing: 25),
         ]
         for prim in primitives {
@@ -252,6 +253,41 @@ final class GeometryConstructionTests: XCTestCase {
         } else {
             XCTFail("Expected square rectangle")
         }
+
+        // Regular pentagon & regular hexagon presets produce exact equal sides.
+        for (preset, expectedSides) in [(ShapePreset.pentagon, 5), (ShapePreset.hexagon, 6)] {
+            if case let .polygon(v, true) = ShapeBuilder.build(preset: preset, from: start, to: end).primitive {
+                XCTAssertEqual(v.count, expectedSides)
+                let sides = (0..<expectedSides).map { i -> CGFloat in
+                    let a = v[i], b = v[(i + 1) % expectedSides]
+                    return hypot(b.x - a.x, b.y - a.y)
+                }
+                for s in sides.dropFirst() {
+                    XCTAssertEqual(s, sides[0], accuracy: 0.01)
+                }
+            } else {
+                XCTFail("Expected regular \(expectedSides)-gon for \(preset)")
+            }
+        }
+
+        // Parabola preset: vertex at start, opens UP when dragged upward, DOWN when dragged downward.
+        if case let .parabola(vUp, aUp, hwUp, hUp) = ShapeBuilder.build(preset: .parabola,
+                                                                        from: CGPoint(x: 200, y: 200),
+                                                                        to: CGPoint(x: 270, y: 110)).primitive {
+            XCTAssertEqual(vUp, CGPoint(x: 200, y: 200))
+            XCTAssertEqual(aUp, -CGFloat.pi / 2, accuracy: 0.01)
+            XCTAssertEqual(hwUp, 70, accuracy: 0.01)
+            XCTAssertEqual(hUp, 90, accuracy: 0.01)
+        } else {
+            XCTFail("Expected upward parabola preset")
+        }
+        if case let .parabola(_, aDown, _, _) = ShapeBuilder.build(preset: .parabola,
+                                                                   from: CGPoint(x: 200, y: 200),
+                                                                   to: CGPoint(x: 270, y: 290)).primitive {
+            XCTAssertEqual(aDown, CGFloat.pi / 2, accuracy: 0.01)
+        } else {
+            XCTFail("Expected downward parabola preset")
+        }
     }
 
     func testVertexEditingSnappingAxesHandlesAndOverlayHitTesting() {
@@ -286,6 +322,23 @@ final class GeometryConstructionTests: XCTestCase {
         // Axes participate in snap points with origin as `.center`.
         let axisSnaps = GeometrySnapEngine.snapPoints(from: [axes])
         XCTAssertTrue(axisSnaps.contains { $0.kind == .center && $0.point == CGPoint(x: 200, y: 200) })
+
+        // Parabola vertex snaps onto axes origin O; arm handle flips opening direction across vertex.
+        let para = GeometricPrimitive.parabola(vertex: CGPoint(x: 196, y: 203), axisAngle: -.pi / 2,
+                                               halfWidth: 60, height: 80)
+        XCTAssertTrue(para.hitTestBody(CGPoint(x: 196, y: 203)))
+        XCTAssertFalse(para.hitTestBody(CGPoint(x: 400, y: 400)))
+        let snappedPara = para.movingHandle(at: 0, to: CGPoint(x: 197, y: 202), snapPoints: axisSnaps, snapThreshold: 10)
+        XCTAssertEqual(snappedPara.snapped?.point, CGPoint(x: 200, y: 200))
+        let flippedPara = snappedPara.primitive.movingHandle(at: 1, to: CGPoint(x: 280, y: 310), snapPoints: [])
+        if case let .parabola(fv, fa, fhw, fh) = flippedPara.primitive {
+            XCTAssertEqual(fv, CGPoint(x: 200, y: 200))
+            XCTAssertEqual(fa, CGFloat.pi / 2, accuracy: 0.01)
+            XCTAssertEqual(fhw, 80, accuracy: 0.01)
+            XCTAssertEqual(fh, 110, accuracy: 0.01)
+        } else {
+            XCTFail("Expected flipped parabola")
+        }
 
         // SelectedShapeOverlay hit-tests handles & action bar accurately.
         let bounds = CGRect(x: 0, y: 0, width: 1024, height: 768)
