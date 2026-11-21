@@ -18,6 +18,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private let eraserCursor = CAShapeLayer()
     private let laserGlowLayer = CAShapeLayer()
     private let laserCoreLayer = CAShapeLayer()
+    private let geometryOverlay = GeometryToolOverlayView()
     private let geometryCache = StrokeGeometryCache()
     private var cancellables = Set<AnyCancellable>()
     private var documentURL: URL?
@@ -32,6 +33,26 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         let layer: CAShapeLayer
         let isHighlighter: Bool
     }
+
+    private enum ActiveInteraction {
+        case none
+        case normalInput
+        case rulerBody(grabOffset: CGPoint, startPoint: CGPoint, tappedBadge: Bool)
+        case rulerRotate(end: RulerState.End, fixedPivot: CGPoint, angleOffset: CGFloat)
+        case rulerDraw(edge: CGFloat, startView: CGPoint, currentView: CGPoint)
+        case compassNeedle(grabOffset: CGPoint)
+        case compassResize
+        case compassButton(CompassState.HitZone, startPoint: CGPoint)
+        case compassDraw(sweep: CompassSweep, crossedCloseHaptic: Bool)
+    }
+
+    // Virtual Ruler & Compass state (iPad-only UI; never projected to external display)
+    private var rulerState = RulerState()
+    private var compassState = CompassState()
+    private var activeInteraction: ActiveInteraction = .none
+    private var fingerControlInteraction: ActiveInteraction = .none
+    private var cachedViewSnapPoints: [SnapPoint] = []
+    private var lastSnapHapticPoint: CGPoint?
 
     // Drawing state (document coordinates, CSS px)
     private var liveTool = ToolSettings()
@@ -117,6 +138,20 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         laserCoreLayer.fillColor = UIColor.white.cgColor
         view.layer.addSublayer(laserCoreLayer)
 
+        // iPad-only Ruler / Compass overlay (sibling above webView & liveLayer; never projected).
+        geometryOverlay.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(geometryOverlay)
+        NSLayoutConstraint.activate([
+            geometryOverlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            geometryOverlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            geometryOverlay.topAnchor.constraint(equalTo: view.topAnchor),
+            geometryOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
+        geometryOverlay.onFingerTap = { [weak self] p in self?.handleGeometryControlTap(at: p) }
+        geometryOverlay.onFingerPanBegan = { [weak self] p in self?.beginFingerGeometryDrag(at: p) }
+        geometryOverlay.onFingerPanChanged = { [weak self] p in self?.updateFingerGeometryDrag(to: p) }
+        geometryOverlay.onFingerPanEnded = { [weak self] _ in self?.endFingerGeometryDrag() }
+
         inkRecognizer.inkDelegate = self
         inkRecognizer.delegate = self
         // Pencil touches must never reach the page (no accidental clicks, Scribble, or text selection).
@@ -140,10 +175,17 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             self?.pushStrokes()
         }
         session.$tool
-            .map(\.fingerDrawing)
-            .removeDuplicates()
             .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.applyGestureRules() }
+                DispatchQueue.main.async {
+                    self?.applyGestureRules()
+                    self?.syncGeometryOverlayAppearance()
+                }
+            }
+            .store(in: &cancellables)
+        session.$geometryAid
+            .removeDuplicates()
+            .sink { [weak self] aid in
+                DispatchQueue.main.async { self?.applyGeometryAid(aid) }
             }
             .store(in: &cancellables)
 
@@ -161,6 +203,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         laserCoreLayer.frame = view.bounds
         CATransaction.commit()
         updatePresentationViewport(focusY: nil)
+        clampGeometryAidsToBounds()
         applyGestureRules()
     }
 
@@ -294,6 +337,9 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             }
         }
         scrollView.panGestureRecognizer.minimumNumberOfTouches = fingerDrawing ? 2 : 1
+        // When fingerDrawing is enabled, inkRecognizer handles single-finger touches directly;
+        // otherwise geometryOverlay handles finger controls while passing everything else to webView.
+        geometryOverlay.isUserInteractionEnabled = !fingerDrawing
         suppressSystemScribble(in: webView)
     }
 
@@ -360,7 +406,15 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     func inkBegan(_ touch: UITouch, event: UIEvent?) {
         liveTool = session.tool
-        updatePresentationViewport(focusY: touch.location(in: view).y)
+        let viewPoint = touch.location(in: view)
+        updatePresentationViewport(focusY: viewPoint.y)
+
+        if let aidInteraction = beginGeometryAidInteraction(at: viewPoint, allowDrawing: canDrawWithGeometryAid) {
+            activeInteraction = aidInteraction
+            return
+        }
+
+        activeInteraction = .normalInput
         switch liveTool.kind {
         case .eraser:
             eraseBegan(touch)
@@ -372,7 +426,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     func inkMoved(_ touch: UITouch, event: UIEvent?) {
-        updatePresentationViewport(focusY: touch.location(in: view).y)
+        let viewPoint = touch.location(in: view)
+        updatePresentationViewport(focusY: viewPoint.y)
+
+        if handleGeometryAidMoved(to: viewPoint) {
+            return
+        }
+
         switch liveTool.kind {
         case .eraser:
             eraseMoved(touch, event: event)
@@ -384,6 +444,11 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     func inkEnded(_ touch: UITouch, event: UIEvent?) {
+        let viewPoint = touch.location(in: view)
+        if handleGeometryAidEnded(at: viewPoint) {
+            return
+        }
+        activeInteraction = .none
         switch liveTool.kind {
         case .eraser:
             eraseMoved(touch, event: event)
@@ -401,6 +466,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         holdTimer = nil
         snappedBaseShape = nil
         snappedCurrentShape = nil
+        let wasGeometryAid: Bool
+        switch activeInteraction {
+        case .none, .normalInput: wasGeometryAid = false
+        default: wasGeometryAid = true
+        }
+        cancelGeometryAidInteraction()
+        if wasGeometryAid { return }
         switch liveTool.kind {
         case .eraser:
             eraseOriginal = nil
@@ -427,17 +499,428 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         }
     }
 
+    // MARK: Virtual Ruler & Compass (One-Handed Apple Pencil + Optional Finger)
+
+    private var canDrawWithGeometryAid: Bool {
+        switch liveTool.kind {
+        case .pen, .highlighter, .tape: return true
+        case .eraser, .laser: return false
+        }
+    }
+
+    private func applyGeometryAid(_ aid: GeometryAid) {
+        cancelGeometryAidInteraction()
+        if aid == .ruler {
+            let bounds = view.bounds
+            if bounds.width > 0, bounds.height > 0 {
+                let targetHalf = min(240, max(150, bounds.width * 0.34))
+                rulerState.halfLength = targetHalf
+                rulerState.pivotOffset = max(90, targetHalf - 50)
+                if rulerState.center == .zero || !bounds.insetBy(dx: 24, dy: 24).contains(rulerState.center) {
+                    rulerState.center = CGPoint(x: bounds.midX, y: bounds.midY)
+                }
+            }
+            geometryOverlay.ruler = rulerState
+        } else if aid == .compass {
+            let bounds = view.bounds
+            if bounds.width > 0, bounds.height > 0,
+               compassState.center == .zero || !bounds.insetBy(dx: 24, dy: 24).contains(compassState.center) {
+                compassState.center = CGPoint(x: bounds.midX, y: bounds.midY)
+            }
+            geometryOverlay.compass = compassState
+        }
+        geometryOverlay.aid = aid
+        syncGeometryOverlayAppearance()
+    }
+
+    private func clampGeometryAidsToBounds() {
+        let bounds = view.bounds
+        guard bounds.width > 64, bounds.height > 64 else { return }
+        let safe = bounds.insetBy(dx: 32, dy: 32)
+        if rulerState.center != .zero {
+            rulerState.center.x = min(max(safe.minX, rulerState.center.x), safe.maxX)
+            rulerState.center.y = min(max(safe.minY, rulerState.center.y), safe.maxY)
+            geometryOverlay.ruler = rulerState
+        }
+        if compassState.center != .zero {
+            compassState.center.x = min(max(safe.minX, compassState.center.x), safe.maxX)
+            compassState.center.y = min(max(safe.minY, compassState.center.y), safe.maxY)
+            geometryOverlay.compass = compassState
+        }
+    }
+
+    private func syncGeometryOverlayAppearance() {
+        let color: RGBAColor
+        switch session.tool.kind {
+        case .highlighter: color = session.tool.highlighterColor
+        case .tape: color = session.tool.tapeColor
+        case .laser: color = session.tool.laserColor
+        default: color = session.tool.color
+        }
+        geometryOverlay.activeStrokeColor = UIColor(cgColor: color.cgColor)
+    }
+
+    private func refreshViewSnapPoints() {
+        let origins = bridge.placements.compactMapValues { $0.visible ? $0.origin : nil }
+        let docSnaps = GeometrySnapEngine.snapPoints(from: session.strokes(onPage: Self.page), origins: origins)
+        let transform = viewTransform()
+        cachedViewSnapPoints = docSnaps.map { SnapPoint(point: $0.point.applying(transform), kind: $0.kind) }
+    }
+
+    private func updateSnapFeedback(_ snap: SnapPoint?) {
+        geometryOverlay.activeSnapPoint = snap?.point
+        geometryOverlay.activeSnapKind = snap?.kind
+        if let snap {
+            if let last = lastSnapHapticPoint, hypot(last.x - snap.point.x, last.y - snap.point.y) < 3 {
+                return
+            }
+            lastSnapHapticPoint = snap.point
+            haptic.impactOccurred(intensity: 0.6)
+        } else {
+            lastSnapHapticPoint = nil
+        }
+    }
+
+    private func activeToolViewRadius() -> CGFloat {
+        // Pen strokes draw right on the geometric ruler edge (0.0 pt offset so lines pass
+        // through snapped intersections/endpoints exactly); wide highlighters/tapes offset outside.
+        switch liveTool.kind {
+        case .highlighter:
+            let zoom = max(webView.scrollView.zoomScale, 0.25)
+            return min(12, max(2.0, CGFloat(liveTool.highlighterWidth) * 0.5 * zoom))
+        case .tape:
+            let zoom = max(webView.scrollView.zoomScale, 0.25)
+            return min(14, max(2.0, CGFloat(liveTool.tapeWidth) * 0.5 * zoom))
+        default:
+            return 0
+        }
+    }
+
+    private func documentPoint(fromViewPoint p: CGPoint) -> CGPoint {
+        bridge.documentPoint(fromView: CGPoint(x: p.x - webView.frame.minX, y: p.y - webView.frame.minY))
+    }
+
+    private func beginGeometryAidInteraction(at viewPoint: CGPoint, allowDrawing: Bool) -> ActiveInteraction? {
+        switch session.geometryAid {
+        case .none:
+            return nil
+
+        case .ruler:
+            let hit = rulerState.hitTest(viewPoint)
+            switch hit {
+            case .none:
+                return nil
+            case .body:
+                refreshViewSnapPoints()
+                let offset = CGPoint(x: rulerState.center.x - viewPoint.x, y: rulerState.center.y - viewPoint.y)
+                return .rulerBody(grabOffset: offset, startPoint: viewPoint, tappedBadge: false)
+            case .angleBadge:
+                refreshViewSnapPoints()
+                let offset = CGPoint(x: rulerState.center.x - viewPoint.x, y: rulerState.center.y - viewPoint.y)
+                return .rulerBody(grabOffset: offset, startPoint: viewPoint, tappedBadge: true)
+            case .leftRotate:
+                refreshViewSnapPoints()
+                let pivot = rulerState.topRightPivot
+                let offset = rulerState.initialRotateAngleOffset(for: .left, fixedPivot: pivot, pointer: viewPoint)
+                return .rulerRotate(end: .left, fixedPivot: pivot, angleOffset: offset)
+            case .rightRotate:
+                refreshViewSnapPoints()
+                let pivot = rulerState.topLeftPivot
+                let offset = rulerState.initialRotateAngleOffset(for: .right, fixedPivot: pivot, pointer: viewPoint)
+                return .rulerRotate(end: .right, fixedPivot: pivot, angleOffset: offset)
+            case .drawTopEdge, .drawBottomEdge:
+                guard allowDrawing else { return nil }
+                refreshViewSnapPoints()
+                let edge: CGFloat = (hit == .drawTopEdge) ? -1 : 1
+                let penRadius = activeToolViewRadius()
+                var projected = rulerState.projectToEdge(viewPoint, edge: edge, penRadius: penRadius)
+                if let snap = GeometrySnapEngine.nearestPoint(to: projected, in: cachedViewSnapPoints, threshold: 10) {
+                    projected = rulerState.projectToEdge(snap.point, edge: edge, penRadius: penRadius)
+                    updateSnapFeedback(snap)
+                }
+                configureLiveLayerForCurrentTool()
+                geometryOverlay.activeRulerDrawEdge = edge
+                renderRulerLiveSegment(startView: projected, endView: projected)
+                return .rulerDraw(edge: edge, startView: projected, currentView: projected)
+            }
+
+        case .compass:
+            let hit = compassState.hitTest(viewPoint, in: view.bounds)
+            switch hit {
+            case .none:
+                return nil
+            case .lockButton, .centerMarkButton, .fullCircleButton:
+                return .compassButton(hit, startPoint: viewPoint)
+            case .needle:
+                refreshViewSnapPoints()
+                let offset = CGPoint(x: compassState.center.x - viewPoint.x, y: compassState.center.y - viewPoint.y)
+                return .compassNeedle(grabOffset: offset)
+            case .resizeHandle:
+                refreshViewSnapPoints()
+                geometryOverlay.isResizingCompass = true
+                return .compassResize
+            case .drawCircle:
+                guard allowDrawing else { return nil }
+                let startAngle = atan2(viewPoint.y - compassState.center.y, viewPoint.x - compassState.center.x)
+                compassState.armAngle = startAngle
+                geometryOverlay.compass = compassState
+                configureLiveLayerForCurrentTool()
+                let sweep = CompassSweep(startAngle: startAngle)
+                geometryOverlay.activeCompassSweep = sweep
+                renderCompassLiveSweep(sweep)
+                return .compassDraw(sweep: sweep, crossedCloseHaptic: false)
+            }
+        }
+    }
+
+    private func handleGeometryAidMoved(to viewPoint: CGPoint) -> Bool {
+        switch activeInteraction {
+        case .none, .normalInput:
+            return false
+
+        case let .rulerBody(grabOffset, startPoint, tappedBadge):
+            let moved = hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y)
+            let stillTap = tappedBadge && moved < 6
+            if !stillTap {
+                let rawCenter = CGPoint(x: viewPoint.x + grabOffset.x, y: viewPoint.y + grabOffset.y)
+                let snap = rulerState.translate(toCenter: rawCenter, snapPoints: cachedViewSnapPoints)
+                geometryOverlay.ruler = rulerState
+                updateSnapFeedback(snap)
+                if tappedBadge {
+                    activeInteraction = .rulerBody(grabOffset: grabOffset, startPoint: startPoint, tappedBadge: false)
+                }
+            }
+            return true
+
+        case let .rulerRotate(end, fixedPivot, angleOffset):
+            let snap = rulerState.rotate(dragging: end, fixedPivot: fixedPivot, pointer: viewPoint,
+                                         angleOffset: angleOffset, snapPoints: cachedViewSnapPoints)
+            geometryOverlay.ruler = rulerState
+            updateSnapFeedback(snap)
+            return true
+
+        case let .rulerDraw(edge, startView, _):
+            let penRadius = activeToolViewRadius()
+            var endView = rulerState.projectToEdge(viewPoint, edge: edge, penRadius: penRadius)
+            if let snap = GeometrySnapEngine.nearestPoint(to: endView, in: cachedViewSnapPoints, threshold: 10) {
+                endView = rulerState.projectToEdge(snap.point, edge: edge, penRadius: penRadius)
+                updateSnapFeedback(snap)
+            } else {
+                updateSnapFeedback(nil)
+            }
+            activeInteraction = .rulerDraw(edge: edge, startView: startView, currentView: endView)
+            renderRulerLiveSegment(startView: startView, endView: endView)
+            return true
+
+        case let .compassNeedle(grabOffset):
+            let rawCenter = CGPoint(x: viewPoint.x + grabOffset.x, y: viewPoint.y + grabOffset.y)
+            let snap = compassState.moveCenter(to: rawCenter, snapPoints: cachedViewSnapPoints)
+            geometryOverlay.compass = compassState
+            updateSnapFeedback(snap)
+            return true
+
+        case .compassResize:
+            let snap = compassState.resize(withHandleAt: viewPoint, snapPoints: cachedViewSnapPoints)
+            geometryOverlay.compass = compassState
+            updateSnapFeedback(snap)
+            return true
+
+        case .compassButton:
+            return true
+
+        case var .compassDraw(sweep, crossedCloseHaptic):
+            sweep.advance(to: viewPoint, center: compassState.center)
+            compassState.armAngle = sweep.currentAngle
+            geometryOverlay.compass = compassState
+            geometryOverlay.activeCompassSweep = sweep
+            if sweep.isFullCircle, !crossedCloseHaptic {
+                crossedCloseHaptic = true
+                haptic.impactOccurred()
+            }
+            activeInteraction = .compassDraw(sweep: sweep, crossedCloseHaptic: crossedCloseHaptic)
+            renderCompassLiveSweep(sweep)
+            return true
+        }
+    }
+
+    private func handleGeometryAidEnded(at viewPoint: CGPoint) -> Bool {
+        let current = activeInteraction
+        switch current {
+        case .none, .normalInput:
+            return false
+
+        case let .rulerBody(_, startPoint, tappedBadge):
+            if tappedBadge, hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y) < 8 {
+                rulerState.cycleQuickAngle()
+                geometryOverlay.ruler = rulerState
+                haptic.impactOccurred()
+            }
+            finishGeometryAidInteraction()
+            return true
+
+        case .rulerRotate, .compassNeedle, .compassResize:
+            finishGeometryAidInteraction()
+            return true
+
+        case let .compassButton(button, startPoint):
+            if hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y) < 28 {
+                executeCompassButton(button)
+            }
+            finishGeometryAidInteraction()
+            return true
+
+        case let .rulerDraw(edge, startView, _):
+            let penRadius = activeToolViewRadius()
+            var endView = rulerState.projectToEdge(viewPoint, edge: edge, penRadius: penRadius)
+            if let snap = GeometrySnapEngine.nearestPoint(to: endView, in: cachedViewSnapPoints, threshold: 10) {
+                endView = rulerState.projectToEdge(snap.point, edge: edge, penRadius: penRadius)
+            }
+            finishGeometryAidInteraction()
+            let aDoc = documentPoint(fromViewPoint: startView)
+            let bDoc = documentPoint(fromViewPoint: endView)
+            if hypot(bDoc.x - aDoc.x, bDoc.y - aDoc.y) >= 1.5 {
+                let stroke = makeGeometricStroke(.segment(a: aDoc, b: bDoc))
+                commitPreparedStroke(stroke)
+            } else {
+                setLivePath(nil)
+            }
+            return true
+
+        case var .compassDraw(sweep, _):
+            sweep.advance(to: viewPoint, center: compassState.center)
+            finishGeometryAidInteraction()
+            let centerDoc = documentPoint(fromViewPoint: compassState.center)
+            let zoom = max(webView.scrollView.zoomScale, 0.0001)
+            let radiusDoc = compassState.radius / zoom
+            if let primitive = sweep.primitive(center: centerDoc, radius: radiusDoc,
+                                               showCenterMark: compassState.showCenterMark) {
+                let stroke = makeGeometricStroke(primitive)
+                commitPreparedStroke(stroke)
+            } else {
+                setLivePath(nil)
+            }
+            return true
+        }
+    }
+
+    private func finishGeometryAidInteraction() {
+        activeInteraction = .none
+        geometryOverlay.activeRulerDrawEdge = 0
+        geometryOverlay.activeCompassSweep = nil
+        geometryOverlay.isResizingCompass = false
+        updateSnapFeedback(nil)
+    }
+
+    private func cancelGeometryAidInteraction() {
+        switch activeInteraction {
+        case .rulerDraw, .compassDraw:
+            setLivePath(nil)
+        default:
+            break
+        }
+        finishGeometryAidInteraction()
+    }
+
+    private func executeCompassButton(_ button: CompassState.HitZone) {
+        switch button {
+        case .lockButton:
+            compassState.isRadiusLocked.toggle()
+            geometryOverlay.compass = compassState
+            haptic.impactOccurred()
+        case .centerMarkButton:
+            compassState.showCenterMark.toggle()
+            geometryOverlay.compass = compassState
+            haptic.impactOccurred()
+        case .fullCircleButton:
+            liveTool = session.tool
+            configureLiveLayerForCurrentTool()
+            let centerDoc = documentPoint(fromViewPoint: compassState.center)
+            let zoom = max(webView.scrollView.zoomScale, 0.0001)
+            let radiusDoc = compassState.radius / zoom
+            let stroke = makeGeometricStroke(.circle(center: centerDoc, radius: radiusDoc,
+                                                     showCenterMark: compassState.showCenterMark))
+            commitPreparedStroke(stroke)
+            haptic.impactOccurred()
+        default:
+            break
+        }
+    }
+
+    private func handleGeometryControlTap(at viewPoint: CGPoint) {
+        switch session.geometryAid {
+        case .ruler:
+            if rulerState.hitTest(viewPoint) == .angleBadge {
+                rulerState.cycleQuickAngle()
+                geometryOverlay.ruler = rulerState
+                haptic.impactOccurred()
+            }
+        case .compass:
+            let hit = compassState.hitTest(viewPoint, in: view.bounds)
+            if hit == .lockButton || hit == .centerMarkButton || hit == .fullCircleButton {
+                executeCompassButton(hit)
+            }
+        case .none:
+            break
+        }
+    }
+
+    private func beginFingerGeometryDrag(at viewPoint: CGPoint) {
+        fingerControlInteraction = beginGeometryAidInteraction(at: viewPoint, allowDrawing: false) ?? .none
+    }
+
+    private func updateFingerGeometryDrag(to viewPoint: CGPoint) {
+        let saved = activeInteraction
+        activeInteraction = fingerControlInteraction
+        _ = handleGeometryAidMoved(to: viewPoint)
+        fingerControlInteraction = activeInteraction
+        activeInteraction = saved
+    }
+
+    private func endFingerGeometryDrag() {
+        fingerControlInteraction = .none
+        geometryOverlay.isResizingCompass = false
+        updateSnapFeedback(nil)
+    }
+
+    private func renderRulerLiveSegment(startView: CGPoint, endView: CGPoint) {
+        let aDoc = documentPoint(fromViewPoint: startView)
+        let bDoc = documentPoint(fromViewPoint: endView)
+        let stroke = makeGeometricStroke(.segment(a: aDoc, b: bDoc))
+        setLivePath(stroke.outlinePath(transform: viewTransform(), finished: true))
+    }
+
+    private func renderCompassLiveSweep(_ sweep: CompassSweep) {
+        let centerDoc = documentPoint(fromViewPoint: compassState.center)
+        let zoom = max(webView.scrollView.zoomScale, 0.0001)
+        let radiusDoc = compassState.radius / zoom
+        guard let primitive = sweep.primitive(center: centerDoc, radius: radiusDoc,
+                                              showCenterMark: compassState.showCenterMark) else {
+            setLivePath(nil)
+            return
+        }
+        let stroke = makeGeometricStroke(primitive)
+        setLivePath(stroke.outlinePath(transform: viewTransform(), finished: true))
+    }
+
+    private func makeGeometricStroke(_ primitive: GeometricPrimitive) -> InkStroke {
+        if liveTool.kind == .highlighter {
+            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
+                             width: liveTool.highlighterWidth, smoothing: 0, points: [],
+                             tool: .highlighter, lineStyle: .solid, geometry: primitive)
+        }
+        if liveTool.kind == .tape {
+            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.tapeColor,
+                             width: liveTool.tapeWidth, smoothing: 0, points: [],
+                             tool: .tape, lineStyle: .solid, revealed: false, geometry: primitive)
+        }
+        return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color,
+                         width: liveTool.width, smoothing: 0, points: [],
+                         tool: .pen, lineStyle: liveTool.lineStyle, geometry: primitive)
+    }
+
     // MARK: Drawing (Pen, Highlighter, Tape & Draw-and-Hold)
 
-    private func drawBegan(_ touch: UITouch, event: UIEvent?) {
-        holdTimer?.cancel()
-        holdTimer = nil
-        snappedBaseShape = nil
-        snappedCurrentShape = nil
-        livePoints.removeAll(keepingCapacity: true)
-        pendingEstimates.removeAll()
-        liveStartTime = touch.timestamp
-
+    private func configureLiveLayerForCurrentTool() {
         let highlighter = liveTool.kind == .highlighter
         let tape = liveTool.kind == .tape
         CATransaction.begin()
@@ -463,6 +946,18 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             liveLayer.lineDashPattern = nil
         }
         CATransaction.commit()
+    }
+
+    private func drawBegan(_ touch: UITouch, event: UIEvent?) {
+        holdTimer?.cancel()
+        holdTimer = nil
+        snappedBaseShape = nil
+        snappedCurrentShape = nil
+        livePoints.removeAll(keepingCapacity: true)
+        pendingEstimates.removeAll()
+        liveStartTime = touch.timestamp
+
+        configureLiveLayerForCurrentTool()
 
         holdAnchorViewPoint = touch.location(in: view)
         append(event?.coalescedTouches(for: touch) ?? [touch])
@@ -538,16 +1033,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func snappedStroke(for shape: RecognizedShape) -> InkStroke {
-        if liveTool.kind == .highlighter {
-            let samples = shape.samples(radius: CGFloat(liveTool.highlighterWidth) / 2)
-            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
-                             width: liveTool.highlighterWidth, smoothing: 0, points: [],
-                             tool: .highlighter, baked: samples, lineStyle: .solid)
-        }
-        let samples = shape.samples(radius: CGFloat(liveTool.width) / 2)
-        return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color,
-                         width: liveTool.width, smoothing: 0, points: [],
-                         tool: .pen, baked: samples, lineStyle: liveTool.lineStyle)
+        makeGeometricStroke(shape.primitive)
     }
 
     private func renderSnappedLiveShape() {

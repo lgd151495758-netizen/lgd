@@ -33,6 +33,7 @@ final class DocumentSession: ObservableObject {
     @Published var tool: ToolSettings {
         didSet { tool.save() }
     }
+    @Published var geometryAid: GeometryAid = .none
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
 
@@ -123,6 +124,17 @@ final class DocumentSession: ObservableObject {
             pageDidChange?(p)
         }
         scheduleSave()
+    }
+
+    func toggleGeometryAid(_ aid: GeometryAid) {
+        if geometryAid == aid {
+            geometryAid = .none
+        } else {
+            geometryAid = aid
+            if tool.kind == .eraser || tool.kind == .laser {
+                tool.select(.pen)
+            }
+        }
     }
 
     /// Apple Pencil (2nd generation) double-tap, following the user's system preference.

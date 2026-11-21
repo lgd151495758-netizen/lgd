@@ -147,6 +147,8 @@ struct InkStroke: Codable, Equatable, Identifiable {
     var lineStyle: StrokeLineStyle?
     /// For `.tape` strokes: whether the tape is currently peeled/revealed to show content underneath.
     var revealed: Bool?
+    /// Parametric geometric representation for ruler lines, compass arcs/circles, and snapped shapes.
+    var geometry: GeometricPrimitive?
 
     var isHighlighter: Bool { tool == .highlighter }
     var isTape: Bool { tool == .tape }
@@ -167,6 +169,7 @@ struct InkStroke: Codable, Equatable, Identifiable {
         copy.baked = baked?.map { s in
             StrokeSample(point: CGPoint(x: s.point.x + offset.x, y: s.point.y + offset.y), radius: s.radius)
         }
+        copy.geometry = geometry?.translated(by: offset)
         return copy
     }
 }

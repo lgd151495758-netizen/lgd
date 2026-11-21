@@ -6,6 +6,7 @@ final class StrokeGeometryCache {
     private struct Entry {
         let pointCount: Int
         let bakedCount: Int
+        let geometry: GeometricPrimitive?
         let samples: [StrokeSample]
         let bounds: CGRect
     }
@@ -15,7 +16,8 @@ final class StrokeGeometryCache {
     private func entry(for stroke: InkStroke) -> Entry {
         if let cached = entries[stroke.id],
            cached.pointCount == stroke.points.count,
-           cached.bakedCount == (stroke.baked?.count ?? -1) {
+           cached.bakedCount == (stroke.baked?.count ?? -1),
+           cached.geometry == stroke.geometry {
             return cached
         }
         let samples = stroke.renderSamples()
@@ -25,7 +27,7 @@ final class StrokeGeometryCache {
                                          width: 2 * s.radius, height: 2 * s.radius))
         }
         let created = Entry(pointCount: stroke.points.count, bakedCount: stroke.baked?.count ?? -1,
-                            samples: samples, bounds: bounds)
+                            geometry: stroke.geometry, samples: samples, bounds: bounds)
         entries[stroke.id] = created
         return created
     }
@@ -118,6 +120,7 @@ enum EraserEngine {
                 piece.id = UUID()
                 piece.points = []
                 piece.baked = run
+                piece.geometry = nil
                 return piece
             }
     }

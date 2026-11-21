@@ -36,69 +36,27 @@ enum RecognizedShape: Equatable {
         }
     }
 
-    /// Generates clean `StrokeSample`s (with subpath breaks at sharp corners) for rendering & storage.
-    func samples(radius: CGFloat) -> [StrokeSample] {
-        let r = max(StrokeProcessor.minimumRadius, radius)
+    /// Converts this recognized shape into a first-class parametric `GeometricPrimitive` so its
+    /// endpoints, vertices, centers, and intersections participate in ruler/compass snapping.
+    var primitive: GeometricPrimitive {
         switch self {
         case let .line(start, end):
-            return Self.segmentSamples(from: start, to: end, radius: r)
-
+            return .segment(a: start, b: end)
         case let .arrow(start, end):
-            var result = Self.segmentSamples(from: start, to: end, radius: r)
-            let dx = end.x - start.x
-            let dy = end.y - start.y
-            let length = hypot(dx, dy)
-            guard length > 4 else { return result }
-            let ux = dx / length
-            let uy = dy / length
-            let headLen = min(max(12, r * 9), length * 0.34)
-            let angle: CGFloat = 28 * .pi / 180
-            let cosA = cos(angle)
-            let sinA = sin(angle)
-            let leftWing = CGPoint(x: end.x - headLen * (ux * cosA - uy * sinA),
-                                   y: end.y - headLen * (uy * cosA + ux * sinA))
-            let rightWing = CGPoint(x: end.x - headLen * (ux * cosA + uy * sinA),
-                                    y: end.y - headLen * (uy * cosA - ux * sinA))
-            result.append(StrokeOutline.breakSample)
-            result.append(contentsOf: Self.segmentSamples(from: leftWing, to: end, radius: r))
-            result.append(StrokeOutline.breakSample)
-            result.append(contentsOf: Self.segmentSamples(from: rightWing, to: end, radius: r))
-            return result
-
+            return .segment(a: start, b: end, startArrow: .none, endArrow: .open)
         case let .ellipse(center, rx, ry, rotation):
-            let perimeter = CGFloat.pi * (3 * (rx + ry) - sqrt((3 * rx + ry) * (rx + 3 * ry)))
-            let steps = max(48, min(180, Int(perimeter / 2.5)))
-            let cosR = cos(rotation)
-            let sinR = sin(rotation)
-            return (0...steps).map { i in
-                let theta = (2 * CGFloat.pi * CGFloat(i)) / CGFloat(steps)
-                let lx = rx * cos(theta)
-                let ly = ry * sin(theta)
-                let p = CGPoint(x: center.x + lx * cosR - ly * sinR,
-                                y: center.y + lx * sinR + ly * cosR)
-                return StrokeSample(point: p, radius: r)
+            if abs(rx - ry) < 0.5 {
+                return .circle(center: center, radius: (rx + ry) / 2, showCenterMark: false)
             }
-
+            return .ellipse(center: center, rx: rx, ry: ry, rotation: rotation)
         case let .polygon(vertices):
-            guard vertices.count >= 3 else { return [] }
-            var result: [StrokeSample] = []
-            for i in 0..<vertices.count {
-                if i > 0 { result.append(StrokeOutline.breakSample) }
-                let a = vertices[i]
-                let b = vertices[(i + 1) % vertices.count]
-                result.append(contentsOf: Self.segmentSamples(from: a, to: b, radius: r))
-            }
-            return result
+            return .polygon(vertices: vertices, closed: true)
         }
     }
 
-    private static func segmentSamples(from a: CGPoint, to b: CGPoint, radius: CGFloat) -> [StrokeSample] {
-        let len = hypot(b.x - a.x, b.y - a.y)
-        let steps = max(1, Int(ceil(len / 2.0)))
-        return (0...steps).map { i in
-            let t = CGFloat(i) / CGFloat(steps)
-            return StrokeSample(point: CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t), radius: radius)
-        }
+    /// Generates clean `StrokeSample`s (with subpath breaks at sharp corners) for rendering & storage.
+    func samples(radius: CGFloat) -> [StrokeSample] {
+        primitive.samples(radius: radius)
     }
 }
 

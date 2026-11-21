@@ -1,0 +1,462 @@
+import UIKit
+
+/// Renders the virtual Ruler, virtual Compass, and magnetic snap indicators on the iPad screen.
+/// Lives as a sibling above `WKWebView` (never inside the web view and never mirrored in
+/// `LiveOverlayState`), so students on the external display only see the crisp drawn lines/arcs.
+final class GeometryToolOverlayView: UIView {
+    var aid: GeometryAid = .none {
+        didSet {
+            isHidden = (aid == .none && activeSnapPoint == nil)
+            setNeedsDisplay()
+        }
+    }
+    var ruler = RulerState() {
+        didSet { setNeedsDisplay() }
+    }
+    var compass = CompassState() {
+        didSet { setNeedsDisplay() }
+    }
+    /// Highlighted edge while drawing with the ruler (`-1` top, `+1` bottom, `0` none).
+    var activeRulerDrawEdge: CGFloat = 0 {
+        didSet { setNeedsDisplay() }
+    }
+    /// Active sweep readout while drawing an arc with the compass.
+    var activeCompassSweep: CompassSweep? {
+        didSet { setNeedsDisplay() }
+    }
+    /// Live radius readout while resizing the compass.
+    var isResizingCompass = false {
+        didSet { setNeedsDisplay() }
+    }
+    /// Currently snapped target in view coordinates (rendered as an emerald crosshair).
+    var activeSnapPoint: CGPoint? {
+        didSet {
+            isHidden = (aid == .none && activeSnapPoint == nil)
+            setNeedsDisplay()
+        }
+    }
+    var activeSnapKind: SnapKind? {
+        didSet { setNeedsDisplay() }
+    }
+    var activeStrokeColor: UIColor = .label {
+        didSet { setNeedsDisplay() }
+    }
+
+    // Optional finger callbacks (in addition to primary one-handed Apple Pencil control).
+    var onFingerTap: ((CGPoint) -> Void)?
+    var onFingerPanBegan: ((CGPoint) -> Void)?
+    var onFingerPanChanged: ((CGPoint) -> Void)?
+    var onFingerPanEnded: ((CGPoint) -> Void)?
+
+    private let fingerTap = UITapGestureRecognizer()
+    private let fingerPan = UIPanGestureRecognizer()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isOpaque = false
+        contentMode = .redraw
+        isHidden = true
+
+        let fingerTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue),
+        ]
+        fingerTap.allowedTouchTypes = fingerTypes
+        fingerTap.addTarget(self, action: #selector(handleFingerTap(_:)))
+        addGestureRecognizer(fingerTap)
+
+        fingerPan.allowedTouchTypes = fingerTypes
+        fingerPan.maximumNumberOfTouches = 1
+        fingerPan.addTarget(self, action: #selector(handleFingerPan(_:)))
+        addGestureRecognizer(fingerPan)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    /// Returns `true` only on manipulative control handles/buttons so finger touches elsewhere
+    /// fall straight through to `WKWebView` (scrolling, zooming, page buttons, cover tapes).
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        switch aid {
+        case .none:
+            return false
+        case .ruler:
+            switch ruler.hitTest(point) {
+            case .body, .leftRotate, .rightRotate, .angleBadge:
+                return true
+            case .none, .drawTopEdge, .drawBottomEdge:
+                return false
+            }
+        case .compass:
+            switch compass.hitTest(point, in: bounds) {
+            case .needle, .resizeHandle, .lockButton, .centerMarkButton, .fullCircleButton:
+                return true
+            case .none, .drawCircle:
+                return false
+            }
+        }
+    }
+
+    @objc private func handleFingerTap(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended else { return }
+        onFingerTap?(recognizer.location(in: self))
+    }
+
+    @objc private func handleFingerPan(_ recognizer: UIPanGestureRecognizer) {
+        let p = recognizer.location(in: self)
+        switch recognizer.state {
+        case .began:
+            onFingerPanBegan?(p)
+        case .changed:
+            onFingerPanChanged?(p)
+        case .ended, .cancelled, .failed:
+            onFingerPanEnded?(p)
+        default:
+            break
+        }
+    }
+
+    // MARK: Drawing
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        switch aid {
+        case .none:
+            break
+        case .ruler:
+            drawRuler(in: ctx)
+        case .compass:
+            drawCompass(in: ctx)
+        }
+        if let snap = activeSnapPoint {
+            drawSnapIndicator(at: snap, kind: activeSnapKind, in: ctx)
+        }
+    }
+
+    private func drawRuler(in ctx: CGContext) {
+        let halfL = ruler.halfLength
+        let halfW = ruler.halfWidth
+        let bodyRect = CGRect(x: -halfL, y: -halfW, width: halfL * 2, height: halfW * 2)
+
+        ctx.saveGState()
+        ctx.translateBy(x: ruler.center.x, y: ruler.center.y)
+        ctx.rotate(by: ruler.angle)
+
+        // Frosted ruler body with subtle drop shadow so geometry underneath stays readable.
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 3), blur: 10,
+                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
+        let bodyPath = UIBezierPath(roundedRect: bodyRect, cornerRadius: 7)
+        UIColor.systemBackground.withAlphaComponent(0.86).setFill()
+        bodyPath.fill()
+        ctx.restoreGState()
+
+        // Outer border
+        UIColor.label.withAlphaComponent(0.28).setStroke()
+        let border = UIBezierPath(roundedRect: bodyRect, cornerRadius: 7)
+        border.lineWidth = 1.1
+        border.stroke()
+
+        // Highlight active drawing edge in accent blue
+        if activeRulerDrawEdge != 0 {
+            let y = activeRulerDrawEdge * halfW
+            ctx.setStrokeColor(UIColor.systemBlue.cgColor)
+            ctx.setLineWidth(2.5)
+            ctx.move(to: CGPoint(x: -halfL + 4, y: y))
+            ctx.addLine(to: CGPoint(x: halfL - 4, y: y))
+            ctx.strokePath()
+        }
+
+        // Tick marks along top and bottom edges (every 10pt minor, 25pt mid, 50pt major)
+        ctx.setStrokeColor(UIColor.label.withAlphaComponent(0.45).cgColor)
+        var x = -halfL + 10
+        while x <= halfL - 10 {
+            let dist = Int(round(abs(x)))
+            let tickLen: CGFloat = (dist % 50 == 0) ? 12 : ((dist % 25 == 0) ? 8.5 : 5)
+            ctx.setLineWidth(dist % 50 == 0 ? 1.2 : 0.8)
+            // Top edge ticks
+            ctx.move(to: CGPoint(x: x, y: -halfW))
+            ctx.addLine(to: CGPoint(x: x, y: -halfW + tickLen))
+            // Bottom edge ticks
+            ctx.move(to: CGPoint(x: x, y: halfW))
+            ctx.addLine(to: CGPoint(x: x, y: halfW - tickLen))
+            x += 10
+        }
+        ctx.strokePath()
+
+        // Top-edge pivot alignment marks directly above the left & right rotate knobs
+        for pivotX in [-ruler.pivotOffset, ruler.pivotOffset] {
+            ctx.setFillColor(UIColor.systemBlue.cgColor)
+            ctx.fillEllipse(in: CGRect(x: pivotX - 3.5, y: -halfW - 3.5, width: 7, height: 7))
+            ctx.setStrokeColor(UIColor.white.cgColor)
+            ctx.setLineWidth(1.2)
+            ctx.strokeEllipse(in: CGRect(x: pivotX - 3.5, y: -halfW - 3.5, width: 7, height: 7))
+        }
+
+        // Subtle drag grip lines in the body
+        ctx.setStrokeColor(UIColor.secondaryLabel.withAlphaComponent(0.35).cgColor)
+        ctx.setLineWidth(1.3)
+        for gx in [-76.0, 76.0] as [CGFloat] {
+            for dy in [-5.0, 0.0, 5.0] as [CGFloat] {
+                ctx.move(to: CGPoint(x: gx - 10, y: dy))
+                ctx.addLine(to: CGPoint(x: gx + 10, y: dy))
+            }
+        }
+        ctx.strokePath()
+
+        // Left & right one-handed rotate handles (↻)
+        drawRotateKnob(at: CGPoint(x: -ruler.pivotOffset, y: 0), in: ctx)
+        drawRotateKnob(at: CGPoint(x: ruler.pivotOffset, y: 0), in: ctx)
+
+        // Central angle badge (tappable to cycle 0° / 90° / 45°)
+        let badgeRect = CGRect(x: -28, y: -12, width: 56, height: 24)
+        let badgePath = UIBezierPath(roundedRect: badgeRect, cornerRadius: 12)
+        UIColor.systemBlue.withAlphaComponent(0.14).setFill()
+        badgePath.fill()
+        UIColor.systemBlue.withAlphaComponent(0.45).setStroke()
+        badgePath.lineWidth = 1
+        badgePath.stroke()
+
+        let degText = "\(ruler.displayDegrees)°"
+        drawCenteredText(degText, in: badgeRect, font: .monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+                         color: .systemBlue)
+
+        ctx.restoreGState()
+    }
+
+    private func drawRotateKnob(at center: CGPoint, in ctx: CGContext) {
+        let r: CGFloat = 16
+        let rect = CGRect(x: center.x - r, y: center.y - r, width: r * 2, height: r * 2)
+        UIColor.systemBlue.withAlphaComponent(0.14).setFill()
+        ctx.fillEllipse(in: rect)
+        UIColor.systemBlue.withAlphaComponent(0.75).setStroke()
+        ctx.setLineWidth(1.5)
+        ctx.strokeEllipse(in: rect)
+        drawCenteredText("↻", in: rect, font: .systemFont(ofSize: 15, weight: .semibold), color: .systemBlue)
+    }
+
+    private func drawCompass(in ctx: CGContext) {
+        let c = compass.center
+        let r = compass.radius
+        let foot = compass.penFoot
+        let sweeping = activeCompassSweep != nil
+
+        // 1. Faint dashed preview circle showing exact sweep track
+        ctx.saveGState()
+        ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(sweeping ? 0.55 : 0.38).cgColor)
+        ctx.setLineWidth(sweeping ? 1.4 : 1.1)
+        ctx.setLineDash(phase: 0, lengths: [6, 4])
+        ctx.strokeEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+        ctx.restoreGState()
+
+        // 2. Subtle radius spoke
+        ctx.saveGState()
+        ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(0.28).cgColor)
+        ctx.setLineWidth(1)
+        ctx.setLineDash(phase: 0, lengths: [4, 4])
+        ctx.move(to: c)
+        ctx.addLine(to: foot)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // 3. Sleek two-legged drafting compass frame (needle leg + pencil leg meeting at top hinge)
+        let mid = CGPoint(x: (c.x + foot.x) / 2, y: (c.y + foot.y) / 2)
+        let dx = foot.x - c.x
+        let dy = foot.y - c.y
+        let len = max(1, hypot(dx, dy))
+        // Pick the perpendicular direction pointing more "upward" (smaller y) so the hinge stays naturally upright.
+        var nx = -dy / len
+        var ny = dx / len
+        if ny > 0 {
+            nx = -nx
+            ny = -ny
+        }
+        let legHeight = max(56, min(115, r * 0.72 + 26))
+        let hinge = CGPoint(x: mid.x + nx * legHeight, y: mid.y + ny * legHeight)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 6,
+                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        ctx.setStrokeColor(UIColor.label.withAlphaComponent(0.52).cgColor)
+        ctx.setLineWidth(4.0)
+        ctx.move(to: c)
+        ctx.addLine(to: hinge)
+        ctx.addLine(to: foot)
+        ctx.strokePath()
+
+        // Inner metallic highlight
+        ctx.setStrokeColor(UIColor.systemBackground.withAlphaComponent(0.82).cgColor)
+        ctx.setLineWidth(1.6)
+        ctx.move(to: c)
+        ctx.addLine(to: hinge)
+        ctx.addLine(to: foot)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Hinge head dot
+        let hingeRect = CGRect(x: hinge.x - 7, y: hinge.y - 7, width: 14, height: 14)
+        UIColor.systemBackground.withAlphaComponent(0.95).setFill()
+        ctx.fillEllipse(in: hingeRect)
+        UIColor.label.withAlphaComponent(0.55).setStroke()
+        ctx.setLineWidth(1.5)
+        ctx.strokeEllipse(in: hingeRect)
+
+        // 4. Needle Pin Handle at exact center O
+        let needleR: CGFloat = 17
+        let needleRect = CGRect(x: c.x - needleR, y: c.y - needleR, width: needleR * 2, height: needleR * 2)
+        UIColor.systemBlue.withAlphaComponent(0.14).setFill()
+        ctx.fillEllipse(in: needleRect)
+        UIColor.systemBlue.withAlphaComponent(0.85).setStroke()
+        ctx.setLineWidth(1.6)
+        ctx.strokeEllipse(in: needleRect)
+
+        // Center crosshair inside needle handle
+        ctx.setStrokeColor(UIColor.systemBlue.cgColor)
+        ctx.setLineWidth(1.2)
+        ctx.move(to: CGPoint(x: c.x - 6, y: c.y))
+        ctx.addLine(to: CGPoint(x: c.x + 6, y: c.y))
+        ctx.move(to: CGPoint(x: c.x, y: c.y - 6))
+        ctx.addLine(to: CGPoint(x: c.x, y: c.y + 6))
+        ctx.strokePath()
+        UIColor.systemBlue.setFill()
+        ctx.fillEllipse(in: CGRect(x: c.x - 2.5, y: c.y - 2.5, width: 5, height: 5))
+
+        // 5. Drawing pen foot tip on the circle
+        let footRect = CGRect(x: foot.x - 7, y: foot.y - 7, width: 14, height: 14)
+        activeStrokeColor.setFill()
+        ctx.fillEllipse(in: footRect)
+        UIColor.white.setStroke()
+        ctx.setLineWidth(2)
+        ctx.strokeEllipse(in: footRect)
+
+        // 6. Radius resize handle (↔) on the exact opposite point of the circle (hidden while sweeping)
+        if !sweeping {
+            let h = compass.resizeHandleCenter
+            let hr: CGFloat = 15
+            let hRect = CGRect(x: h.x - hr, y: h.y - hr, width: hr * 2, height: hr * 2)
+            if compass.isRadiusLocked {
+                UIColor.secondarySystemBackground.withAlphaComponent(0.9).setFill()
+                ctx.fillEllipse(in: hRect)
+                UIColor.secondaryLabel.withAlphaComponent(0.45).setStroke()
+                ctx.setLineWidth(1.2)
+                ctx.strokeEllipse(in: hRect)
+                drawCenteredText("🔒", in: hRect, font: .systemFont(ofSize: 12), color: .secondaryLabel)
+            } else {
+                UIColor.systemOrange.withAlphaComponent(0.18).setFill()
+                ctx.fillEllipse(in: hRect)
+                UIColor.systemOrange.withAlphaComponent(0.9).setStroke()
+                ctx.setLineWidth(1.6)
+                ctx.strokeEllipse(in: hRect)
+                drawCenteredText("↔", in: hRect, font: .systemFont(ofSize: 15, weight: .bold), color: .systemOrange)
+            }
+        }
+
+        // 7. Live angle / radius readout badge
+        if let sweep = activeCompassSweep {
+            let label = sweep.isFullCircle ? "360° 整圆" : "\(sweep.sweepDegrees)°"
+            drawReadoutPill(label, centeredAt: CGPoint(x: c.x, y: c.y - 34), in: ctx)
+        } else if isResizingCompass {
+            let label = "r = \(Int(r.rounded()))"
+            drawReadoutPill(label, centeredAt: CGPoint(x: c.x, y: c.y - 34), in: ctx)
+        }
+
+        // 8. Compact floating action bar (🔒 锁半径 | ⊙ 圆心 | ○ 整圆)
+        drawCompassActionBar(in: ctx)
+    }
+
+    private func drawCompassActionBar(in ctx: CGContext) {
+        let bar = compass.actionBarFrame(in: bounds)
+        let buttons = compass.buttonFrames(in: bounds)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8,
+                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
+        let bgPath = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        UIColor.systemBackground.withAlphaComponent(0.94).setFill()
+        bgPath.fill()
+        ctx.restoreGState()
+
+        UIColor.separator.withAlphaComponent(0.6).setStroke()
+        let border = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        border.lineWidth = 0.8
+        border.stroke()
+
+        // Active segment highlights
+        if compass.isRadiusLocked {
+            let pill = UIBezierPath(roundedRect: buttons.lock.insetBy(dx: 3, dy: 3), cornerRadius: 14)
+            UIColor.systemBlue.withAlphaComponent(0.18).setFill()
+            pill.fill()
+        }
+        if compass.showCenterMark {
+            let pill = UIBezierPath(roundedRect: buttons.centerMark.insetBy(dx: 3, dy: 3), cornerRadius: 14)
+            UIColor.systemBlue.withAlphaComponent(0.18).setFill()
+            pill.fill()
+        }
+
+        // Dividers
+        ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
+        ctx.setLineWidth(0.8)
+        for divX in [buttons.lock.maxX, buttons.centerMark.maxX] {
+            ctx.move(to: CGPoint(x: divX, y: bar.minY + 7))
+            ctx.addLine(to: CGPoint(x: divX, y: bar.maxY - 7))
+        }
+        ctx.strokePath()
+
+        let font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        drawCenteredText(compass.isRadiusLocked ? "🔒已锁" : "🔓锁半径", in: buttons.lock, font: font,
+                         color: compass.isRadiusLocked ? .systemBlue : .label)
+        drawCenteredText("⊙圆心", in: buttons.centerMark, font: font,
+                         color: compass.showCenterMark ? .systemBlue : .secondaryLabel)
+        drawCenteredText("○整圆", in: buttons.fullCircle, font: font, color: .systemBlue)
+    }
+
+    private func drawSnapIndicator(at point: CGPoint, kind: SnapKind?, in ctx: CGContext) {
+        let color = UIColor.systemGreen
+        let r: CGFloat = 10
+        ctx.saveGState()
+        color.withAlphaComponent(0.22).setFill()
+        ctx.fillEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
+        color.setStroke()
+        ctx.setLineWidth(2.0)
+        ctx.strokeEllipse(in: CGRect(x: point.x - r, y: point.y - r, width: r * 2, height: r * 2))
+        ctx.setLineWidth(1.3)
+        ctx.move(to: CGPoint(x: point.x - 14, y: point.y))
+        ctx.addLine(to: CGPoint(x: point.x + 14, y: point.y))
+        ctx.move(to: CGPoint(x: point.x, y: point.y - 14))
+        ctx.addLine(to: CGPoint(x: point.x, y: point.y + 14))
+        ctx.strokePath()
+
+        let label: String
+        switch kind {
+        case .intersection: label = "交点"
+        case .center: label = "圆心"
+        case .midpoint: label = "中点"
+        case .endpoint, .none: label = "端点"
+        }
+        drawReadoutPill(label, centeredAt: CGPoint(x: point.x, y: point.y - 24), in: ctx, accent: color)
+        ctx.restoreGState()
+    }
+
+    private func drawReadoutPill(_ text: String, centeredAt center: CGPoint, in ctx: CGContext,
+                                 accent: UIColor = .systemBlue) {
+        let font = UIFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        let rect = CGRect(x: center.x - size.width / 2 - 8, y: center.y - size.height / 2 - 3,
+                          width: size.width + 16, height: size.height + 6)
+        let path = UIBezierPath(roundedRect: rect, cornerRadius: rect.height / 2)
+        accent.withAlphaComponent(0.92).setFill()
+        path.fill()
+        drawCenteredText(text, in: rect, font: font, color: .white)
+    }
+
+    private func drawCenteredText(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let size = (text as NSString).size(withAttributes: attrs)
+        let drawPoint = CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2)
+        (text as NSString).draw(at: drawPoint, withAttributes: attrs)
+    }
+}

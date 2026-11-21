@@ -356,6 +356,7 @@ extension InkStroke {
     /// Centerline used for rendering and hit testing.
     func renderSamples(finished: Bool = true) -> [StrokeSample] {
         if let baked { return baked }
+        if let geometry { return geometry.samples(radius: CGFloat(width) / 2) }
         return StrokeProcessor.samples(for: points, pen: pen, width: width, smoothing: smoothing,
                                        finished: finished, highlighter: isHighlighter || isTape)
     }
