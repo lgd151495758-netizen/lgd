@@ -33,10 +33,8 @@ struct ToolbarView: View {
                 toolButton(title: "圆规", symbol: "compass.drawing", selected: session.geometryAid == .compass) {
                     session.toggleGeometryAid(.compass)
                 }
-                if session.meta.layout == .live {
-                    toolButton(title: "便签", symbol: "note.text", selected: session.isScratchpadOpen) {
-                        session.toggleScratchpad()
-                    }
+                toolButton(title: "便签", symbol: "note.text", selected: session.isScratchpadOpen) {
+                    session.toggleScratchpad()
                 }
                 divider
                 options

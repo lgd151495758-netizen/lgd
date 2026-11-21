@@ -9,20 +9,24 @@ final class DocumentSession: ObservableObject {
     enum Command: Equatable {
         case insert(page: Int, stroke: InkStroke, index: Int)
         case remove(page: Int, stroke: InkStroke, index: Int)
-        /// Replaces all strokes of a page (one eraser gesture).
+        /// Replaces all strokes of a single page (eraser, lasso, shape edit, clear page).
         case replace(page: Int, before: [InkStroke], after: [InkStroke])
+        /// Replaces the entire annotations snapshot as one undoable step (clear all document handwriting).
+        case replaceAll(before: DocumentAnnotations, after: DocumentAnnotations)
 
         var inverse: Command {
             switch self {
             case let .insert(page, stroke, index): return .remove(page: page, stroke: stroke, index: index)
             case let .remove(page, stroke, index): return .insert(page: page, stroke: stroke, index: index)
             case let .replace(page, before, after): return .replace(page: page, before: after, after: before)
+            case let .replaceAll(before, after): return .replaceAll(before: after, after: before)
             }
         }
 
-        var page: Int {
+        var page: Int? {
             switch self {
             case let .insert(page, _, _), let .remove(page, _, _), let .replace(page, _, _): return page
+            case .replaceAll: return nil
             }
         }
     }
@@ -48,9 +52,17 @@ final class DocumentSession: ObservableObject {
     var savedScratchpadFrame: CGRect? { annotations.scratchpadFrame }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
+    /// Zero-based currently visible main page index (used by multi-page PDF documents).
+    @Published var activeDocumentPageIndex: Int = 0
 
-    /// Called after the strokes of a page changed (page index; negative values are scratchpad pages).
+    /// Called after the strokes of a single page changed (page index; negative values are scratchpad pages).
     var pageDidChange: ((Int) -> Void)?
+    /// Called after a multi-page command (`replaceAll`) changed multiple pages at once.
+    var allPagesDidChange: (() -> Void)?
+
+    var pdfPageCount: Int {
+        pdfDocument?.pageCount ?? 0
+    }
 
     /// Negative page ID for the currently active scratchpad page (`-1, -2, ...`).
     var currentScratchpadPageID: Int {
@@ -184,6 +196,49 @@ final class DocumentSession: ObservableObject {
         replaceStrokes(onPage: pageID, before: current, after: [])
     }
 
+    /// Clears handwriting on a single page as one undoable step. When `keepTapes` is `true`,
+    /// Cover Tapes remain on the page and reset to covered (`revealed = false`).
+    func clearHandwriting(onPage page: Int, keepTapes: Bool) {
+        let before = strokes(onPage: page)
+        guard !before.isEmpty else { return }
+        let after: [InkStroke]
+        if keepTapes {
+            after = before.compactMap { stroke in
+                guard stroke.isTape else { return nil }
+                var covered = stroke
+                covered.revealed = false
+                return covered
+            }
+        } else {
+            after = []
+        }
+        replaceStrokes(onPage: page, before: before, after: after)
+    }
+
+    /// Clears handwriting across all main document pages as one undoable step (preserving sticky-note pages).
+    /// When `keepTapes` is `true`, Cover Tapes are preserved and reset to covered (`revealed = false`).
+    func clearAllDocumentHandwriting(keepTapes: Bool) {
+        let before = annotations
+        var after = annotations
+        var updatedPages: [String: PageAnnotations] = [:]
+        if keepTapes {
+            for (key, page) in before.pages {
+                let kept: [InkStroke] = page.strokes.compactMap { stroke in
+                    guard stroke.isTape else { return nil }
+                    var covered = stroke
+                    covered.revealed = false
+                    return covered
+                }
+                if !kept.isEmpty {
+                    updatedPages[key] = PageAnnotations(strokes: kept)
+                }
+            }
+        }
+        after.pages = updatedPages
+        guard after != before else { return }
+        perform(.replaceAll(before: before, after: after))
+    }
+
     func toggleGeometryAid(_ aid: GeometryAid) {
         if geometryAid == aid {
             geometryAid = .none
@@ -280,8 +335,20 @@ final class DocumentSession: ObservableObject {
             annotations.updatePage(page) { p in
                 p.strokes = after
             }
+        case let .replaceAll(_, after):
+            annotations = after
+            scratchpadPageCount = after.resolvedScratchpadPageCount
+            if let paper = after.scratchpadPaper {
+                scratchpadPaper = paper
+            }
         }
-        pageDidChange?(command.page)
+        if let page = command.page {
+            pageDidChange?(page)
+        } else if let allPagesDidChange {
+            allPagesDidChange()
+        } else {
+            pageDidChange?(0)
+        }
         scheduleSave()
     }
 

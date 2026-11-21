@@ -5,12 +5,19 @@ import UniformTypeIdentifiers
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
 
+    private struct PendingClear {
+        let meta: DocumentMeta
+        let keepTapes: Bool
+    }
+
     @State private var path: [DocumentMeta] = []
-    @State private var showFileImporter = false
+    @State private var showPDFImporter = false
+    @State private var showHTMLImporter = false
     @State private var showURLPrompt = false
     @State private var urlText = ""
     @State private var isImporting = false
     @State private var errorMessage: String?
+    @State private var pendingClear: PendingClear?
 
     private let columns = [GridItem(.adaptive(minimum: 170, maximum: 230), spacing: 24)]
 
@@ -24,8 +31,14 @@ struct LibraryView: View {
                 .navigationDestination(for: DocumentMeta.self) { meta in
                     EditorView(meta: meta, library: library)
                 }
+                .fileImporter(isPresented: $showHTMLImporter, allowedContentTypes: [.html, .folder]) { result in
+                    switch result {
+                    case .success(let url): startImport(.file(url))
+                    case .failure(let error): errorMessage = error.localizedDescription
+                    }
+                }
         }
-        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.html, .folder]) { result in
+        .fileImporter(isPresented: $showPDFImporter, allowedContentTypes: [.pdf]) { result in
             switch result {
             case .success(let url): startImport(.file(url))
             case .failure(let error): errorMessage = error.localizedDescription
@@ -47,10 +60,21 @@ struct LibraryView: View {
         } message: {
             Text("网页会保存到本地，可离线批注。")
         }
-        .alert("导入失败", isPresented: errorBinding) {
+        .alert("操作失败", isPresented: errorBinding) {
             Button("好", role: .cancel) {}
         } message: {
             Text(errorMessage ?? "")
+        }
+        .alert(clearAlertTitle, isPresented: clearBinding) {
+            Button("取消", role: .cancel) { pendingClear = nil }
+            Button("清空", role: .destructive) {
+                if let target = pendingClear {
+                    library.clearInk(for: target.meta.id, keepTapes: target.keepTapes)
+                    pendingClear = nil
+                }
+            }
+        } message: {
+            Text(clearAlertMessage)
         }
         .overlay {
             if isImporting { ImportProgressView() }
@@ -77,11 +101,16 @@ struct LibraryView: View {
             ContentUnavailableView {
                 Label("还没有文档", systemImage: "doc.richtext")
             } description: {
-                Text("导入 HTML 文件或打开网址，网页里的按钮照常可用，用 Apple Pencil 直接在上面书写。")
+                Text("导入 PDF 试卷、HTML 网页或打开网址，用 Apple Pencil 直接批注、画几何图形和投屏讲题。")
             } actions: {
-                Button("导入 HTML 文件") { showFileImporter = true }
+                Button("导入 PDF 文件") { showPDFImporter = true }
                     .buttonStyle(.borderedProminent)
-                Button("打开网址") { urlText = ""; showURLPrompt = true }
+                Button("导入 HTML 文件") { showHTMLImporter = true }
+                    .buttonStyle(.bordered)
+                Button("打开网址") {
+                    urlText = ""
+                    showURLPrompt = true
+                }
             }
         } else {
             ScrollView {
@@ -93,6 +122,22 @@ struct LibraryView: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
+                            Button {
+                                pendingClear = PendingClear(meta: meta, keepTapes: true)
+                            } label: {
+                                Label("清空手写（保留胶带）", systemImage: "eraser.line.dashed")
+                            }
+                            Button {
+                                pendingClear = PendingClear(meta: meta, keepTapes: false)
+                            } label: {
+                                Label("清空全部批注", systemImage: "trash.slash")
+                            }
+                            Button {
+                                duplicateDocument(meta)
+                            } label: {
+                                Label("复制副本", systemImage: "doc.on.doc")
+                            }
+                            Divider()
                             Button(role: .destructive) {
                                 library.delete(meta.id)
                             } label: {
@@ -109,7 +154,12 @@ struct LibraryView: View {
     private var importMenu: some View {
         Menu {
             Button {
-                showFileImporter = true
+                showPDFImporter = true
+            } label: {
+                Label("导入 PDF 文件…", systemImage: "doc.fill")
+            }
+            Button {
+                showHTMLImporter = true
             } label: {
                 Label("导入 HTML 文件…", systemImage: "doc.badge.plus")
             }
@@ -128,6 +178,32 @@ struct LibraryView: View {
         Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })
     }
 
+    private var clearBinding: Binding<Bool> {
+        Binding(get: { pendingClear != nil }, set: { if !$0 { pendingClear = nil } })
+    }
+
+    private var clearAlertTitle: String {
+        guard let target = pendingClear else { return "清空手写" }
+        return target.keepTapes ? "清空手写（保留胶带）" : "清空全部批注"
+    }
+
+    private var clearAlertMessage: String {
+        guard let target = pendingClear else { return "" }
+        if target.keepTapes {
+            return "将清空《\(target.meta.title)》的所有手写与图形，已放置的遮挡胶带会保留并恢复为遮盖状态。"
+        } else {
+            return "将清空《\(target.meta.title)》的所有手写、图形与遮挡胶带，此操作无法撤销。"
+        }
+    }
+
+    private func duplicateDocument(_ meta: DocumentMeta) {
+        do {
+            _ = try library.duplicate(meta.id)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     private func startImport(_ source: ImportSource) {
         guard !isImporting else { return }
         isImporting = true
@@ -135,7 +211,11 @@ struct LibraryView: View {
             defer { isImporting = false }
             do {
                 let meta = try await HTMLImportService.importDocument(from: source, into: library)
-                path.append(meta)
+                if path.isEmpty {
+                    path.append(meta)
+                } else {
+                    path = [meta]
+                }
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -161,7 +241,7 @@ private struct DocumentCard: View {
                         .clipShape(RoundedRectangle(cornerRadius: 4))
                         .padding(8)
                 } else {
-                    Image(systemName: "doc.richtext")
+                    Image(systemName: meta.layout == .pdf ? "doc.fill" : "doc.richtext")
                         .font(.largeTitle)
                         .foregroundStyle(.secondary)
                 }
@@ -195,7 +275,7 @@ private struct ImportProgressView: View {
             VStack(spacing: 12) {
                 ProgressView()
                     .controlSize(.large)
-                Text("正在保存网页…")
+                Text("正在导入文档…")
                     .font(.callout)
             }
             .padding(28)

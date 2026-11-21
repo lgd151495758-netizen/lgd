@@ -2,8 +2,10 @@ import Foundation
 import PDFKit
 
 enum PageLayoutMode: String, Codable, CaseIterable, Identifiable {
-    /// Live web page annotated in place (current import mode).
+    /// Live web page annotated in place.
     case live
+    /// Imported PDF document annotated with full Quillmark tools.
+    case pdf
     /// Legacy PDF conversions from version 0.1.
     case pagedA4
     case longPage
@@ -13,6 +15,7 @@ enum PageLayoutMode: String, Codable, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .live: return "网页"
+        case .pdf: return "PDF"
         case .pagedA4: return "A4 分页"
         case .longPage: return "整张长页"
         }
@@ -23,6 +26,7 @@ struct DocumentMeta: Codable, Identifiable, Hashable {
     enum SourceKind: String, Codable {
         case htmlFile
         case webURL
+        case pdfFile
     }
 
     var id: UUID
@@ -118,6 +122,54 @@ final class LibraryStore: ObservableObject {
     func delete(_ id: UUID) {
         try? fileManager.removeItem(at: folder(for: id))
         reload()
+    }
+
+    /// Clears handwriting across all main pages of a document on disk. When `keepTapes` is `true`,
+    /// Cover Tapes are preserved and reset to covered (`revealed = false`) for teaching another class.
+    func clearInk(for id: UUID, keepTapes: Bool) {
+        var annotations = loadAnnotations(for: id)
+        var updatedPages: [String: PageAnnotations] = [:]
+        if keepTapes {
+            for (key, page) in annotations.pages {
+                let kept: [InkStroke] = page.strokes.compactMap { stroke in
+                    guard stroke.isTape else { return nil }
+                    var covered = stroke
+                    covered.revealed = false
+                    return covered
+                }
+                if !kept.isEmpty {
+                    updatedPages[key] = PageAnnotations(strokes: kept)
+                }
+            }
+        }
+        annotations.pages = updatedPages
+        try? fileManager.removeItem(at: thumbnailURL(for: id))
+        try? saveAnnotations(annotations, for: id)
+    }
+
+    /// Creates an independent copy of a document (including source/PDF and annotations) for multi-class reuse.
+    @discardableResult
+    func duplicate(_ id: UUID) throws -> DocumentMeta {
+        guard let original = documents.first(where: { $0.id == id }) else {
+            throw ImportError.unreadable
+        }
+        let now = Date()
+        let copyMeta = DocumentMeta(
+            id: UUID(),
+            title: "\(original.title) 副本",
+            createdAt: now,
+            modifiedAt: now,
+            layout: original.layout,
+            sourceKind: original.sourceKind,
+            sourceURL: original.sourceURL,
+            sourceEntry: original.sourceEntry
+        )
+        let srcFolder = folder(for: original.id)
+        let dstFolder = folder(for: copyMeta.id)
+        try fileManager.copyItem(at: srcFolder, to: dstFolder)
+        try writeMeta(copyMeta)
+        reload()
+        return copyMeta
     }
 
     func loadAnnotations(for id: UUID) -> DocumentAnnotations {

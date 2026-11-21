@@ -41,6 +41,15 @@ struct EditorView: View {
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 HStack(spacing: 8) {
+                    if session.pdfPageCount > 1 {
+                        Text("第 \(session.activeDocumentPageIndex + 1)/\(session.pdfPageCount) 页")
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                    }
+                    clearMenu
                     if presentation.isExternalDisplayConnected {
                         Button {
                             presentation.isFrozen.toggle()
@@ -84,6 +93,66 @@ struct EditorView: View {
         .onDisappear { session.saveNow() }
     }
 
+    private var clearMenu: some View {
+        Menu {
+            if session.meta.layout == .live {
+                Button {
+                    session.clearAllDocumentHandwriting(keepTapes: true)
+                } label: {
+                    Label("清空手写（保留胶带）", systemImage: "eraser.line.dashed")
+                }
+                Button(role: .destructive) {
+                    session.clearAllDocumentHandwriting(keepTapes: false)
+                } label: {
+                    Label("清空全部批注（含胶带）", systemImage: "trash")
+                }
+            } else {
+                if session.pdfPageCount > 1 {
+                    Button {
+                        session.clearHandwriting(onPage: session.activeDocumentPageIndex, keepTapes: true)
+                    } label: {
+                        Label("清空第 \(session.activeDocumentPageIndex + 1) 页手写（保留胶带）",
+                              systemImage: "eraser.line.dashed")
+                    }
+                    Button {
+                        session.clearAllDocumentHandwriting(keepTapes: true)
+                    } label: {
+                        Label("清空整份 PDF 手写（保留胶带）", systemImage: "doc.on.doc")
+                    }
+                } else {
+                    Button {
+                        session.clearAllDocumentHandwriting(keepTapes: true)
+                    } label: {
+                        Label("清空手写（保留胶带）", systemImage: "eraser.line.dashed")
+                    }
+                }
+                Button(role: .destructive) {
+                    session.clearAllDocumentHandwriting(keepTapes: false)
+                } label: {
+                    Label("清空全部批注（含胶带）", systemImage: "trash")
+                }
+            }
+            if session.isScratchpadOpen {
+                Divider()
+                Button {
+                    session.clearCurrentScratchpadPage()
+                } label: {
+                    Label("清空当前便签页", systemImage: "note.text")
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "trash")
+                Text("清空")
+                    .font(.caption.weight(.medium))
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.secondary.opacity(0.14), in: Capsule())
+        }
+        .accessibilityLabel("清空手写")
+    }
+
     @ViewBuilder
     private var editor: some View {
         if session.meta.layout == .live {
@@ -104,7 +173,7 @@ private struct PresentationPopover: View {
 
             Toggle("投屏仅显示内容", isOn: $presentation.contentOnly)
 
-            Text("开启后，外接屏幕（如 OfflineMirror / AirPlay）只显示工具栏下方的网页与批注内容，工具栏仅在 iPad 上显示。")
+            Text("开启后，外接屏幕（如 OfflineMirror / AirPlay）只显示工具栏下方的文档与批注内容，工具栏仅在 iPad 上显示。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

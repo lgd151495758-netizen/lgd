@@ -1,4 +1,5 @@
 import Foundation
+import PDFKit
 
 enum ImportSource {
     case file(URL)
@@ -8,17 +9,18 @@ enum ImportSource {
 enum ImportError: LocalizedError {
     case unreadable
     case noHTMLInFolder
+    case invalidPDF
 
     var errorDescription: String? {
         switch self {
         case .unreadable: return "无法读取所选文件"
         case .noHTMLInFolder: return "文件夹里没有找到 .html 文件"
+        case .invalidPDF: return "无法解析所选 PDF 文件"
         }
     }
 }
 
-/// Creates a live web document: local HTML is copied with its resources, a web address is
-/// saved as a `.webarchive`.
+/// Imports local HTML files/folders, web URLs (as `.webarchive`), and PDF documents into `LibraryStore`.
 @MainActor
 enum HTMLImportService {
     static let archiveName = "page.webarchive"
@@ -32,6 +34,12 @@ enum HTMLImportService {
 
         switch source {
         case .file(let url):
+            if url.pathExtension.lowercased() == "pdf" {
+                let (pdfData, title) = try loadLocalPDF(url)
+                return try library.createDocument(title: title, pdfData: pdfData, layout: .pdf,
+                                                  sourceKind: .pdfFile, sourceURL: url.lastPathComponent,
+                                                  stagedSource: nil)
+            }
             let entry = try stageLocalHTML(url, into: sourceFolder)
             let title = htmlTitle(of: entry) ?? url.deletingPathExtension().lastPathComponent
             return try library.createDocument(title: title, pdfData: nil, layout: .live, sourceKind: .htmlFile,
@@ -45,6 +53,22 @@ enum HTMLImportService {
                                               sourceURL: url.absoluteString, stagedSource: sourceFolder,
                                               sourceEntry: archiveName)
         }
+    }
+
+    nonisolated static func loadLocalPDF(_ url: URL) throws -> (data: Data, title: String) {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+            throw ImportError.unreadable
+        }
+        guard let pdf = PDFDocument(data: data), pdf.pageCount > 0 else {
+            throw ImportError.invalidPDF
+        }
+        let filenameTitle = url.deletingPathExtension().lastPathComponent.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attrTitle = (pdf.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = !filenameTitle.isEmpty ? filenameTitle : (attrTitle?.isEmpty == false ? attrTitle! : "PDF 文档")
+        return (data, title)
     }
 
     /// Accepts "example.com" as well as full URLs.

@@ -288,6 +288,14 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                 self.refreshLassoSelectionOverlay()
             }
         }
+        session.allPagesDidChange = { [weak self] in
+            guard let self else { return }
+            self.clearSelectedShape()
+            self.clearLassoSelection()
+            self.pushStrokes()
+            self.scratchpadPanel.canvas.syncCommittedStrokes()
+            PresentationCenter.shared.requestFrameRefresh()
+        }
         session.$tool
             .sink { [weak self] _ in
                 DispatchQueue.main.async {
