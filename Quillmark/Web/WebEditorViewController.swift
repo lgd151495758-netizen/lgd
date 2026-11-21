@@ -15,6 +15,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
     private let pendingFillContainer = CALayer()
     private let pendingContainer = CALayer()
+    private let lassoPreviewFillContainer = CALayer()
+    private let lassoPreviewContainer = CALayer()
     private let liveFillLayer = CAShapeLayer()
     private let liveLayer = CAShapeLayer()
     private let eraserCursor = CAShapeLayer()
@@ -37,6 +39,26 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         let isHighlighter: Bool
     }
 
+    private struct LassoPreviewEntry {
+        let baseViewPath: CGPath
+        let baseFillPath: CGPath?
+        let strokeColor: CGColor
+        let fillColor: CGColor?
+        let opacity: Float
+        let isHighlighter: Bool
+    }
+
+    private struct LassoTransformContext {
+        let originalStrokes: [InkStroke]
+        let selectedIDs: Set<UUID>
+        let docStrokesByID: [UUID: InkStroke]
+        let baseDocBox: CGRect
+        let baseViewTransform: CGAffineTransform
+        var currentScale: CGFloat = 1
+        var pivotDoc: CGPoint = .zero
+        var currentTranslation: CGPoint = .zero
+    }
+
     private struct ShapeEditContext {
         let strokeID: UUID
         let originalStrokes: [InkStroke]
@@ -57,12 +79,20 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case selectedHandle(index: Int, context: ShapeEditContext)
         case selectedBody(startDoc: CGPoint, context: ShapeEditContext)
         case selectedAction(SelectedShapeOverlay.ActionButton, startPoint: CGPoint)
+        case lassoDraw(docPoints: [CGPoint], rawStartView: CGPoint)
+        case lassoMove(startDoc: CGPoint, context: LassoTransformContext)
+        case lassoScale(corner: LassoSelectionOverlay.ScaleCorner, startCornerDoc: CGPoint, context: LassoTransformContext)
+        case lassoAction(LassoSelectionOverlay.ActionButton, startPoint: CGPoint)
     }
 
-    // Virtual Compass, Selected Shape & Snap Points (iPad-only UI; never projected to external display)
+    // Virtual Compass, Selected Shape, Lasso & Snap Points (iPad-only UI; never projected to external display)
     private var compassState = CompassState()
     private var selectedStrokeID: UUID?
     private var selectedAnchorFallbackOrigin: CGPoint = .zero
+    private var lassoSelectedIDs: [UUID] = []
+    private var lassoFallbackOrigins: [UUID: CGPoint] = [:]
+    private var lassoPreviewEntries: [LassoPreviewEntry] = []
+    private var lassoPreviewTransform: CGAffineTransform = .identity
     private var activeInteraction: ActiveInteraction = .none
     private var fingerControlInteraction: ActiveInteraction = .none
     private var cachedDocSnapPoints: [SnapPoint] = []
@@ -134,6 +164,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
         view.layer.addSublayer(pendingFillContainer)
         view.layer.addSublayer(pendingContainer)
+        // Pin anchorPoint to (0, 0) so affine scale transforms match CGPath/CGRect coordinates exactly.
+        lassoPreviewFillContainer.anchorPoint = .zero
+        lassoPreviewFillContainer.position = .zero
+        lassoPreviewContainer.anchorPoint = .zero
+        lassoPreviewContainer.position = .zero
+        view.layer.addSublayer(lassoPreviewFillContainer)
+        view.layer.addSublayer(lassoPreviewContainer)
 
         liveFillLayer.fillRule = .nonZero
         liveFillLayer.opacity = 0.18
@@ -188,6 +225,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         }
         bridge.onPlacementsChanged = { [weak self] in
             self?.refreshSelectedShapeOverlay()
+            self?.refreshLassoSelectionOverlay()
         }
         bridge.onToggleTape = { [weak self] id in
             guard let self else { return }
@@ -197,6 +235,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         session.pageDidChange = { [weak self] _ in
             self?.pushStrokes()
             self?.refreshSelectedShapeOverlay()
+            self?.refreshLassoSelectionOverlay()
         }
         session.$tool
             .sink { [weak self] _ in
@@ -210,7 +249,10 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             .map(\.kind)
             .removeDuplicates()
             .sink { [weak self] _ in
-                DispatchQueue.main.async { self?.clearSelectedShape() }
+                DispatchQueue.main.async {
+                    self?.clearSelectedShape()
+                    self?.clearLassoSelection()
+                }
             }
             .store(in: &cancellables)
         session.$geometryAid
@@ -222,11 +264,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         webView.scrollView.publisher(for: \.contentOffset)
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
+                self?.refreshLassoSelectionOverlay()
             }
             .store(in: &cancellables)
         webView.scrollView.publisher(for: \.zoomScale)
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
+                self?.refreshLassoSelectionOverlay()
             }
             .store(in: &cancellables)
 
@@ -239,6 +283,12 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         CATransaction.setDisableActions(true)
         pendingFillContainer.frame = view.bounds
         pendingContainer.frame = view.bounds
+        if lassoPreviewTransform == .identity {
+            lassoPreviewFillContainer.bounds = view.bounds
+            lassoPreviewFillContainer.position = .zero
+            lassoPreviewContainer.bounds = view.bounds
+            lassoPreviewContainer.position = .zero
+        }
         liveFillLayer.frame = view.bounds
         liveLayer.frame = view.bounds
         eraserCursor.frame = view.bounds
@@ -248,6 +298,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         updatePresentationViewport(focusY: nil)
         clampGeometryAidsToBounds()
         refreshSelectedShapeOverlay()
+        refreshLassoSelectionOverlay()
         applyGestureRules()
     }
 
@@ -454,7 +505,16 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         let viewPoint = touch.location(in: view)
         updatePresentationViewport(focusY: viewPoint.y)
 
-        // 1. Selected shape handles, mini-bar buttons, or body drag take priority.
+        // 1. Active lasso selection box, corner scale handles, or floating color/copy/delete bar.
+        if let lassoInteraction = beginLassoSelectionInteraction(at: viewPoint) {
+            activeInteraction = lassoInteraction
+            return
+        }
+        if !lassoSelectedIDs.isEmpty {
+            clearLassoSelection()
+        }
+
+        // 2. Selected shape handles, mini-bar buttons, or body drag take priority.
         if let editInteraction = beginSelectedShapeInteraction(at: viewPoint) {
             activeInteraction = editInteraction
             return
@@ -464,15 +524,21 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             clearSelectedShape()
         }
 
-        // 2. Virtual compass handles, buttons, or circle sweep.
+        // 3. Virtual compass handles, buttons, or circle sweep.
         if let aidInteraction = beginGeometryAidInteraction(at: viewPoint, allowDrawing: canDrawWithGeometryAid) {
             activeInteraction = aidInteraction
             return
         }
 
-        // 3. Standard geometric shape tool (drag to create, or quick tap to select existing shape).
+        // 4. Standard geometric shape tool (drag to create, or quick tap to select existing shape).
         if liveTool.kind == .shape {
             activeInteraction = beginShapeCreation(at: viewPoint)
+            return
+        }
+
+        // 5. Lasso tool: draw a freeform selection loop (or quick tap a stroke to select it).
+        if liveTool.kind == .lasso {
+            activeInteraction = beginLassoDraw(at: viewPoint)
             return
         }
 
@@ -482,7 +548,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             eraseBegan(touch)
         case .laser:
             laserBegan(touch)
-        case .pen, .highlighter, .tape, .shape:
+        case .pen, .tape, .shape, .lasso:
             drawBegan(touch, event: event)
         }
     }
@@ -500,7 +566,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             eraseMoved(touch, event: event)
         case .laser:
             laserMoved(touch, event: event)
-        case .pen, .highlighter, .tape, .shape:
+        case .pen, .tape, .shape, .lasso:
             drawMoved(touch, event: event)
         }
     }
@@ -518,7 +584,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case .laser:
             laserMoved(touch, event: event)
             laserEnded(touch)
-        case .pen, .highlighter, .tape, .shape:
+        case .pen, .tape, .shape, .lasso:
             drawEnded(touch, event: event)
         }
     }
@@ -544,7 +610,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case .laser:
             laserEngine.cancel()
             updateLaserRender()
-        case .pen, .highlighter, .tape, .shape:
+        case .pen, .tape, .shape, .lasso:
             livePoints.removeAll()
             pendingEstimates.removeAll()
             setLivePath(nil)
@@ -565,8 +631,8 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     private var canDrawWithGeometryAid: Bool {
         switch liveTool.kind {
-        case .pen, .highlighter, .tape, .shape: return true
-        case .eraser, .laser: return false
+        case .pen, .tape, .shape: return true
+        case .eraser, .laser, .lasso: return false
         }
     }
 
@@ -574,6 +640,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         cancelGeometryAidInteraction()
         if aid == .compass {
             clearSelectedShape()
+            clearLassoSelection()
             let bounds = view.bounds
             if bounds.width > 0, bounds.height > 0,
                compassState.center == .zero || !bounds.insetBy(dx: 24, dy: 24).contains(compassState.center) {
@@ -599,7 +666,6 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private func syncGeometryOverlayAppearance() {
         let color: RGBAColor
         switch session.tool.kind {
-        case .highlighter: color = session.tool.highlighterColor
         case .tape: color = session.tool.tapeColor
         case .laser: color = session.tool.laserColor
         default: color = session.tool.color
@@ -1025,6 +1091,41 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             activeInteraction = .selectedBody(startDoc: startDoc, context: context)
             renderEditedShape(stroke: context.originalStroke, docPrimitive: context.currentDocPrimitive)
             return true
+
+        case var .lassoDraw(docPoints, rawStartView):
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            if let last = docPoints.last, hypot(currentDoc.x - last.x, currentDoc.y - last.y) >= 2.5 {
+                docPoints.append(currentDoc)
+            }
+            activeInteraction = .lassoDraw(docPoints: docPoints, rawStartView: rawStartView)
+            let transform = viewTransform()
+            geometryOverlay.activeLassoPath = docPoints.map { $0.applying(transform) }
+            return true
+
+        case var .lassoMove(startDoc, context):
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            let delta = CGPoint(x: currentDoc.x - startDoc.x, y: currentDoc.y - startDoc.y)
+            context.currentTranslation = delta
+            activeInteraction = .lassoMove(startDoc: startDoc, context: context)
+            applyLassoLivePreviewTransform(context: context)
+            return true
+
+        case var .lassoScale(corner, startCornerDoc, context):
+            let currentDoc = documentPoint(fromViewPoint: viewPoint)
+            let pivotDoc = context.pivotDoc
+            let v0x = startCornerDoc.x - pivotDoc.x
+            let v0y = startCornerDoc.y - pivotDoc.y
+            let d0 = max(16, hypot(v0x, v0y))
+            let ux = v0x / d0
+            let uy = v0y / d0
+            let proj = (currentDoc.x - pivotDoc.x) * ux + (currentDoc.y - pivotDoc.y) * uy
+            context.currentScale = max(0.25, min(4.0, proj / d0))
+            activeInteraction = .lassoScale(corner: corner, startCornerDoc: startCornerDoc, context: context)
+            applyLassoLivePreviewTransform(context: context)
+            return true
+
+        case .lassoAction:
+            return true
         }
     }
 
@@ -1050,6 +1151,42 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
                 executeSelectedShapeAction(action)
             }
             finishGeometryAidInteraction()
+            return true
+
+        case let .lassoAction(action, startPoint):
+            if hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y) < 28 {
+                executeLassoAction(action)
+            }
+            finishGeometryAidInteraction()
+            return true
+
+        case let .lassoDraw(docPoints, rawStartView):
+            finishGeometryAidInteraction()
+            geometryOverlay.activeLassoPath = []
+            let dragDist = hypot(viewPoint.x - rawStartView.x, viewPoint.y - rawStartView.y)
+            let origins = visibleDocumentOrigins()
+            let strokes = session.strokes(onPage: Self.page)
+            if dragDist < 8, docPoints.count <= 4 {
+                let docPt = documentPoint(fromViewPoint: viewPoint)
+                let docTol = 14 / max(webView.scrollView.zoomScale, 0.25)
+                if let hitID = LassoEngine.hitTestSingleStroke(from: strokes, origins: origins,
+                                                               at: docPt, tolerance: docTol, cache: geometryCache) {
+                    selectLassoStrokes([hitID])
+                    haptic.impactOccurred()
+                }
+            } else {
+                let ids = LassoEngine.selectStrokeIDs(from: strokes, origins: origins,
+                                                      polygon: docPoints, cache: geometryCache)
+                if !ids.isEmpty {
+                    selectLassoStrokes(ids)
+                    haptic.impactOccurred()
+                }
+            }
+            return true
+
+        case let .lassoMove(_, context), let .lassoScale(_, _, context):
+            finishGeometryAidInteraction()
+            commitLassoTransform(context)
             return true
 
         case var .compassDraw(sweep, _):
@@ -1099,6 +1236,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         geometryOverlay.activeCompassSweep = nil
         geometryOverlay.isResizingCompass = false
         geometryOverlay.isEditingSelectedShape = false
+        geometryOverlay.isTransformingLasso = false
         updateSnapFeedback(nil)
     }
 
@@ -1109,11 +1247,17 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         case .selectedHandle, .selectedBody:
             setLivePath(nil)
             pushStrokes()
+        case .lassoDraw:
+            geometryOverlay.activeLassoPath = []
+        case .lassoMove, .lassoScale:
+            clearLassoPreviewLayers()
+            pushStrokes()
         default:
             break
         }
         finishGeometryAidInteraction()
         refreshSelectedShapeOverlay()
+        refreshLassoSelectionOverlay()
     }
 
     private func executeCompassButton(_ button: CompassState.HitZone) {
@@ -1142,6 +1286,11 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func handleGeometryControlTap(at viewPoint: CGPoint) {
+        if let lasso = geometryOverlay.lassoSelection,
+           case let .action(button) = lasso.hitTest(viewPoint, in: view.bounds) {
+            executeLassoAction(button)
+            return
+        }
         if let selected = geometryOverlay.selectedShape,
            case let .action(button) = selected.hitTest(viewPoint, in: view.bounds, bodyHit: false) {
             executeSelectedShapeAction(button)
@@ -1155,6 +1304,10 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func beginFingerGeometryDrag(at viewPoint: CGPoint) {
+        if let lassoEdit = beginLassoSelectionInteraction(at: viewPoint) {
+            fingerControlInteraction = lassoEdit
+            return
+        }
         if let edit = beginSelectedShapeInteraction(at: viewPoint) {
             fingerControlInteraction = edit
             return
@@ -1174,16 +1327,392 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         let saved = activeInteraction
         activeInteraction = fingerControlInteraction
         switch activeInteraction {
+        case let .lassoMove(_, context), let .lassoScale(_, _, context):
+            finishGeometryAidInteraction()
+            commitLassoTransform(context)
         case let .selectedHandle(_, context), let .selectedBody(_, context):
             finishGeometryAidInteraction()
             commitEditedShape(context)
         default:
             geometryOverlay.isResizingCompass = false
             geometryOverlay.isEditingSelectedShape = false
+            geometryOverlay.isTransformingLasso = false
             updateSnapFeedback(nil)
         }
         fingerControlInteraction = .none
         activeInteraction = saved
+    }
+
+    // MARK: Lasso Selection, GPU Move/Scale Preview & Batch Actions (iPad-Only UI)
+
+    private func visibleDocumentOrigins() -> [UUID: CGPoint] {
+        var origins = bridge.placements.compactMapValues { $0.visible ? $0.origin : nil }
+        for (id, fallback) in lassoFallbackOrigins where origins[id] == nil {
+            origins[id] = fallback
+        }
+        return origins
+    }
+
+    private func lassoOrigin(for stroke: InkStroke) -> CGPoint {
+        if let placement = bridge.placements[stroke.id] {
+            return placement.origin
+        }
+        if let fallback = lassoFallbackOrigins[stroke.id] {
+            return fallback
+        }
+        return .zero
+    }
+
+    private func selectLassoStrokes(_ ids: [UUID]) {
+        lassoSelectedIDs = ids
+        refreshLassoSelectionOverlay()
+    }
+
+    private func clearLassoSelection() {
+        guard !lassoSelectedIDs.isEmpty || geometryOverlay.lassoSelection != nil || !geometryOverlay.activeLassoPath.isEmpty else {
+            return
+        }
+        lassoSelectedIDs.removeAll()
+        lassoFallbackOrigins.removeAll()
+        geometryOverlay.activeLassoPath = []
+        geometryOverlay.isTransformingLasso = false
+        geometryOverlay.lassoSelection = nil
+    }
+
+    private func refreshLassoSelectionOverlay() {
+        guard !lassoSelectedIDs.isEmpty else {
+            if geometryOverlay.lassoSelection != nil {
+                geometryOverlay.lassoSelection = nil
+            }
+            return
+        }
+        switch activeInteraction {
+        case .lassoMove, .lassoScale:
+            return
+        default:
+            break
+        }
+        let idSet = Set(lassoSelectedIDs)
+        let selected = session.strokes(onPage: Self.page).filter { idSet.contains($0.id) }
+        guard !selected.isEmpty else {
+            clearLassoSelection()
+            return
+        }
+        let origins = visibleDocumentOrigins()
+        let docBox = LassoEngine.documentBounds(of: selected, origins: origins, cache: geometryCache)
+        guard !docBox.isNull, docBox.minX.isFinite, docBox.minY.isFinite else {
+            clearLassoSelection()
+            return
+        }
+        let viewBox = docBox.applying(viewTransform())
+        let firstColor = selected.first?.color
+        let sharedColor = selected.allSatisfy({ $0.color == firstColor }) ? firstColor : nil
+        geometryOverlay.lassoSelection = LassoSelectionOverlay(
+            strokeIDs: selected.map(\.id),
+            boundingBox: viewBox,
+            activeColor: sharedColor
+        )
+    }
+
+    private func beginLassoDraw(at viewPoint: CGPoint) -> ActiveInteraction {
+        let docPt = documentPoint(fromViewPoint: viewPoint)
+        geometryOverlay.activeLassoPath = [viewPoint]
+        return .lassoDraw(docPoints: [docPt], rawStartView: viewPoint)
+    }
+
+    private func beginLassoSelectionInteraction(at viewPoint: CGPoint) -> ActiveInteraction? {
+        guard !lassoSelectedIDs.isEmpty,
+              let overlay = geometryOverlay.lassoSelection else { return nil }
+        let hit = overlay.hitTest(viewPoint, in: view.bounds)
+        switch hit {
+        case .none:
+            return nil
+        case let .action(button):
+            return .lassoAction(button, startPoint: viewPoint)
+        case .body:
+            guard let context = startLassoTransform() else { return nil }
+            let startDoc = documentPoint(fromViewPoint: viewPoint)
+            return .lassoMove(startDoc: startDoc, context: context)
+        case let .handle(corner):
+            guard var context = startLassoTransform() else { return nil }
+            context.pivotDoc = overlay.oppositeCorner(of: corner, in: context.baseDocBox)
+            let startCornerDoc = overlay.cornerPoint(of: corner, in: context.baseDocBox)
+            return .lassoScale(corner: corner, startCornerDoc: startCornerDoc, context: context)
+        }
+    }
+
+    private func startLassoTransform() -> LassoTransformContext? {
+        let originalStrokes = session.strokes(onPage: Self.page)
+        let selectedSet = Set(lassoSelectedIDs)
+        let selectedStrokes = originalStrokes.filter { selectedSet.contains($0.id) }
+        guard !selectedStrokes.isEmpty else { return nil }
+
+        let origins = visibleDocumentOrigins()
+        let baseDocBox = LassoEngine.documentBounds(of: selectedStrokes, origins: origins, cache: geometryCache)
+        guard !baseDocBox.isNull else { return nil }
+
+        let transform = viewTransform()
+        var docStrokesByID: [UUID: InkStroke] = [:]
+        clearLassoPreviewLayers()
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lassoPreviewFillContainer.setAffineTransform(.identity)
+        lassoPreviewContainer.setAffineTransform(.identity)
+        lassoPreviewFillContainer.bounds = view.bounds
+        lassoPreviewFillContainer.position = .zero
+        lassoPreviewContainer.bounds = view.bounds
+        lassoPreviewContainer.position = .zero
+
+        var entries: [LassoPreviewEntry] = []
+        for stroke in selectedStrokes {
+            let origin = lassoOrigin(for: stroke)
+            let docStroke = stroke.translated(by: origin)
+            docStrokesByID[stroke.id] = docStroke
+
+            let viewPath = docStroke.outlinePath(transform: transform, finished: true)
+            let fillPath = docStroke.fillPath(transform: transform)
+            let fillColor = docStroke.fillColor?.cgColor
+
+            if let fillPath, let fillColor {
+                let fl = CAShapeLayer()
+                fl.frame = lassoPreviewFillContainer.bounds
+                fl.fillRule = .nonZero
+                fl.opacity = 0.18
+                fl.fillColor = fillColor
+                fl.path = fillPath
+                lassoPreviewFillContainer.addSublayer(fl)
+            }
+
+            let layer = CAShapeLayer()
+            layer.frame = lassoPreviewContainer.bounds
+            layer.fillRule = .nonZero
+            layer.path = viewPath
+            let opacity: Float
+            if docStroke.isHighlighter {
+                opacity = PageInkView.highlighterOpacity
+                layer.compositingFilter = "multiplyBlendMode"
+            } else if docStroke.isTape {
+                opacity = docStroke.isRevealed ? 0.16 : 0.96
+                layer.strokeColor = UIColor.black.withAlphaComponent(0.25).cgColor
+                layer.lineWidth = 1
+                layer.lineDashPattern = [5, 3]
+            } else {
+                opacity = 1
+            }
+            layer.fillColor = docStroke.color.cgColor
+            layer.opacity = opacity
+            lassoPreviewContainer.addSublayer(layer)
+
+            entries.append(LassoPreviewEntry(
+                baseViewPath: viewPath,
+                baseFillPath: fillPath,
+                strokeColor: docStroke.color.cgColor,
+                fillColor: fillColor,
+                opacity: opacity,
+                isHighlighter: docStroke.isHighlighter
+            ))
+        }
+        lassoPreviewEntries = entries
+        lassoPreviewTransform = .identity
+        CATransaction.commit()
+
+        // Temporarily hide original SVG strokes in WebKit while dragging at 120fps natively.
+        bridge.sync(originalStrokes.filter { !selectedSet.contains($0.id) })
+        geometryOverlay.isTransformingLasso = true
+        pushPresentationOverlay()
+
+        return LassoTransformContext(
+            originalStrokes: originalStrokes,
+            selectedIDs: selectedSet,
+            docStrokesByID: docStrokesByID,
+            baseDocBox: baseDocBox,
+            baseViewTransform: transform
+        )
+    }
+
+    private func applyLassoLivePreviewTransform(context: LassoTransformContext) {
+        let baseT = context.baseViewTransform
+        let previewT: CGAffineTransform
+        if abs(context.currentScale - 1) > 1e-4 {
+            let pivotView = context.pivotDoc.applying(baseT)
+            let s = context.currentScale
+            previewT = CGAffineTransform(translationX: pivotView.x, y: pivotView.y)
+                .scaledBy(x: s, y: s)
+                .translatedBy(x: -pivotView.x, y: -pivotView.y)
+        } else {
+            let dxV = context.currentTranslation.x * baseT.a
+            let dyV = context.currentTranslation.y * baseT.d
+            previewT = CGAffineTransform(translationX: dxV, y: dyV)
+        }
+
+        lassoPreviewTransform = previewT
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lassoPreviewFillContainer.setAffineTransform(previewT)
+        lassoPreviewContainer.setAffineTransform(previewT)
+        CATransaction.commit()
+
+        if var overlay = geometryOverlay.lassoSelection {
+            let baseViewBox = context.baseDocBox.applying(baseT)
+            overlay.boundingBox = baseViewBox.applying(previewT)
+            geometryOverlay.lassoSelection = overlay
+        }
+        pushPresentationOverlay()
+    }
+
+    private func clearLassoPreviewLayers() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        lassoPreviewFillContainer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        lassoPreviewContainer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        lassoPreviewFillContainer.setAffineTransform(.identity)
+        lassoPreviewContainer.setAffineTransform(.identity)
+        lassoPreviewEntries.removeAll()
+        lassoPreviewTransform = .identity
+        CATransaction.commit()
+    }
+
+    private func commitLassoTransform(_ context: LassoTransformContext) {
+        let isUnchanged = abs(context.currentScale - 1) < 1e-3
+            && hypot(context.currentTranslation.x, context.currentTranslation.y) < 0.5
+        if isUnchanged {
+            clearLassoPreviewLayers()
+            pushStrokes()
+            refreshLassoSelectionOverlay()
+            pushPresentationOverlay()
+            return
+        }
+
+        // Compute exact transformed strokes in document space.
+        var transformedDocByID: [UUID: InkStroke] = [:]
+        var newDocBox = CGRect.null
+        for (id, docStroke) in context.docStrokesByID {
+            let updated = LassoEngine.transformStroke(docStroke,
+                                                      scale: context.currentScale,
+                                                      around: context.pivotDoc,
+                                                      translation: context.currentTranslation)
+            transformedDocByID[id] = updated
+            let sb = geometryCache.bounds(for: updated)
+            if !sb.isNull { newDocBox = newDocBox.union(sb) }
+            if let gb = updated.geometry?.boundingBox(), !gb.isNull { newDocBox = newDocBox.union(gb) }
+        }
+
+        // Hand off transformed preview paths into `pendingItems` so there is zero blink across WebKit sync.
+        let viewT = viewTransform()
+        var pendingIDs: Set<UUID> = []
+        for (id, docStroke) in transformedDocByID {
+            let pending = CAShapeLayer()
+            pending.frame = pendingContainer.bounds
+            pending.fillRule = .nonZero
+            pending.path = docStroke.outlinePath(transform: viewT, finished: true)
+            pending.fillColor = docStroke.color.cgColor
+            if docStroke.isHighlighter {
+                pending.opacity = PageInkView.highlighterOpacity
+                pending.compositingFilter = "multiplyBlendMode"
+            } else if docStroke.isTape {
+                pending.opacity = docStroke.isRevealed ? 0.16 : 0.96
+                pending.strokeColor = UIColor.black.withAlphaComponent(0.25).cgColor
+                pending.lineWidth = 1
+                pending.lineDashPattern = [5, 3]
+            } else {
+                pending.opacity = 1
+            }
+            pendingContainer.addSublayer(pending)
+
+            var pendingFill: CAShapeLayer?
+            if let fillColor = docStroke.fillColor, let fillPath = docStroke.fillPath(transform: viewT) {
+                let fl = CAShapeLayer()
+                fl.frame = pendingFillContainer.bounds
+                fl.fillRule = .nonZero
+                fl.opacity = 0.18
+                fl.fillColor = fillColor.cgColor
+                fl.path = fillPath
+                pendingFillContainer.addSublayer(fl)
+                pendingFill = fl
+            }
+            pendingItems.append(PendingItem(id: id, layer: pending, fillLayer: pendingFill,
+                                            isHighlighter: docStroke.isHighlighter))
+            pendingIDs.insert(id)
+        }
+        clearLassoPreviewLayers()
+        pushPresentationOverlay()
+
+        let anchorPoint: CGPoint
+        if newDocBox.isNull || !newDocBox.midX.isFinite || !newDocBox.midY.isFinite {
+            anchorPoint = CGPoint(x: context.baseDocBox.midX + context.currentTranslation.x,
+                                  y: context.baseDocBox.midY + context.currentTranslation.y)
+        } else {
+            anchorPoint = CGPoint(x: newDocBox.midX, y: newDocBox.midY)
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let pick = await self.bridge.pickAnchor(at: anchorPoint)
+            let newOrigin = pick?.origin ?? .zero
+            let newAnchor = pick?.anchor ?? .body
+            let inverseOffset = CGPoint(x: -newOrigin.x, y: -newOrigin.y)
+
+            let after = context.originalStrokes.map { stroke -> InkStroke in
+                guard let docStroke = transformedDocByID[stroke.id] else { return stroke }
+                var reanchored = docStroke.translated(by: inverseOffset)
+                reanchored.anchor = newAnchor
+                self.lassoFallbackOrigins[stroke.id] = newOrigin
+                return reanchored
+            }
+            self.session.replaceStrokes(onPage: Self.page, before: context.originalStrokes, after: after)
+            self.refreshLassoSelectionOverlay()
+
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            self.removePendingItems(matching: pendingIDs)
+        }
+    }
+
+    private func executeLassoAction(_ action: LassoSelectionOverlay.ActionButton) {
+        guard !lassoSelectedIDs.isEmpty else { return }
+        let before = session.strokes(onPage: Self.page)
+        let selectedSet = Set(lassoSelectedIDs)
+
+        switch action {
+        case let .color(idx):
+            guard idx >= 0, idx < ToolSettings.palette.count else { return }
+            let newColor = ToolSettings.palette[idx]
+            let after = before.map { stroke -> InkStroke in
+                guard selectedSet.contains(stroke.id) else { return stroke }
+                var copy = stroke
+                copy.color = newColor
+                if copy.fillColor != nil {
+                    copy.fillColor = newColor
+                }
+                return copy
+            }
+            session.replaceStrokes(onPage: Self.page, before: before, after: after)
+            refreshLassoSelectionOverlay()
+            haptic.impactOccurred()
+
+        case .duplicate:
+            var newIDs: [UUID] = []
+            var copies: [InkStroke] = []
+            for stroke in before where selectedSet.contains(stroke.id) {
+                var copy = stroke.translated(by: CGPoint(x: 24, y: 24))
+                copy.id = UUID()
+                lassoFallbackOrigins[copy.id] = lassoOrigin(for: stroke)
+                newIDs.append(copy.id)
+                copies.append(copy)
+            }
+            guard !copies.isEmpty else { return }
+            let after = before + copies
+            lassoSelectedIDs = newIDs
+            session.replaceStrokes(onPage: Self.page, before: before, after: after)
+            refreshLassoSelectionOverlay()
+            haptic.impactOccurred()
+
+        case .delete:
+            let after = before.filter { !selectedSet.contains($0.id) }
+            clearLassoSelection()
+            session.replaceStrokes(onPage: Self.page, before: before, after: after)
+            haptic.impactOccurred()
+        }
     }
 
     private func renderCompassLiveSweep(_ sweep: CompassSweep) {
@@ -1200,36 +1729,24 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func makeGeometricStroke(_ primitive: GeometricPrimitive, allowFill: Bool = false) -> InkStroke {
-        if liveTool.kind == .highlighter {
-            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
-                             width: liveTool.highlighterWidth, smoothing: 0, points: [],
-                             tool: .highlighter, lineStyle: .solid, geometry: primitive)
-        }
         if liveTool.kind == .tape {
             return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.tapeColor,
                              width: liveTool.tapeWidth, smoothing: 0, points: [],
                              tool: .tape, lineStyle: .solid, revealed: false, geometry: primitive)
         }
         let fill = (allowFill && primitive.supportsFill) ? liveTool.color : nil
-        return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color,
+        return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.color,
                          width: liveTool.width, smoothing: 0, points: [],
                          tool: .pen, lineStyle: liveTool.lineStyle, geometry: primitive, fillColor: fill)
     }
 
-    // MARK: Drawing (Pen, Highlighter, Tape & Draw-and-Hold)
+    // MARK: Drawing (Pen, Tape & Draw-and-Hold)
 
     private func configureLiveLayerForCurrentTool() {
-        let highlighter = liveTool.kind == .highlighter
         let tape = liveTool.kind == .tape
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if highlighter {
-            liveLayer.fillColor = liveTool.highlighterColor.cgColor
-            liveLayer.opacity = PageInkView.highlighterOpacity
-            liveLayer.compositingFilter = "multiplyBlendMode"
-            liveLayer.strokeColor = nil
-            liveLayer.lineDashPattern = nil
-        } else if tape {
+        if tape {
             liveLayer.fillColor = liveTool.tapeColor.cgColor
             liveLayer.opacity = 0.96
             liveLayer.compositingFilter = nil
@@ -1339,11 +1856,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private var canDrawAndHold: Bool {
-        switch liveTool.kind {
-        case .pen: return liveTool.drawAndHold
-        case .highlighter: return !liveTool.highlighterStraight
-        default: return false
-        }
+        liveTool.kind == .pen && liveTool.drawAndHold
     }
 
     private func scheduleHoldRecognitionIfNeeded() {
@@ -1362,10 +1875,6 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         guard snappedBaseShape == nil, livePoints.count >= 4 else { return }
         let pts = livePoints.map(\.location)
         guard var shape = ShapeRecognizer.recognize(pts) else { return }
-        // Highlighter only snaps to straight lines (clean text underlining/highlighting).
-        if liveTool.kind == .highlighter {
-            guard case .line = shape else { return }
-        }
         // Snap line/arrow start & end onto existing geometric endpoints/intersections/centers.
         refreshViewSnapPoints()
         let docThreshold = 10 / max(webView.scrollView.zoomScale, 0.25)
@@ -1453,19 +1962,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     }
 
     private func makeStroke(points: [InkPoint]) -> InkStroke {
-        if liveTool.kind == .highlighter {
-            let shaped = liveTool.highlighterStraight ? StrokeProcessor.straightened(points) : points
-            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
-                             width: liveTool.highlighterWidth, smoothing: 0.7, points: shaped,
-                             tool: .highlighter, lineStyle: .solid)
-        }
         if liveTool.kind == .tape {
             let shaped = liveTool.tapeStraight ? StrokeProcessor.straightened(points, snapAngleDegrees: 8) : points
             return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.tapeColor,
                              width: liveTool.tapeWidth, smoothing: 0.7, points: shaped,
                              tool: .tape, lineStyle: .solid, revealed: false)
         }
-        return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
+        return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.color, width: liveTool.width,
                          smoothing: liveTool.smoothing, points: points, tool: .pen,
                          lineStyle: liveTool.lineStyle)
     }
@@ -1665,7 +2168,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     private func applyEraseStep(from a: CGPoint, to b: CGPoint) -> Bool {
         let result = LiveEraser.erase(eraseWorking, origins: eraseOrigins, from: a, to: b, radius: eraserRadius,
-                                      mode: liveTool.eraserMode, highlighterOnly: liveTool.eraseHighlighterOnly,
+                                      mode: liveTool.eraserMode, highlighterOnly: false,
                                       cache: geometryCache)
         guard result.changed else { return false }
         eraseWorking = result.strokes
@@ -1695,11 +2198,26 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     private func pushPresentationOverlay() {
         guard PresentationCenter.shared.isShowingContentOnly else { return }
         let captureRect = presentationViewport.captureRect.width > 0 ? presentationViewport.captureRect : view.bounds
-        let pendingOverlays: [PendingOverlayStroke] = pendingItems.compactMap { item in
+        var pendingOverlays: [PendingOverlayStroke] = pendingItems.compactMap { item in
             guard let path = item.layer.path else { return nil }
             return PendingOverlayStroke(path: path, color: item.layer.fillColor,
                                         opacity: item.layer.opacity, isHighlighter: item.isHighlighter,
                                         fillPath: item.fillLayer?.path, fillColor: item.fillLayer?.fillColor)
+        }
+        if !lassoPreviewEntries.isEmpty {
+            var transform = lassoPreviewTransform
+            for entry in lassoPreviewEntries {
+                let path = entry.baseViewPath.copy(using: &transform) ?? entry.baseViewPath
+                let fill = entry.baseFillPath?.copy(using: &transform) ?? entry.baseFillPath
+                pendingOverlays.append(PendingOverlayStroke(
+                    path: path,
+                    color: entry.strokeColor,
+                    opacity: entry.opacity,
+                    isHighlighter: entry.isHighlighter,
+                    fillPath: fill,
+                    fillColor: entry.fillColor
+                ))
+            }
         }
         let state = LiveOverlayState(
             sourceSize: captureRect.size,
@@ -1707,7 +2225,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             strokePath: liveLayer.path,
             strokeColor: liveLayer.fillColor,
             strokeOpacity: liveLayer.opacity,
-            isHighlighter: liveTool.kind == .highlighter,
+            isHighlighter: false,
             fillPath: liveFillLayer.path,
             fillColor: liveFillLayer.fillColor,
             pendingStrokes: pendingOverlays,

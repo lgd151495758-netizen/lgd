@@ -157,6 +157,8 @@ final class PageInkView: UIView, InkInputDelegate {
         liveTool = session.tool
         if liveTool.kind == .eraser {
             eraseBegan(touch, event: event)
+        } else if liveTool.kind == .lasso {
+            return
         } else if liveTool.kind == .laser {
             // Legacy PDF pages simply show a temporary laser path until lifted.
             drawBegan(touch, event: event)
@@ -168,6 +170,8 @@ final class PageInkView: UIView, InkInputDelegate {
     func inkMoved(_ touch: UITouch, event: UIEvent?) {
         if liveTool.kind == .eraser {
             eraseMoved(touch, event: event)
+        } else if liveTool.kind == .lasso {
+            return
         } else {
             drawMoved(touch, event: event)
         }
@@ -177,6 +181,8 @@ final class PageInkView: UIView, InkInputDelegate {
         if liveTool.kind == .eraser {
             eraseMoved(touch, event: event)
             eraseEnded()
+        } else if liveTool.kind == .lasso {
+            return
         } else if liveTool.kind == .laser {
             inkCancelled()
         } else {
@@ -208,13 +214,11 @@ final class PageInkView: UIView, InkInputDelegate {
         pendingEstimates.removeAll()
         lastCommitted = nil
         liveStartTime = touch.timestamp
-        let highlighter = liveTool.kind == .highlighter
         let tape = liveTool.kind == .tape
-        let color: RGBAColor = highlighter ? liveTool.highlighterColor
-            : (tape ? liveTool.tapeColor : (liveTool.kind == .laser ? liveTool.laserColor : liveTool.color))
+        let color: RGBAColor = tape ? liveTool.tapeColor : (liveTool.kind == .laser ? liveTool.laserColor : liveTool.color)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        Self.applyAppearance(highlighter: highlighter, tape: tape, color: color, to: liveLayer)
+        Self.applyAppearance(highlighter: false, tape: tape, color: color, to: liveLayer)
         CATransaction.commit()
         append(event?.coalescedTouches(for: touch) ?? [touch])
         updateLiveStroke(predicted: [])
@@ -281,11 +285,6 @@ final class PageInkView: UIView, InkInputDelegate {
     }
 
     private func makeStroke(points: [InkPoint]) -> InkStroke {
-        if liveTool.kind == .highlighter {
-            let shaped = liveTool.highlighterStraight ? StrokeProcessor.straightened(points) : points
-            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.highlighterColor,
-                             width: liveTool.highlighterWidth, smoothing: 0.7, points: shaped, tool: .highlighter)
-        }
         if liveTool.kind == .tape {
             let shaped = liveTool.tapeStraight ? StrokeProcessor.straightened(points, snapAngleDegrees: 8) : points
             return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.tapeColor,
@@ -294,11 +293,11 @@ final class PageInkView: UIView, InkInputDelegate {
         if liveTool.kind == .shape, let first = points.first, let last = points.last, points.count >= 2 {
             let built = ShapeBuilder.build(preset: liveTool.shapePreset, from: first.location, to: last.location)
             let fill = (liveTool.shapeFilled && built.primitive.supportsFill) ? liveTool.color : nil
-            return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
+            return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.color, width: liveTool.width,
                              smoothing: 0, points: [], tool: .pen, lineStyle: liveTool.lineStyle,
                              geometry: built.primitive, fillColor: fill)
         }
-        return InkStroke(id: UUID(), pen: liveTool.pen, color: liveTool.color, width: liveTool.width,
+        return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.color, width: liveTool.width,
                          smoothing: liveTool.smoothing, points: points, tool: .pen,
                          lineStyle: liveTool.lineStyle)
     }
@@ -373,7 +372,7 @@ final class PageInkView: UIView, InkInputDelegate {
 
     private func applyErase(from a: CGPoint, to b: CGPoint) {
         let result = EraserEngine.erase(eraseWorking, from: a, to: b, radius: eraserRadius,
-                                        mode: liveTool.eraserMode, highlighterOnly: liveTool.eraseHighlighterOnly,
+                                        mode: liveTool.eraserMode, highlighterOnly: false,
                                         cache: geometryCache)
         guard result.changed else { return }
         eraseWorking = result.strokes

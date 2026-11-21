@@ -82,6 +82,33 @@ enum GeometricPrimitive: Codable, Equatable {
         }
     }
 
+    /// Uniformly scales this geometric primitive around `pivot` while preserving exact mathematical invariants.
+    func scaled(by factor: CGFloat, around pivot: CGPoint) -> GeometricPrimitive {
+        let s = max(0.05, factor)
+        func map(_ p: CGPoint) -> CGPoint {
+            CGPoint(x: pivot.x + (p.x - pivot.x) * s, y: pivot.y + (p.y - pivot.y) * s)
+        }
+        switch self {
+        case let .segment(a, b, sArrow, eArrow):
+            return .segment(a: map(a), b: map(b), startArrow: sArrow, endArrow: eArrow)
+        case let .circle(center, radius, mark):
+            return .circle(center: map(center), radius: max(4, radius * s), showCenterMark: mark)
+        case let .arc(center, radius, start, end, cw, mark):
+            return .arc(center: map(center), radius: max(4, radius * s), startAngle: start, endAngle: end,
+                        clockwise: cw, showCenterMark: mark)
+        case let .ellipse(center, rx, ry, rotation):
+            return .ellipse(center: map(center), rx: max(4, rx * s), ry: max(4, ry * s), rotation: rotation)
+        case let .polygon(vertices, closed):
+            return .polygon(vertices: vertices.map(map), closed: closed)
+        case let .parabola(vertex, axisAngle, halfWidth, height):
+            return .parabola(vertex: map(vertex), axisAngle: axisAngle,
+                             halfWidth: max(6, halfWidth * s), height: max(6, height * s))
+        case let .axes(origin, xMin, xMax, yMin, yMax, tick):
+            return .axes(origin: map(origin), xMin: xMin * s, xMax: xMax * s,
+                         yMin: yMin * s, yMax: yMax * s, tickSpacing: max(12, tick * s))
+        }
+    }
+
     /// Closed interior path for optional semi-transparent shading (returns `nil` for open shapes).
     func fillPath(transform: CGAffineTransform = .identity) -> CGPath? {
         switch self {

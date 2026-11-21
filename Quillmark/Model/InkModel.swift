@@ -70,7 +70,7 @@ struct RGBAColor: Codable, Equatable, Hashable {
 
 enum ToolKind: String, Codable, CaseIterable {
     case pen
-    case highlighter
+    case lasso
     case tape
     case shape
     case laser
@@ -248,19 +248,14 @@ struct ToolSettings: Codable, Equatable {
     /// Tool to return to on Apple Pencil double-tap ("switch to previous").
     var previousKind: ToolKind = .eraser
 
-    // Pen
-    var pen: PenKind = .fountain
+    // Pen (ballpoint only; fountain/brush kept on PenKind solely for decoding legacy annotations)
+    var pen: PenKind = .ballpoint
     var color: RGBAColor = .ink
     var width: Float = 1.8
     var lineStyle: StrokeLineStyle = .solid
     var drawAndHold: Bool = true
     var smoothing: Float = 0.45
     var prediction: Bool = true
-
-    // Highlighter
-    var highlighterColor: RGBAColor = ToolSettings.highlighterPalette[0]
-    var highlighterWidth: Float = 14
-    var highlighterStraight: Bool = false
 
     // Cover Tape
     var tapeColor: RGBAColor = ToolSettings.tapePalette[0]
@@ -277,12 +272,10 @@ struct ToolSettings: Codable, Equatable {
     // Eraser
     var eraserMode: EraserMode = .pixel
     var eraserRadius: Float = 8
-    var eraseHighlighterOnly: Bool = false
 
     var fingerDrawing: Bool = false
 
     static let widthPresets: [Float] = [1.0, 1.8, 3.0]
-    static let highlighterWidthPresets: [Float] = [8, 14, 22]
     static let tapeWidthPresets: [Float] = [18, 26, 42]
     static let eraserRadiusPresets: [Float] = [4, 8, 16]
 
@@ -293,14 +286,6 @@ struct ToolSettings: Codable, Equatable {
         RGBAColor(0.11, 0.55, 0.32),
         RGBAColor(0.48, 0.25, 0.70),
         RGBAColor(0.93, 0.50, 0.10),
-    ]
-
-    static let highlighterPalette: [RGBAColor] = [
-        RGBAColor(1.00, 0.88, 0.20),
-        RGBAColor(0.55, 0.92, 0.45),
-        RGBAColor(1.00, 0.55, 0.75),
-        RGBAColor(0.45, 0.80, 1.00),
-        RGBAColor(1.00, 0.70, 0.30),
     ]
 
     static let tapePalette: [RGBAColor] = [
@@ -343,13 +328,14 @@ struct ToolSettings: Codable, Equatable {
         kind = target == kind ? .pen : target
     }
 
-    private static let defaultsKey = "toolSettings.v4"
+    private static let defaultsKey = "toolSettings.v5"
 
     static func load(from defaults: UserDefaults = .standard) -> ToolSettings {
         guard let data = defaults.data(forKey: defaultsKey),
-              let value = try? JSONDecoder().decode(ToolSettings.self, from: data) else {
+              var value = try? JSONDecoder().decode(ToolSettings.self, from: data) else {
             return ToolSettings()
         }
+        value.pen = .ballpoint
         return value
     }
 

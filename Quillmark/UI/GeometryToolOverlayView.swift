@@ -24,6 +24,24 @@ final class GeometryToolOverlayView: UIView {
     var isEditingSelectedShape = false {
         didSet { setNeedsDisplay() }
     }
+    /// Freehand lasso loop currently being drawn in view coordinates (iPad-only).
+    var activeLassoPath: [CGPoint] = [] {
+        didSet {
+            updateVisibility()
+            setNeedsDisplay()
+        }
+    }
+    /// Active lasso multi-stroke selection box, corner handles & quick-action bar (iPad-only).
+    var lassoSelection: LassoSelectionOverlay? {
+        didSet {
+            updateVisibility()
+            setNeedsDisplay()
+        }
+    }
+    /// Hides the lasso floating bar while actively moving or scaling the selection.
+    var isTransformingLasso = false {
+        didSet { setNeedsDisplay() }
+    }
     /// Active sweep readout while drawing an arc with the compass.
     var activeCompassSweep: CompassSweep? {
         didSet { setNeedsDisplay() }
@@ -47,7 +65,11 @@ final class GeometryToolOverlayView: UIView {
     }
 
     private func updateVisibility() {
-        isHidden = (aid == .none && selectedShape == nil && activeSnapPoint == nil)
+        isHidden = (aid == .none
+                    && selectedShape == nil
+                    && activeSnapPoint == nil
+                    && activeLassoPath.isEmpty
+                    && lassoSelection == nil)
     }
 
     // Optional finger callbacks (in addition to primary one-handed Apple Pencil control).
@@ -87,6 +109,14 @@ final class GeometryToolOverlayView: UIView {
     /// Returns `true` only on manipulative control handles/buttons so finger touches elsewhere
     /// fall straight through to `WKWebView` (scrolling, zooming, page buttons, cover tapes).
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if let lasso = lassoSelection {
+            switch lasso.hitTest(point, in: bounds, includeActionBar: !isTransformingLasso) {
+            case .action, .handle, .body:
+                return true
+            case .none:
+                break
+            }
+        }
         if let selected = selectedShape {
             switch selected.hitTest(point, in: bounds, bodyHit: false) {
             case .action, .handle:
@@ -131,6 +161,12 @@ final class GeometryToolOverlayView: UIView {
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        if !activeLassoPath.isEmpty {
+            drawActiveLassoPath(in: ctx)
+        }
+        if let lasso = lassoSelection {
+            drawLassoSelection(lasso, in: ctx)
+        }
         if let selected = selectedShape {
             drawSelectedShape(selected, in: ctx)
         }
@@ -139,6 +175,117 @@ final class GeometryToolOverlayView: UIView {
         }
         if let snap = activeSnapPoint {
             drawSnapIndicator(at: snap, kind: activeSnapKind, in: ctx)
+        }
+    }
+
+    private func drawActiveLassoPath(in ctx: CGContext) {
+        guard activeLassoPath.count >= 2 else { return }
+        ctx.saveGState()
+        let path = UIBezierPath()
+        path.move(to: activeLassoPath[0])
+        for pt in activeLassoPath.dropFirst() {
+            path.addLine(to: pt)
+        }
+        path.close()
+        UIColor.systemBlue.withAlphaComponent(0.08).setFill()
+        path.fill()
+
+        ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(0.85).cgColor)
+        ctx.setLineWidth(1.8)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        ctx.setLineDash(phase: 0, lengths: [6, 4])
+        ctx.addPath(path.cgPath)
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    private func drawLassoSelection(_ lasso: LassoSelectionOverlay, in ctx: CGContext) {
+        let box = lasso.paddedBox
+        if box.width > 0, box.height > 0 {
+            ctx.saveGState()
+            let rounded = UIBezierPath(roundedRect: box, cornerRadius: 6)
+            UIColor.systemBlue.withAlphaComponent(isTransformingLasso ? 0.04 : 0.06).setFill()
+            rounded.fill()
+
+            ctx.setStrokeColor(UIColor.systemBlue.withAlphaComponent(0.75).cgColor)
+            ctx.setLineWidth(1.5)
+            ctx.setLineDash(phase: 0, lengths: [5, 4])
+            ctx.addPath(rounded.cgPath)
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+
+        // Four corner proportional-scale handles
+        for (_, pt) in lasso.handlePositions() {
+            let r: CGFloat = 7.5
+            let rect = CGRect(x: pt.x - r, y: pt.y - r, width: r * 2, height: r * 2)
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4,
+                          color: UIColor.black.withAlphaComponent(0.22).cgColor)
+            UIColor.white.setFill()
+            ctx.fillEllipse(in: rect)
+            ctx.restoreGState()
+
+            UIColor.systemBlue.setStroke()
+            ctx.setLineWidth(2.2)
+            ctx.strokeEllipse(in: rect)
+        }
+
+        guard !isTransformingLasso else { return }
+        let bar = lasso.actionBarFrame(in: bounds)
+        let buttons = lasso.actionButtons(in: bounds)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8,
+                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
+        let bg = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        UIColor.systemBackground.withAlphaComponent(0.96).setFill()
+        bg.fill()
+        ctx.restoreGState()
+
+        UIColor.separator.withAlphaComponent(0.6).setStroke()
+        let border = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        border.lineWidth = 0.8
+        border.stroke()
+
+        let font = UIFont.systemFont(ofSize: 12.5, weight: .semibold)
+        for (action, rect) in buttons {
+            switch action {
+            case let .color(idx):
+                guard idx < ToolSettings.palette.count else { continue }
+                let swatch = ToolSettings.palette[idx]
+                let isSelected = (lasso.activeColor == swatch)
+                let r: CGFloat = 8.5
+                let dotRect = CGRect(x: rect.midX - r, y: rect.midY - r, width: r * 2, height: r * 2)
+                if isSelected {
+                    let ring = dotRect.insetBy(dx: -3, dy: -3)
+                    UIColor.label.withAlphaComponent(0.85).setStroke()
+                    ctx.setLineWidth(1.6)
+                    ctx.strokeEllipse(in: ring)
+                }
+                ctx.setFillColor(swatch.cgColor)
+                ctx.fillEllipse(in: dotRect)
+                UIColor.separator.withAlphaComponent(0.45).setStroke()
+                ctx.setLineWidth(0.7)
+                ctx.strokeEllipse(in: dotRect)
+
+            case .duplicate:
+                ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
+                ctx.setLineWidth(0.8)
+                ctx.move(to: CGPoint(x: rect.minX, y: bar.minY + 7))
+                ctx.addLine(to: CGPoint(x: rect.minX, y: bar.maxY - 7))
+                ctx.strokePath()
+                drawCenteredText("复制", in: rect, font: font, color: .label)
+
+            case .delete:
+                ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
+                ctx.setLineWidth(0.8)
+                ctx.move(to: CGPoint(x: rect.minX, y: bar.minY + 7))
+                ctx.addLine(to: CGPoint(x: rect.minX, y: bar.maxY - 7))
+                ctx.strokePath()
+                drawCenteredText("删除", in: rect, font: font, color: .systemRed)
+            }
         }
     }
 

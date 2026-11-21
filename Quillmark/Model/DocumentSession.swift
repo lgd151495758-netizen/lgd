@@ -131,7 +131,7 @@ final class DocumentSession: ObservableObject {
             geometryAid = .none
         } else {
             geometryAid = aid
-            if tool.kind == .eraser || tool.kind == .laser {
+            if tool.kind == .eraser || tool.kind == .laser || tool.kind == .lasso {
                 tool.select(.pen)
             }
         }

@@ -1,11 +1,14 @@
 import CoreGraphics
 import Foundation
 
-/// Caches stroke centerlines and bounds for hit testing (keyed by stroke identity and content size).
+/// Caches stroke centerlines and bounds for hit testing (keyed by stroke identity and geometry signature).
 final class StrokeGeometryCache {
     private struct Entry {
         let pointCount: Int
         let bakedCount: Int
+        let width: Float
+        let firstPoint: CGPoint?
+        let lastPoint: CGPoint?
         let geometry: GeometricPrimitive?
         let samples: [StrokeSample]
         let bounds: CGRect
@@ -14,9 +17,14 @@ final class StrokeGeometryCache {
     private var entries: [UUID: Entry] = [:]
 
     private func entry(for stroke: InkStroke) -> Entry {
+        let firstPt = stroke.baked?.first?.point ?? stroke.points.first?.location
+        let lastPt = stroke.baked?.last?.point ?? stroke.points.last?.location
         if let cached = entries[stroke.id],
            cached.pointCount == stroke.points.count,
            cached.bakedCount == (stroke.baked?.count ?? -1),
+           cached.width == stroke.width,
+           cached.firstPoint == firstPt,
+           cached.lastPoint == lastPt,
            cached.geometry == stroke.geometry {
             return cached
         }
@@ -27,6 +35,7 @@ final class StrokeGeometryCache {
                                          width: 2 * s.radius, height: 2 * s.radius))
         }
         let created = Entry(pointCount: stroke.points.count, bakedCount: stroke.baked?.count ?? -1,
+                            width: stroke.width, firstPoint: firstPt, lastPoint: lastPt,
                             geometry: stroke.geometry, samples: samples, bounds: bounds)
         entries[stroke.id] = created
         return created

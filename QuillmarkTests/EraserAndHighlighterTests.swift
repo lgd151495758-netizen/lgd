@@ -133,15 +133,15 @@ final class EraserAndHighlighterTests: XCTestCase {
 
     func testPencilDoubleTapToggles() {
         var tool = ToolSettings()
-        tool.select(.highlighter)
+        tool.select(.lasso)
         tool.toggleEraser()
         XCTAssertEqual(tool.kind, .eraser)
         tool.toggleEraser()
-        XCTAssertEqual(tool.kind, .highlighter, "double-tap returns to the tool in use before the eraser")
+        XCTAssertEqual(tool.kind, .lasso, "double-tap returns to the tool in use before the eraser")
 
         tool.select(.pen)
         tool.switchToPrevious()
-        XCTAssertEqual(tool.kind, .highlighter)
+        XCTAssertEqual(tool.kind, .lasso)
         tool.switchToPrevious()
         XCTAssertEqual(tool.kind, .pen)
     }

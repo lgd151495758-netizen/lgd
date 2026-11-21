@@ -10,15 +10,12 @@ struct ToolbarView: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
-                ForEach(PenKind.allCases) { pen in
-                    toolButton(title: pen.displayName, symbol: pen.symbolName,
-                               selected: tool.kind == .pen && tool.pen == pen) {
-                        session.tool.select(.pen)
-                        session.tool.pen = pen
-                    }
+                toolButton(title: "画笔", symbol: "pencil", selected: tool.kind == .pen) {
+                    session.tool.select(.pen)
+                    session.tool.pen = .ballpoint
                 }
-                toolButton(title: "荧光笔", symbol: "highlighter", selected: tool.kind == .highlighter) {
-                    session.tool.select(.highlighter)
+                toolButton(title: "套索", symbol: "lasso", selected: tool.kind == .lasso) {
+                    session.tool.select(.lasso)
                 }
                 toolButton(title: "胶带", symbol: "bandage", selected: tool.kind == .tape) {
                     session.tool.select(.tape)
@@ -107,23 +104,11 @@ struct ToolbarView: View {
             .toggleStyle(.button)
             .accessibilityLabel("画完按住自动成形")
 
-        case .highlighter:
-            ForEach(ToolSettings.highlighterPalette, id: \.self) { color in
-                colorButton(color, selected: tool.highlighterColor == color) { session.tool.highlighterColor = color }
-            }
-            divider
-            ForEach(ToolSettings.highlighterWidthPresets, id: \.self) { width in
-                sizeButton(diameter: CGFloat(width) * 0.7 + 4, selected: tool.highlighterWidth == width,
-                           shape: AnyShape(Capsule())) {
-                    session.tool.highlighterWidth = width
-                }
-            }
-            Toggle(isOn: $session.tool.highlighterStraight) {
-                Label("直线", systemImage: "line.diagonal")
-                    .labelStyle(.titleAndIcon)
-                    .font(.callout)
-            }
-            .toggleStyle(.button)
+        case .lasso:
+            Label("圈选或轻点笔迹：拖动移动 · 拖角缩放 · 浮条改色/复制/删除", systemImage: "lasso")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 4)
 
         case .tape:
             ForEach(ToolSettings.tapePalette, id: \.self) { color in
@@ -210,10 +195,6 @@ struct ToolbarView: View {
                     session.tool.eraserRadius = radius
                 }
             }
-            Toggle(isOn: $session.tool.eraseHighlighterOnly) {
-                Text("只擦荧光笔").font(.callout)
-            }
-            .toggleStyle(.button)
         }
     }
 
