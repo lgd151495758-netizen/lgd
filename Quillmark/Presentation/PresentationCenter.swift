@@ -505,13 +505,17 @@ final class PresentationCenter: ObservableObject {
             accessoryNote = ""
         }
 
+        let nextSummary: String
         if isExternalDisplayConnected, let screen = externalScreen {
             let w = Int(screen.bounds.width * screen.scale)
             let h = Int(screen.bounds.height * screen.scale)
-            connectionSummary = "已连接外接屏 \(w)×\(h)（\(attachmentKind.rawValue)\(accessoryNote)）"
+            nextSummary = "已连接外接屏 \(w)×\(h)（\(attachmentKind.rawValue)\(accessoryNote)）"
         } else {
             let mirrorText = captured ? "镜像中" : "未镜像"
-            connectionSummary = "未检测到独立外接屏（屏幕 \(screens.count) · 场景 \(scenes.count) · \(mirrorText)\(accessoryNote)）"
+            nextSummary = "未检测到独立外接屏（屏幕 \(screens.count) · 场景 \(scenes.count) · \(mirrorText)\(accessoryNote)）"
+        }
+        if connectionSummary != nextSummary {
+            connectionSummary = nextSummary
         }
     }
 

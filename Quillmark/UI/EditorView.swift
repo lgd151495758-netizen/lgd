@@ -1,28 +1,36 @@
 import SwiftUI
 
-struct EditorView: View {
-    @StateObject private var session: DocumentSession
+/// Tabbed document editing workspace: compact browser-style tab bar (iPad-only) + floating toolbar
+/// + live `TabDeckViewController` hosting multiple HTML & PDF documents simultaneously with
+/// instant 0ms switching and exact viewing-position preservation.
+struct WorkspaceView: View {
+    @ObservedObject var tabManager: TabManager
+    @ObservedObject var library: LibraryStore
     @ObservedObject private var presentation = PresentationCenter.shared
-    @State private var showPresentationPopover = false
-    private let library: LibraryStore
 
-    init(meta: DocumentMeta, library: LibraryStore) {
-        self.library = library
-        _session = StateObject(wrappedValue: DocumentSession(meta: meta, library: library))
-    }
+    @State private var showQuickOpenPopover = false
+    @State private var showPresentationPopover = false
+
+    let onImportPDF: () -> Void
+    let onImportHTML: () -> Void
+    let onImportURL: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
-            ToolbarView(session: session)
-                .padding(.horizontal)
-                .padding(.vertical, 6)
+            tabBar
+            Divider()
+            if let activeTab = tabManager.activeTab {
+                ToolbarView(session: activeTab.session)
+                    .padding(.horizontal)
+                    .padding(.vertical, 6)
+            }
             if presentation.isFrozen {
                 Button {
                     presentation.isFrozen = false
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "snowflake")
-                        Text("大屏画面已冻结 · 可在 iPad 自由翻页，轻点此处恢复实时同步")
+                        Text("大屏画面已冻结 · 可自由切换标签或翻页，轻点此处恢复实时同步")
                             .font(.caption.weight(.semibold))
                     }
                     .foregroundStyle(.white)
@@ -33,64 +41,211 @@ struct EditorView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("恢复大屏实时同步")
             }
-            editor
+            TabDeckRepresentable(tabManager: tabManager, library: library)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .background(Color(.systemBackground))
         .ignoresSafeArea(edges: .bottom)
-        .navigationTitle(session.meta.title)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                HStack(spacing: 8) {
-                    if session.pdfPageCount > 1 {
-                        Text("第 \(session.activeDocumentPageIndex + 1)/\(session.pdfPageCount) 页")
-                            .font(.caption.monospacedDigit().weight(.medium))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.secondary.opacity(0.12), in: Capsule())
-                    }
-                    clearMenu
-                    if presentation.isExternalDisplayConnected {
+    }
+
+    private var tabBar: some View {
+        HStack(spacing: 8) {
+            Button {
+                tabManager.showLibrary()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.left")
+                        .font(.caption.weight(.bold))
+                    Text("文档库")
+                        .font(.subheadline.weight(.medium))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(.tertiarySystemFill), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("返回文档库")
+
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(tabManager.tabs) { tab in
+                            DocumentTabPill(
+                                tab: tab,
+                                isActive: tab.id == tabManager.activeTabID,
+                                onSelect: { tabManager.selectTab(id: tab.id) },
+                                onClose: { tabManager.closeTab(id: tab.id) }
+                            )
+                            .id(tab.id)
+                        }
+
                         Button {
-                            presentation.isFrozen.toggle()
+                            showQuickOpenPopover = true
                         } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: presentation.isFrozen ? "snowflake" : "pause.circle")
-                                Text(presentation.isFrozen ? "已冻结" : "冻结")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            .foregroundStyle(presentation.isFrozen ? Color.white : Color.primary)
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 4)
-                            .background(presentation.isFrozen ? Color.orange : Color.secondary.opacity(0.16),
-                                        in: Capsule())
+                            Image(systemName: "plus")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 30, height: 30)
+                                .background(Color(.tertiarySystemFill), in: Circle())
                         }
-                        .accessibilityLabel(presentation.isFrozen ? "取消冻结大屏" : "冻结大屏画面")
-                    }
-                    Button {
-                        presentation.scanDisplays()
-                        showPresentationPopover = true
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "airplayvideo")
-                            if presentation.isExternalDisplayConnected {
-                                Text(presentation.contentOnly ? "投屏中" : "镜像中")
-                                    .font(.caption.weight(.medium))
-                            }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("在新标签页打开文档")
+                        .popover(isPresented: $showQuickOpenPopover) {
+                            QuickOpenDocumentPopover(
+                                library: library,
+                                tabManager: tabManager,
+                                dismiss: { showQuickOpenPopover = false },
+                                onImportPDF: {
+                                    showQuickOpenPopover = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                        onImportPDF()
+                                    }
+                                },
+                                onImportHTML: {
+                                    showQuickOpenPopover = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                        onImportHTML()
+                                    }
+                                },
+                                onImportURL: {
+                                    showQuickOpenPopover = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                        onImportURL()
+                                    }
+                                }
+                            )
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(presentation.isExternalDisplayConnected ? Color.accentColor.opacity(0.18) : Color.clear,
-                                    in: Capsule())
                     }
-                    .accessibilityLabel("投屏设置")
-                    .popover(isPresented: $showPresentationPopover) {
-                        PresentationPopover(presentation: presentation)
+                    .padding(.vertical, 1)
+                }
+                .onChange(of: tabManager.activeTabID) { _, newID in
+                    guard let newID else { return }
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(newID, anchor: .center)
                     }
                 }
             }
+            .frame(maxWidth: .infinity)
+
+            HStack(spacing: 6) {
+                if let activeTab = tabManager.activeTab {
+                    ActiveTabTrailingControls(session: activeTab.session)
+                }
+                if presentation.isExternalDisplayConnected {
+                    Button {
+                        presentation.isFrozen.toggle()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: presentation.isFrozen ? "snowflake" : "pause.circle")
+                            Text(presentation.isFrozen ? "已冻结" : "冻结")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .foregroundStyle(presentation.isFrozen ? Color.white : Color.primary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(presentation.isFrozen ? Color.orange : Color.secondary.opacity(0.16),
+                                    in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(presentation.isFrozen ? "取消冻结大屏" : "冻结大屏画面")
+                }
+                Button {
+                    presentation.scanDisplays()
+                    showPresentationPopover = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "airplayvideo")
+                        if presentation.isExternalDisplayConnected {
+                            Text(presentation.contentOnly ? "投屏中" : "镜像中")
+                                .font(.caption.weight(.medium))
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(presentation.isExternalDisplayConnected ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.12),
+                                in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("投屏设置")
+                .popover(isPresented: $showPresentationPopover) {
+                    PresentationPopover(presentation: presentation)
+                }
+            }
         }
-        .onDisappear { session.saveNow() }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemBackground))
+    }
+}
+
+private struct DocumentTabPill: View {
+    @ObservedObject var tab: DocumentTab
+    let isActive: Bool
+    let onSelect: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button(action: onSelect) {
+                HStack(spacing: 5) {
+                    Image(systemName: tab.meta.layout == .live ? "doc.richtext" : "doc.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(tab.meta.layout == .live ? Color.accentColor : Color.red.opacity(0.85))
+                    Text(tab.meta.title)
+                        .font(.subheadline.weight(isActive ? .semibold : .regular))
+                        .foregroundStyle(isActive ? Color.primary : Color.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: isActive ? 175 : 145, alignment: .leading)
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, 2)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+                    .background(Color.secondary.opacity(isActive ? 0.14 : 0.08), in: Circle())
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 5)
+            .accessibilityLabel("关闭标签页 \(tab.meta.title)")
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(isActive ? Color(.systemBackground) : Color(.tertiarySystemFill).opacity(0.65))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .stroke(isActive ? Color.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
+        )
+        .shadow(color: isActive ? Color.black.opacity(0.08) : Color.clear, radius: 3, y: 1)
+    }
+}
+
+/// Observes the active tab's `DocumentSession` directly so page numbers & clear options update live.
+private struct ActiveTabTrailingControls: View {
+    @ObservedObject var session: DocumentSession
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if session.pdfPageCount > 1 {
+                Text("\(session.activeDocumentPageIndex + 1)/\(session.pdfPageCount)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                    .accessibilityLabel("第 \(session.activeDocumentPageIndex + 1) 页，共 \(session.pdfPageCount) 页")
+            }
+            clearMenu
+        }
     }
 
     private var clearMenu: some View {
@@ -147,19 +302,131 @@ struct EditorView: View {
                     .font(.caption.weight(.medium))
             }
             .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .padding(.vertical, 5)
             .background(Color.secondary.opacity(0.14), in: Capsule())
         }
         .accessibilityLabel("清空手写")
     }
+}
 
-    @ViewBuilder
-    private var editor: some View {
-        if session.meta.layout == .live {
-            WebEditorRepresentable(session: session, library: library)
-        } else {
-            EditorRepresentable(session: session)
+private struct QuickOpenDocumentPopover: View {
+    @ObservedObject var library: LibraryStore
+    @ObservedObject var tabManager: TabManager
+    let dismiss: () -> Void
+    let onImportPDF: () -> Void
+    let onImportHTML: () -> Void
+    let onImportURL: () -> Void
+
+    @State private var query = ""
+
+    private var filteredDocuments: [DocumentMeta] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return library.documents }
+        return library.documents.filter { $0.title.localizedCaseInsensitiveContains(trimmed) }
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("打开文档到新标签页")
+                    .font(.headline)
+                Spacer()
+            }
+
+            HStack(spacing: 8) {
+                Button(action: onImportPDF) {
+                    Label("导入 PDF", systemImage: "doc.fill")
+                        .font(.caption.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                Button(action: onImportHTML) {
+                    Label("导入 HTML", systemImage: "doc.badge.plus")
+                        .font(.caption.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                Button(action: onImportURL) {
+                    Label("网址", systemImage: "globe")
+                        .font(.caption.weight(.medium))
+                }
+                .buttonStyle(.bordered)
+            }
+
+            if library.documents.count > 4 {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("搜索文档名称…", text: $query)
+                        .textFieldStyle(.plain)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            Divider()
+
+            if filteredDocuments.isEmpty {
+                Text("没有匹配的文档")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 80)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 4) {
+                        ForEach(filteredDocuments) { meta in
+                            let isCurrent = tabManager.activeTabID == meta.id
+                            let isOpened = tabManager.isOpen(meta.id)
+                            Button {
+                                tabManager.open(meta, library: library)
+                                dismiss()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: meta.layout == .live ? "doc.richtext" : "doc.fill")
+                                        .foregroundStyle(meta.layout == .live ? Color.accentColor : Color.red.opacity(0.85))
+                                        .frame(width: 20)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(meta.title)
+                                            .font(.subheadline.weight(isCurrent ? .semibold : .regular))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                        Text(meta.layout.displayName)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if isCurrent {
+                                        Text("当前")
+                                            .font(.caption2.weight(.semibold))
+                                            .foregroundStyle(.white)
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 2)
+                                            .background(Color.accentColor, in: Capsule())
+                                    } else if isOpened {
+                                        Text("已打开")
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundStyle(Color.accentColor)
+                                            .padding(.horizontal, 7)
+                                            .padding(.vertical, 2)
+                                            .background(Color.accentColor.opacity(0.14), in: Capsule())
+                                    }
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 8)
+                                .background(isCurrent ? Color.accentColor.opacity(0.08) : Color.clear,
+                                            in: RoundedRectangle(cornerRadius: 8))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+                .frame(maxHeight: 320)
+            }
         }
+        .padding(14)
+        .frame(width: 340)
     }
 }
 
@@ -173,7 +440,7 @@ private struct PresentationPopover: View {
 
             Toggle("投屏仅显示内容", isOn: $presentation.contentOnly)
 
-            Text("开启后，外接屏幕（如 OfflineMirror / AirPlay）只显示工具栏下方的文档与批注内容，工具栏仅在 iPad 上显示。")
+            Text("开启后，外接屏幕（如 OfflineMirror / AirPlay）只显示工具栏下方的文档与批注内容，标签栏与工具栏仅在 iPad 上显示。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -189,7 +456,7 @@ private struct PresentationPopover: View {
 
             if presentation.isExternalDisplayConnected {
                 Toggle("冻结大屏画面", isOn: $presentation.isFrozen)
-                Text("冻结后学生端大屏保持当前题目不变，你可以在 iPad 上自由翻页看答案或下一题，关闭后立即恢复同步。")
+                Text("冻结后学生端大屏保持当前题目不变，你可以在 iPad 上自由切换标签页或翻页看答案，关闭后立即恢复同步。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -220,23 +487,31 @@ private struct PresentationPopover: View {
     }
 }
 
-private struct WebEditorRepresentable: UIViewControllerRepresentable {
-    let session: DocumentSession
+private struct TabDeckRepresentable: UIViewControllerRepresentable {
+    @ObservedObject var tabManager: TabManager
     let library: LibraryStore
 
-    func makeUIViewController(context: Context) -> WebEditorViewController {
-        WebEditorViewController(session: session, library: library)
+    func makeUIViewController(context: Context) -> TabDeckViewController {
+        let controller = TabDeckViewController()
+        tabManager.onFlushTabState = { [weak controller] id in
+            controller?.flushTabState(for: id)
+        }
+        return controller
     }
 
-    func updateUIViewController(_ uiViewController: WebEditorViewController, context: Context) {}
-}
-
-private struct EditorRepresentable: UIViewControllerRepresentable {
-    let session: DocumentSession
-
-    func makeUIViewController(context: Context) -> EditorViewController {
-        EditorViewController(session: session)
+    func updateUIViewController(_ uiViewController: TabDeckViewController, context: Context) {
+        tabManager.onFlushTabState = { [weak uiViewController] id in
+            uiViewController?.flushTabState(for: id)
+        }
+        uiViewController.sync(
+            tabs: tabManager.tabs,
+            activeTabID: tabManager.activeTabID,
+            isWorkspaceVisible: tabManager.isWorkspaceVisible,
+            library: library
+        )
     }
 
-    func updateUIViewController(_ uiViewController: EditorViewController, context: Context) {}
+    static func dismantleUIViewController(_ uiViewController: TabDeckViewController, coordinator: ()) {
+        uiViewController.teardownAllTabs()
+    }
 }

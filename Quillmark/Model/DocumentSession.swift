@@ -50,6 +50,7 @@ final class DocumentSession: ObservableObject {
         }
     }
     var savedScratchpadFrame: CGRect? { annotations.scratchpadFrame }
+    var savedViewport: ViewportState? { annotations.viewport }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
     /// Zero-based currently visible main page index (used by multi-page PDF documents).
@@ -174,6 +175,39 @@ final class DocumentSession: ObservableObject {
         guard annotations.scratchpadFrame != frame else { return }
         annotations.scratchpadFrame = frame
         scheduleSave()
+    }
+
+    func updateViewport(_ viewport: ViewportState) {
+        guard viewport.isValid else { return }
+        if let existing = annotations.viewport, existing.isApproximatelyEqual(to: viewport) {
+            return
+        }
+        annotations.viewport = viewport
+        scheduleSave()
+    }
+
+    /// Reloads annotations from disk (e.g. after clearing ink from the Library while a tab stays open).
+    func reloadAnnotationsFromDisk() {
+        saveWork?.cancel()
+        saveWork = nil
+        hasUnsavedChanges = false
+        let loaded = library.loadAnnotations(for: meta.id)
+        annotations = loaded
+        scratchpadPageCount = loaded.resolvedScratchpadPageCount
+        if scratchpadPageIndex >= scratchpadPageCount {
+            scratchpadPageIndex = max(0, scratchpadPageCount - 1)
+        }
+        if let paper = loaded.scratchpadPaper {
+            scratchpadPaper = paper
+        }
+        undoStack.removeAll()
+        redoStack.removeAll()
+        updateFlags()
+        if let allPagesDidChange {
+            allPagesDidChange()
+        } else {
+            pageDidChange?(0)
+        }
     }
 
     func selectScratchpadPage(_ index: Int) {

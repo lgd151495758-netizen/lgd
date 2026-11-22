@@ -5,9 +5,14 @@ import WebKit
 /// Annotates a live web page. Fingers use the page normally (tap buttons, expand sections,
 /// scroll, zoom, tap cover tapes to reveal/hide); Apple Pencil writes, highlights, places cover
 /// tapes, uses the laser pointer, or erases. Strokes are anchored to page elements by `WebInkBridge`.
-final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavigationDelegate,
+final class WebEditorViewController: UIViewController, DocumentTabViewController, InkInputDelegate, WKNavigationDelegate,
     UIScribbleInteractionDelegate, UIGestureRecognizerDelegate {
     let session: DocumentSession
+    var isManagedByTabDeck: Bool = false
+    private var isTabActive: Bool = true
+    private var hasRestoredViewport: Bool = false
+    private var isRestoringViewport: Bool = false
+    private let pencilInteraction = UIPencilInteraction()
     private let library: LibraryStore
     private let bridge = WebInkBridge()
     private var webView: WKWebView { bridge.webView }
@@ -260,13 +265,13 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         inkRecognizer.cancelsTouchesInView = true
         view.addGestureRecognizer(inkRecognizer)
 
-        let pencilInteraction = UIPencilInteraction()
         pencilInteraction.delegate = self
         view.addInteraction(pencilInteraction)
 
         bridge.onReady = { [weak self] in
             self?.applyGestureRules()
             self?.pushStrokes()
+            self?.restoreSavedViewportIfNeeded()
         }
         bridge.onPlacementsChanged = { [weak self] in
             self?.refreshSelectedShapeOverlay()
@@ -381,12 +386,14 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
+                self?.recordCurrentViewport()
             }
             .store(in: &cancellables)
         webView.scrollView.publisher(for: \.zoomScale)
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
+                self?.recordCurrentViewport()
             }
             .store(in: &cancellables)
 
@@ -453,6 +460,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        guard !isManagedByTabDeck else { return }
         PresentationCenter.shared.registerSceneAccessory(on: self)
         PresentationCenter.shared.setContentSource(self)
     }
@@ -462,9 +470,89 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
         stopLaserLoop()
         holdTimer?.cancel()
         scratchpadPanel.canvas.deactivate()
+        saveStateNow()
+        guard !isManagedByTabDeck else { return }
         PresentationCenter.shared.clearContentSource(self)
         PresentationCenter.shared.unregisterSceneAccessory(from: self)
-        saveThumbnail()
+    }
+
+    // MARK: DocumentTabViewController & Viewport Persistence
+
+    func setTabActive(_ active: Bool, releasePresentation: Bool) {
+        isTabActive = active
+        pencilInteraction.isEnabled = active
+        if active {
+            updatePresentationViewport(focusY: nil)
+            PresentationCenter.shared.setContentSource(self)
+            pushPresentationOverlay()
+        } else {
+            stopLaserLoop()
+            laserEngine.cancel()
+            laserFrame = .empty
+            holdTimer?.cancel()
+            holdTimer = nil
+            scratchpadPanel.canvas.deactivate()
+            scratchpadLiveOverlay = nil
+            if releasePresentation {
+                PresentationCenter.shared.clearContentSource(self)
+            }
+        }
+    }
+
+    func saveStateNow() {
+        recordCurrentViewport()
+        session.saveNow()
+        if isTabActive, !view.isHidden, webView.bounds.width > 0 {
+            saveThumbnail()
+        }
+    }
+
+    private func recordCurrentViewport() {
+        guard hasRestoredViewport, !isRestoringViewport,
+              webView.bounds.width > 0, webView.scrollView.contentSize.height > 0 else { return }
+        let sv = webView.scrollView
+        session.updateViewport(ViewportState(
+            offsetX: sv.contentOffset.x,
+            offsetY: sv.contentOffset.y,
+            zoomScale: sv.zoomScale,
+            pageIndex: nil
+        ))
+    }
+
+    private func restoreSavedViewportIfNeeded() {
+        guard !hasRestoredViewport, !isRestoringViewport else { return }
+        guard let saved = session.savedViewport, saved.isValid else {
+            hasRestoredViewport = true
+            return
+        }
+        isRestoringViewport = true
+        applySavedViewport(saved, allowRetry: true)
+    }
+
+    private func applySavedViewport(_ saved: ViewportState, allowRetry: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (allowRetry ? 0.12 : 0.30)) { [weak self] in
+            guard let self else { return }
+            let sv = self.webView.scrollView
+            if saved.zoomScale > 0, sv.maximumZoomScale >= sv.minimumZoomScale {
+                let clampedZoom = min(max(saved.zoomScale, sv.minimumZoomScale), sv.maximumZoomScale)
+                if abs(sv.zoomScale - clampedZoom) > 0.01 {
+                    sv.setZoomScale(clampedZoom, animated: false)
+                }
+            }
+            let clamped = ViewportState.clampedOffset(
+                CGPoint(x: saved.offsetX, y: saved.offsetY),
+                contentSize: sv.contentSize,
+                boundsSize: sv.bounds.size
+            )
+            sv.setContentOffset(clamped, animated: false)
+            let maxY = max(0, sv.contentSize.height - sv.bounds.height)
+            if allowRetry, saved.offsetY > 12, maxY < saved.offsetY * 0.85 {
+                self.applySavedViewport(saved, allowRetry: false)
+            } else {
+                self.isRestoringViewport = false
+                self.hasRestoredViewport = true
+            }
+        }
     }
 
     // MARK: Loading
@@ -531,6 +619,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         applyGestureRules()
+        restoreSavedViewportIfNeeded()
     }
 
     /// The document stays on its page: links to other pages open in Safari, in-page anchors
@@ -2356,7 +2445,7 @@ final class WebEditorViewController: UIViewController, InkInputDelegate, WKNavig
     // MARK: Presentation Overlay & Viewport
 
     private func pushPresentationOverlay() {
-        guard PresentationCenter.shared.isShowingContentOnly else { return }
+        guard isTabActive, PresentationCenter.shared.isShowingContentOnly else { return }
         let captureRect = presentationViewport.captureRect.width > 0 ? presentationViewport.captureRect : view.bounds
 
         // When the sticky note is actively receiving live input (or open full-screen), project its live ink.

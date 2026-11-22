@@ -301,6 +301,35 @@ struct PageAnnotations: Codable, Equatable {
     var strokes: [InkStroke] = []
 }
 
+/// Persisted scroll position, zoom scale, and active PDF page for a document so switching tabs
+/// or reopening the document later restores the exact viewing position.
+struct ViewportState: Codable, Equatable {
+    var offsetX: CGFloat
+    var offsetY: CGFloat
+    var zoomScale: CGFloat
+    var pageIndex: Int?
+
+    var isValid: Bool {
+        offsetX.isFinite && offsetY.isFinite && zoomScale.isFinite && zoomScale > 0
+    }
+
+    func isApproximatelyEqual(to other: ViewportState) -> Bool {
+        abs(offsetX - other.offsetX) < 1.0
+            && abs(offsetY - other.offsetY) < 1.0
+            && abs(zoomScale - other.zoomScale) < 0.01
+            && pageIndex == other.pageIndex
+    }
+
+    /// Clamps a saved content offset safely within the current scrollable content bounds.
+    static func clampedOffset(_ offset: CGPoint, contentSize: CGSize, boundsSize: CGSize) -> CGPoint {
+        let maxX = max(0, contentSize.width - boundsSize.width)
+        let maxY = max(0, contentSize.height - boundsSize.height)
+        let x = offset.x.isFinite ? min(max(0, offset.x), maxX) : 0
+        let y = offset.y.isFinite ? min(max(0, offset.y), maxY) : 0
+        return CGPoint(x: x, y: y)
+    }
+}
+
 struct DocumentAnnotations: Codable, Equatable {
     var version: Int = 1
     /// Keyed by zero-based page index as a string, so the JSON stays a plain object.
@@ -311,6 +340,8 @@ struct DocumentAnnotations: Codable, Equatable {
     var scratchpadPaper: ScratchpadPaperStyle?
     /// Last floating position & size of this document's sticky note.
     var scratchpadFrame: CGRect?
+    /// Last scroll offset, zoom scale, and PDF page index for reopening at the previous position.
+    var viewport: ViewportState?
 
     /// Negative page indices (`-1, -2, ...`) map to zero-based scratchpad pages (`0, 1, ...`).
     static func scratchpadPageID(_ scratchpadIndex: Int) -> Int {

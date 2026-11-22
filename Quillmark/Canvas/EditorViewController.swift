@@ -8,10 +8,15 @@ import UIKit
 /// intersection snap, Cover Tape (finger tap reveal/hide + cover/reveal all), Trail Laser Pointer,
 /// Precise/Stroke Eraser, freely movable & resizable Floating Sticky Note, Scribble suppression,
 /// and 60fps borderless external display projection + Freeze.
-final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, InkInputDelegate,
+final class EditorViewController: UIViewController, DocumentTabViewController, PDFPageOverlayViewProvider, InkInputDelegate,
     UIScribbleInteractionDelegate, UIGestureRecognizerDelegate {
 
     let session: DocumentSession
+    var isManagedByTabDeck: Bool = false
+    private var isTabActive: Bool = true
+    private var hasRestoredViewport: Bool = false
+    private var isRestoringViewport: Bool = false
+    private let pencilInteraction = UIPencilInteraction()
     let pdfView = PDFView()
     private var overlays: [Int: PageInkView] = [:]
     private var cancellables = Set<AnyCancellable>()
@@ -270,7 +275,6 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, 
         tapeTapRecognizer.addTarget(self, action: #selector(handleFingerTap(_:)))
         view.addGestureRecognizer(tapeTapRecognizer)
 
-        let pencilInteraction = UIPencilInteraction()
         pencilInteraction.delegate = self
         view.addInteraction(pencilInteraction)
 
@@ -393,12 +397,14 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, 
                 self?.updateActiveDocumentPageIndex()
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
+                self?.recordCurrentViewport()
             }
             .store(in: &cancellables)
         NotificationCenter.default.publisher(for: .PDFViewScaleChanged, object: pdfView)
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
+                self?.recordCurrentViewport()
             }
             .store(in: &cancellables)
         attachScrollViewObserversIfNeeded()
@@ -411,12 +417,14 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, 
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
+                self?.recordCurrentViewport()
             }
             .store(in: &cancellables)
         scrollView.publisher(for: \.zoomScale)
             .sink { [weak self] _ in
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
+                self?.recordCurrentViewport()
             }
             .store(in: &cancellables)
     }
@@ -448,10 +456,14 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, 
         refreshSelectedShapeOverlay()
         refreshLassoSelectionOverlay()
         applyGestureRules()
+        if pdfView.bounds.width > 0, pdfView.bounds.height > 0 {
+            restoreSavedViewportIfNeeded()
+        }
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        guard !isManagedByTabDeck else { return }
         PresentationCenter.shared.registerSceneAccessory(on: self)
         PresentationCenter.shared.setContentSource(self)
     }
@@ -461,8 +473,86 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, 
         stopLaserLoop()
         holdTimer?.cancel()
         scratchpadPanel.canvas.deactivate()
+        saveStateNow()
+        guard !isManagedByTabDeck else { return }
         PresentationCenter.shared.clearContentSource(self)
         PresentationCenter.shared.unregisterSceneAccessory(from: self)
+    }
+
+    // MARK: DocumentTabViewController & Viewport Persistence
+
+    func setTabActive(_ active: Bool, releasePresentation: Bool) {
+        isTabActive = active
+        pencilInteraction.isEnabled = active
+        if active {
+            updatePresentationViewport(focusY: nil)
+            PresentationCenter.shared.setContentSource(self)
+            pushPresentationOverlay()
+        } else {
+            stopLaserLoop()
+            laserEngine.cancel()
+            laserFrame = .empty
+            holdTimer?.cancel()
+            holdTimer = nil
+            scratchpadPanel.canvas.deactivate()
+            scratchpadLiveOverlay = nil
+            if releasePresentation {
+                PresentationCenter.shared.clearContentSource(self)
+            }
+        }
+    }
+
+    func saveStateNow() {
+        recordCurrentViewport()
+        session.saveNow()
+    }
+
+    private func recordCurrentViewport() {
+        guard hasRestoredViewport, !isRestoringViewport, pdfView.bounds.width > 0 else { return }
+        guard let sv = pdfView.firstDescendant(of: UIScrollView.self), sv.contentSize.height > 0 else { return }
+        session.updateViewport(ViewportState(
+            offsetX: sv.contentOffset.x,
+            offsetY: sv.contentOffset.y,
+            zoomScale: pdfView.scaleFactor,
+            pageIndex: session.activeDocumentPageIndex
+        ))
+    }
+
+    private func restoreSavedViewportIfNeeded() {
+        guard !hasRestoredViewport, !isRestoringViewport else { return }
+        guard let saved = session.savedViewport, saved.isValid else {
+            hasRestoredViewport = true
+            return
+        }
+        isRestoringViewport = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self else { return }
+            if saved.zoomScale > 0 {
+                let minScale = self.pdfView.minScaleFactor
+                let maxScale = self.pdfView.maxScaleFactor
+                if minScale > 0, maxScale >= minScale {
+                    let clampedZoom = min(max(saved.zoomScale, minScale), maxScale)
+                    if abs(self.pdfView.scaleFactor - clampedZoom) > 0.015 {
+                        self.pdfView.scaleFactor = clampedZoom
+                    }
+                }
+            }
+            if let sv = self.pdfView.firstDescendant(of: UIScrollView.self),
+               sv.contentSize.height > 0 {
+                let clamped = ViewportState.clampedOffset(
+                    CGPoint(x: saved.offsetX, y: saved.offsetY),
+                    contentSize: sv.contentSize,
+                    boundsSize: sv.bounds.size
+                )
+                sv.setContentOffset(clamped, animated: false)
+            } else if let pageIdx = saved.pageIndex,
+                      let page = self.pdfView.document?.page(at: pageIdx) {
+                self.pdfView.go(to: page)
+            }
+            self.isRestoringViewport = false
+            self.hasRestoredViewport = true
+            self.updateActiveDocumentPageIndex()
+        }
     }
 
     // MARK: Sticky Note & Geometry Aid Routing
@@ -2216,7 +2306,7 @@ final class EditorViewController: UIViewController, PDFPageOverlayViewProvider, 
     // MARK: Presentation Overlay & Viewport
 
     private func pushPresentationOverlay() {
-        guard PresentationCenter.shared.isShowingContentOnly else { return }
+        guard isTabActive, PresentationCenter.shared.isShowingContentOnly else { return }
         let captureRect = presentationViewport.captureRect.width > 0 ? presentationViewport.captureRect : view.bounds
 
         // Sticky note active live ink takes priority when open.

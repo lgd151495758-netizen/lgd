@@ -4,13 +4,13 @@ import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
+    @StateObject private var tabManager = TabManager()
 
     private struct PendingClear {
         let meta: DocumentMeta
         let keepTapes: Bool
     }
 
-    @State private var path: [DocumentMeta] = []
     @State private var showPDFImporter = false
     @State private var showHTMLImporter = false
     @State private var showURLPrompt = false
@@ -22,26 +22,60 @@ struct LibraryView: View {
     private let columns = [GridItem(.adaptive(minimum: 170, maximum: 230), spacing: 24)]
 
     var body: some View {
-        NavigationStack(path: $path) {
-            content
-                .navigationTitle("羽签")
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) { importMenu }
-                }
-                .navigationDestination(for: DocumentMeta.self) { meta in
-                    EditorView(meta: meta, library: library)
-                }
-                .fileImporter(isPresented: $showHTMLImporter, allowedContentTypes: [.html, .folder]) { result in
-                    switch result {
-                    case .success(let url): startImport(.file(url))
-                    case .failure(let error): errorMessage = error.localizedDescription
+        ZStack {
+            NavigationStack {
+                content
+                    .navigationTitle("羽签")
+                    .toolbar {
+                        ToolbarItem(placement: .primaryAction) {
+                            HStack(spacing: 10) {
+                                if !tabManager.tabs.isEmpty {
+                                    Button {
+                                        tabManager.showWorkspace()
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            Image(systemName: "rectangle.stack")
+                                            Text("返回文档 (\(tabManager.tabs.count))")
+                                                .font(.subheadline.weight(.medium))
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Color.accentColor.opacity(0.16), in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("返回已打开的文档标签页")
+                                }
+                                importMenu
+                            }
+                        }
                     }
+                    .fileImporter(isPresented: $showHTMLImporter, allowedContentTypes: [.html, .folder]) { result in
+                        switch result {
+                        case .success(let url): startImport(.file(url))
+                        case .failure(let error): errorMessage = error.localizedDescription
+                        }
+                    }
+            }
+            .fileImporter(isPresented: $showPDFImporter, allowedContentTypes: [.pdf]) { result in
+                switch result {
+                case .success(let url): startImport(.file(url))
+                case .failure(let error): errorMessage = error.localizedDescription
                 }
-        }
-        .fileImporter(isPresented: $showPDFImporter, allowedContentTypes: [.pdf]) { result in
-            switch result {
-            case .success(let url): startImport(.file(url))
-            case .failure(let error): errorMessage = error.localizedDescription
+            }
+
+            if !tabManager.tabs.isEmpty {
+                WorkspaceView(
+                    tabManager: tabManager,
+                    library: library,
+                    onImportPDF: { showPDFImporter = true },
+                    onImportHTML: { showHTMLImporter = true },
+                    onImportURL: {
+                        urlText = ""
+                        showURLPrompt = true
+                    }
+                )
+                .opacity(tabManager.isWorkspaceVisible ? 1 : 0)
+                .allowsHitTesting(tabManager.isWorkspaceVisible)
             }
         }
         .alert("打开网址", isPresented: $showURLPrompt) {
@@ -70,6 +104,7 @@ struct LibraryView: View {
             Button("清空", role: .destructive) {
                 if let target = pendingClear {
                     library.clearInk(for: target.meta.id, keepTapes: target.keepTapes)
+                    tabManager.reloadFromDisk(id: target.meta.id)
                     pendingClear = nil
                 }
             }
@@ -92,6 +127,9 @@ struct LibraryView: View {
             guard let url else { return }
             library.pendingImportURL = nil
             startImport(.file(url))
+        }
+        .onChange(of: library.documents) { _, docs in
+            tabManager.syncMetadata(from: docs)
         }
     }
 
@@ -116,12 +154,23 @@ struct LibraryView: View {
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 28) {
                     ForEach(library.documents) { meta in
-                        NavigationLink(value: meta) {
-                            DocumentCard(meta: meta, pdfURL: library.pdfURL(for: meta.id),
+                        Button {
+                            tabManager.open(meta, library: library)
+                        } label: {
+                            DocumentCard(meta: meta,
+                                         isOpenInTab: tabManager.isOpen(meta.id),
+                                         pdfURL: library.pdfURL(for: meta.id),
                                          thumbnailURL: library.thumbnailURL(for: meta.id))
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
+                            Button {
+                                tabManager.open(meta, library: library)
+                            } label: {
+                                Label(tabManager.isOpen(meta.id) ? "切换到此标签页" : "在新标签页打开",
+                                      systemImage: "rectangle.badge.plus")
+                            }
+                            Divider()
                             Button {
                                 pendingClear = PendingClear(meta: meta, keepTapes: true)
                             } label: {
@@ -139,6 +188,7 @@ struct LibraryView: View {
                             }
                             Divider()
                             Button(role: .destructive) {
+                                tabManager.closeTab(id: meta.id)
                                 library.delete(meta.id)
                             } label: {
                                 Label("删除", systemImage: "trash")
@@ -211,11 +261,7 @@ struct LibraryView: View {
             defer { isImporting = false }
             do {
                 let meta = try await HTMLImportService.importDocument(from: source, into: library)
-                if path.isEmpty {
-                    path.append(meta)
-                } else {
-                    path = [meta]
-                }
+                tabManager.open(meta, library: library)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -225,25 +271,37 @@ struct LibraryView: View {
 
 private struct DocumentCard: View {
     let meta: DocumentMeta
+    let isOpenInTab: Bool
     let pdfURL: URL
     let thumbnailURL: URL
     @State private var thumbnail: UIImage?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(.secondarySystemBackground))
-                if let thumbnail {
-                    Image(uiImage: thumbnail)
-                        .resizable()
-                        .scaledToFit()
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+            ZStack(alignment: .topTrailing) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(Color(.secondarySystemBackground))
+                    if let thumbnail {
+                        Image(uiImage: thumbnail)
+                            .resizable()
+                            .scaledToFit()
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                            .padding(8)
+                    } else {
+                        Image(systemName: meta.layout == .pdf ? "doc.fill" : "doc.richtext")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if isOpenInTab {
+                    Text("已打开")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor, in: Capsule())
                         .padding(8)
-                } else {
-                    Image(systemName: meta.layout == .pdf ? "doc.fill" : "doc.richtext")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
                 }
             }
             .aspectRatio(0.75, contentMode: .fit)
