@@ -361,4 +361,39 @@ final class EfficiencyAndStabilityTests: XCTestCase {
         stressCache.prune(keeping: Set(working.map(\.id)))
         XCTAssertLessThan(elapsed, 2.0, "80 precise-erase sweeps on 120 strokes must finish briskly")
     }
+
+    // MARK: 7. Viewing-Only Does Not Bump `modifiedAt` (Real Ink Required)
+
+    func testViewingScrollingAndTapeToggleDoNotBumpModifiedAtUntilInkIsDrawn() throws {
+        let olderDoc = try library.createDocument(title: "旧试卷", pdfData: makePDFData(pageCount: 3),
+                                                  layout: .pdf, sourceKind: .pdfFile, sourceURL: "old.pdf", stagedSource: nil)
+        Thread.sleep(forTimeInterval: 0.05)
+        let newerDoc = try library.createDocument(title: "新讲义", pdfData: makePDFData(pageCount: 2),
+                                                  layout: .pdf, sourceKind: .pdfFile, sourceURL: "new.pdf", stagedSource: nil)
+        XCTAssertEqual(library.documents.first?.id, newerDoc.id)
+        let originalOlderModifiedAt = try XCTUnwrap(library.documents.first(where: { $0.id == olderDoc.id })?.modifiedAt)
+
+        // Open olderDoc and ONLY view it: scroll viewport, resize sticky note, switch paper style, save.
+        let session = DocumentSession(meta: olderDoc, library: library, tool: ToolSettings())
+        session.updateViewport(ViewportState(offsetX: 0, offsetY: 650, zoomScale: 1.25, pageIndex: 2))
+        session.setScratchpadFrame(CGRect(x: 40, y: 60, width: 320, height: 260))
+        session.scratchpadPaper = .dot
+        session.saveNow()
+
+        // Viewport must be persisted on disk, while `modifiedAt` and Library ordering stay UNCHANGED!
+        let savedViewport = library.loadAnnotations(for: olderDoc.id).viewport
+        XCTAssertEqual(savedViewport?.pageIndex, 2)
+        XCTAssertEqual(library.documents.first?.id, newerDoc.id, "just viewing olderDoc must not bump it above newerDoc")
+        let afterViewingModifiedAt = try XCTUnwrap(library.documents.first(where: { $0.id == olderDoc.id })?.modifiedAt)
+        XCTAssertEqual(afterViewingModifiedAt, originalOlderModifiedAt)
+
+        // Now actually draw an ink stroke on olderDoc -> `modifiedAt` updates and olderDoc becomes latest!
+        Thread.sleep(forTimeInterval: 0.05)
+        session.addStroke(makeStroke(y: 120), page: 0)
+        session.saveNow()
+
+        XCTAssertEqual(library.documents.first?.id, olderDoc.id, "real handwriting must update modifiedAt to top")
+        let afterInkModifiedAt = try XCTUnwrap(library.documents.first(where: { $0.id == olderDoc.id })?.modifiedAt)
+        XCTAssertGreaterThan(afterInkModifiedAt, originalOlderModifiedAt)
+    }
 }

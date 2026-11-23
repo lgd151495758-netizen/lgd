@@ -16,37 +16,71 @@ struct LaserRenderFrame {
     static let empty = LaserRenderFrame()
 }
 
-/// Time-based laser trail engine: keeps the full glowing trail visible while the pen touches the
-/// screen, then smoothly fades it away once the pen lifts. Renders identically on iPad and the
-/// external presentation display.
+/// Multi-stroke classroom laser pointer engine:
+/// - Supports circling or underlining multiple separate places in sequence even when the pen tip
+///   lifts between strokes (accumulates disconnected strokes while the previous laser marks remain
+///   visible).
+/// - After lifting the pen, keeps all marks at full 100% brightness for `liftHoldDuration` (1.6s),
+///   then smoothly fades out over `liftFadeDuration` (0.9s).
+/// - Touching & holding the pen tip down anywhere on the screen revives and locks all visible laser
+///   marks at 100% brightness indefinitely until the teacher lifts the pen again.
+/// - Renders identically on iPad and the 60fps external presentation display.
 final class LaserPointerEngine {
-    /// Duration of the smooth fade-out after the pen leaves the screen.
-    static let liftFadeDuration: TimeInterval = 0.45
+    /// Full-brightness dwell window after lifting the pen so the teacher can circle multiple areas.
+    static let liftHoldDuration: TimeInterval = 1.6
+    /// Smooth fade-out duration following `liftHoldDuration`.
+    static let liftFadeDuration: TimeInterval = 0.9
+    /// Total time from pen lift until marks fully clear.
+    static var totalLiftDuration: TimeInterval { liftHoldDuration + liftFadeDuration }
     static let trailGlowRadius: CGFloat = 4.2
     static let trailCoreRadius: CGFloat = 1.7
 
     private(set) var color: RGBAColor = ToolSettings.laserPalette[0]
-    private(set) var samples: [LaserSample] = []
+    /// Disconnected laser strokes currently visible on screen.
+    private(set) var strokes: [[LaserSample]] = []
     private(set) var isTouching = false
     private var endedAt: TimeInterval?
 
+    /// Flattened samples across all active strokes (kept for compatibility and inspection).
+    var samples: [LaserSample] {
+        strokes.flatMap { $0 }
+    }
+
     var isActive: Bool {
-        isTouching || !samples.isEmpty
+        isTouching || !strokes.isEmpty
     }
 
     func begin(at point: CGPoint, color: RGBAColor, now: TimeInterval) {
+        let shouldChain: Bool
+        if strokes.isEmpty {
+            shouldChain = false
+        } else if isTouching {
+            shouldChain = true
+        } else if let endedAt {
+            shouldChain = (now - endedAt) < Self.totalLiftDuration
+        } else {
+            shouldChain = true
+        }
+
         self.color = color
         self.isTouching = true
         self.endedAt = nil
-        samples = [LaserSample(point: point, time: now)]
+
+        let newStroke = [LaserSample(point: point, time: now)]
+        if shouldChain {
+            strokes.append(newStroke)
+        } else {
+            strokes = [newStroke]
+        }
     }
 
     func move(to point: CGPoint, now: TimeInterval) {
-        guard isTouching else { return }
-        if let last = samples.last, hypot(point.x - last.point.x, point.y - last.point.y) < 1.0 {
-            samples[samples.count - 1].time = now
+        guard isTouching, !strokes.isEmpty else { return }
+        let idx = strokes.count - 1
+        if let last = strokes[idx].last, hypot(point.x - last.point.x, point.y - last.point.y) < 1.0 {
+            strokes[idx][strokes[idx].count - 1].time = now
         } else {
-            samples.append(LaserSample(point: point, time: now))
+            strokes[idx].append(LaserSample(point: point, time: now))
         }
     }
 
@@ -58,33 +92,49 @@ final class LaserPointerEngine {
     func cancel() {
         isTouching = false
         endedAt = nil
-        samples.removeAll()
+        strokes.removeAll()
     }
 
-    /// Computes laser glow & core paths in view coordinates via `transform`.
-    /// While `isTouching`, the full trail remains visible at full opacity; once lifted, it fades
-    /// smoothly over `liftFadeDuration` and clears.
+    /// Computes combined glow & core paths for all active laser strokes in view coordinates.
+    /// While `isTouching`, every accumulated stroke remains at 100% opacity indefinitely.
+    /// After lifting, marks stay at 100% opacity for `liftHoldDuration`, then fade smoothly over
+    /// `liftFadeDuration` before clearing.
     func frame(at now: TimeInterval, transform: CGAffineTransform = .identity) -> LaserRenderFrame {
-        guard !samples.isEmpty else { return .empty }
+        guard !strokes.isEmpty else { return .empty }
 
         var opacity: Float = 1
         var scale: CGFloat = 1
         if !isTouching, let endedAt {
             let elapsed = max(0, now - endedAt)
-            if elapsed >= Self.liftFadeDuration {
-                samples.removeAll()
+            if elapsed >= Self.totalLiftDuration {
+                strokes.removeAll()
                 self.endedAt = nil
                 return .empty
             }
-            let remaining = 1 - elapsed / Self.liftFadeDuration
-            opacity = Float(remaining)
-            scale = CGFloat(0.55 + 0.45 * remaining)
+            if elapsed > Self.liftHoldDuration {
+                let fadeElapsed = elapsed - Self.liftHoldDuration
+                let remaining = max(0, 1 - fadeElapsed / Self.liftFadeDuration)
+                opacity = Float(remaining)
+                scale = CGFloat(0.60 + 0.40 * remaining)
+            }
         }
 
         let glowRadius = Self.trailGlowRadius * scale
         let coreRadius = Self.trailCoreRadius * scale
-        let glowSamples = samples.map { StrokeSample(point: $0.point, radius: glowRadius) }
-        let coreSamples = samples.map { StrokeSample(point: $0.point, radius: coreRadius) }
+        var glowSamples: [StrokeSample] = []
+        var coreSamples: [StrokeSample] = []
+        for (idx, stroke) in strokes.enumerated() where !stroke.isEmpty {
+            if idx > 0 && !glowSamples.isEmpty {
+                glowSamples.append(StrokeOutline.breakSample)
+                coreSamples.append(StrokeOutline.breakSample)
+            }
+            for sample in stroke {
+                glowSamples.append(StrokeSample(point: sample.point, radius: glowRadius))
+                coreSamples.append(StrokeSample(point: sample.point, radius: coreRadius))
+            }
+        }
+        guard !glowSamples.isEmpty else { return .empty }
+
         return LaserRenderFrame(
             glowPath: StrokeOutline.path(for: glowSamples, transform: transform),
             corePath: StrokeOutline.path(for: coreSamples, transform: transform),

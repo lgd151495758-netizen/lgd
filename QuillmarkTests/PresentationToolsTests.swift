@@ -500,15 +500,56 @@ final class PresentationToolsTests: XCTestCase {
         XCTAssertEqual(held.opacity, 1.0, accuracy: 0.001)
         XCTAssertEqual(engine.samples.count, 3)
 
-        // Lifting the pen starts the smooth fade-out.
+        // Lifting the pen holds full brightness during `liftHoldDuration`, then fades over `liftFadeDuration`.
         engine.end(now: 15.2)
-        let midFade = engine.frame(at: 15.2 + LaserPointerEngine.liftFadeDuration * 0.5)
+        let duringHold = engine.frame(at: 15.2 + LaserPointerEngine.liftHoldDuration * 0.5)
+        XCTAssertTrue(duringHold.isActive)
+        XCTAssertEqual(duringHold.opacity, 1.0, accuracy: 0.001)
+
+        let midFade = engine.frame(at: 15.2 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
         XCTAssertTrue(midFade.isActive)
         XCTAssertEqual(midFade.opacity, 0.5, accuracy: 0.05)
 
-        let expired = engine.frame(at: 15.2 + LaserPointerEngine.liftFadeDuration + 0.05)
+        let expired = engine.frame(at: 15.2 + LaserPointerEngine.totalLiftDuration + 0.05)
         XCTAssertFalse(expired.isActive)
         XCTAssertTrue(engine.samples.isEmpty)
+    }
+
+    func testLaserMultiStrokeChainingAndHoldToKeepAlive() {
+        let engine = LaserPointerEngine()
+        // Circle 1
+        engine.begin(at: CGPoint(x: 20, y: 20), color: ToolSettings.laserPalette[0], now: 10.0)
+        engine.move(to: CGPoint(x: 80, y: 20), now: 10.1)
+        engine.end(now: 10.2)
+
+        // Lift for 1.0s (within hold window), then circle 2 -> chains both disconnected strokes!
+        engine.begin(at: CGPoint(x: 200, y: 120), color: ToolSettings.laserPalette[0], now: 11.2)
+        engine.move(to: CGPoint(x: 260, y: 120), now: 11.3)
+        engine.end(now: 11.4)
+        XCTAssertEqual(engine.strokes.count, 2)
+
+        // Wait into fade phase (1.6s hold + 0.45s fade = 2.05s after lift -> fading at ~50%).
+        let fading = engine.frame(at: 11.4 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
+        XCTAssertTrue(fading.isActive)
+        XCTAssertLessThan(fading.opacity, 0.7)
+
+        // Press & hold pen tip on screen before expiry -> revives ALL strokes to 100% brightness indefinitely!
+        engine.begin(at: CGPoint(x: 320, y: 200), color: ToolSettings.laserPalette[0],
+                     now: 11.4 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
+        XCTAssertEqual(engine.strokes.count, 3)
+
+        // Even 10 seconds later while still holding pen on screen, all marks stay at 100% brightness.
+        let heldLong = engine.frame(at: 25.0)
+        XCTAssertTrue(heldLong.isActive)
+        XCTAssertEqual(heldLong.opacity, 1.0, accuracy: 0.001)
+
+        // Once finally lifted and totalLiftDuration passes, clears cleanly and next stroke starts fresh.
+        engine.end(now: 25.0)
+        XCTAssertFalse(engine.frame(at: 25.0 + LaserPointerEngine.totalLiftDuration + 0.1).isActive)
+        XCTAssertTrue(engine.strokes.isEmpty)
+
+        engine.begin(at: CGPoint(x: 50, y: 50), color: ToolSettings.laserPalette[0], now: 30.0)
+        XCTAssertEqual(engine.strokes.count, 1)
     }
 
     func testLaserCancelClearsImmediately() {

@@ -378,20 +378,23 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    func saveAnnotations(_ annotations: DocumentAnnotations, for id: UUID) throws {
+    func saveAnnotations(_ annotations: DocumentAnnotations, for id: UUID, markModified: Bool = true) throws {
         var toSave = annotations
         toSave.syncActiveLayerFromTopLevel()
         let url = annotationsURL(for: id)
         try ioQueue.sync {
             try Self.makeEncoder().encode(toSave).write(to: url, options: .atomic)
         }
-        touchModifiedDate(for: id)
+        if markModified {
+            touchModifiedDate(for: id)
+        }
     }
 
     /// Encodes and writes `annotations` atomically on the background serial queue, then updates
-    /// metadata timestamps on the main thread without blocking handwriting frames.
+    /// metadata timestamps on the main thread only when `markModified` is `true` (real ink edits).
     func saveAnnotationsAsync(_ annotations: DocumentAnnotations,
                               for id: UUID,
+                              markModified: Bool = true,
                               completion: ((Error?) -> Void)? = nil) {
         var snapshot = annotations
         snapshot.syncActiveLayerFromTopLevel()
@@ -406,7 +409,9 @@ final class LibraryStore: ObservableObject {
                 let data = try Self.makeEncoder().encode(snapshot)
                 try data.write(to: url, options: .atomic)
                 DispatchQueue.main.async {
-                    self?.touchModifiedDate(for: id)
+                    if markModified {
+                        self?.touchModifiedDate(for: id)
+                    }
                     completion?(nil)
                 }
             } catch {

@@ -46,7 +46,7 @@ final class DocumentSession: ObservableObject {
         didSet {
             guard scratchpadPaper != oldValue else { return }
             annotations.scratchpadPaper = scratchpadPaper
-            scheduleSave()
+            scheduleSave(contentEdited: false)
         }
     }
     var savedScratchpadFrame: CGRect? { annotations.scratchpadFrame }
@@ -88,6 +88,9 @@ final class DocumentSession: ObservableObject {
     private let library: LibraryStore
     private var saveWork: DispatchWorkItem?
     private var hasUnsavedChanges = false
+    /// Only becomes `true` when real ink/annotation/page edits occur (pure viewing/scrolling/zoom
+    /// never bumps `meta.modifiedAt` in the Library list).
+    private var hasPendingContentEdit = false
     private var saveGeneration: UInt64 = 0
     private var observers: [NSObjectProtocol] = []
     private let undoLimit = 500
@@ -146,7 +149,7 @@ final class DocumentSession: ObservableObject {
         }
         guard changed else { return }
         pageDidChange?(page)
-        scheduleSave()
+        scheduleSave(contentEdited: false)
     }
 
     /// Covers (`revealed == false`) or reveals (`revealed == true`) every tape on `page`
@@ -177,7 +180,7 @@ final class DocumentSession: ObservableObject {
         for p in changedPages {
             pageDidChange?(p)
         }
-        scheduleSave()
+        scheduleSave(contentEdited: false)
     }
 
     // MARK: Scratchpad Pages
@@ -193,7 +196,7 @@ final class DocumentSession: ObservableObject {
     func setScratchpadFrame(_ frame: CGRect) {
         guard annotations.scratchpadFrame != frame else { return }
         annotations.scratchpadFrame = frame
-        scheduleSave()
+        scheduleSave(contentEdited: false)
     }
 
     func updateViewport(_ viewport: ViewportState) {
@@ -202,7 +205,7 @@ final class DocumentSession: ObservableObject {
             return
         }
         annotations.viewport = viewport
-        scheduleSave()
+        scheduleSave(contentEdited: false)
     }
 
     /// Reloads annotations from disk (e.g. after clearing ink from the Library while a tab stays open).
@@ -210,6 +213,7 @@ final class DocumentSession: ObservableObject {
         saveWork?.cancel()
         saveWork = nil
         hasUnsavedChanges = false
+        hasPendingContentEdit = false
         let loaded = library.loadAnnotations(for: meta.id)
         annotations = loaded
         scratchpadPageCount = loaded.resolvedScratchpadPageCount
@@ -235,13 +239,13 @@ final class DocumentSession: ObservableObject {
     func switchLayer(to id: UUID) {
         guard id != activeLayerID else { return }
         guard annotations.switchToLayer(id) else { return }
-        applyLayerChange()
+        applyLayerChange(contentEdited: false)
     }
 
     @discardableResult
     func createLayer(name: String, template: DocumentAnnotations.NewLayerTemplate) -> InkLayer {
         let created = annotations.createLayer(name: name, template: template)
-        applyLayerChange()
+        applyLayerChange(contentEdited: true)
         return created
     }
 
@@ -249,15 +253,16 @@ final class DocumentSession: ObservableObject {
         guard annotations.renameLayer(id, to: newName) else { return }
         refreshPublishedLayers()
         hasUnsavedChanges = true
+        hasPendingContentEdit = true
         saveNow()
     }
 
     func deleteLayer(id: UUID) {
         guard annotations.deleteLayer(id) else { return }
-        applyLayerChange()
+        applyLayerChange(contentEdited: true)
     }
 
-    private func applyLayerChange() {
+    private func applyLayerChange(contentEdited: Bool) {
         scratchpadPageCount = annotations.resolvedScratchpadPageCount
         scratchpadPageIndex = min(max(0, scratchpadPageIndex), max(0, scratchpadPageCount - 1))
         refreshPublishedLayers()
@@ -270,6 +275,9 @@ final class DocumentSession: ObservableObject {
             pageDidChange?(0)
         }
         hasUnsavedChanges = true
+        if contentEdited {
+            hasPendingContentEdit = true
+        }
         saveNow()
     }
 
@@ -331,6 +339,7 @@ final class DocumentSession: ObservableObject {
         updateFlags()
         activeDocumentPageIndex = insertIndex
         hasUnsavedChanges = true
+        hasPendingContentEdit = true
         saveNow()
         pdfDocumentDidReload?(insertIndex)
         return insertIndex
@@ -346,7 +355,7 @@ final class DocumentSession: ObservableObject {
         let newIdx = annotations.appendScratchpadPage()
         scratchpadPageCount = annotations.resolvedScratchpadPageCount
         scratchpadPageIndex = newIdx
-        scheduleSave()
+        scheduleSave(contentEdited: false)
     }
 
     func clearCurrentScratchpadPage() {
@@ -490,7 +499,7 @@ final class DocumentSession: ObservableObject {
             return command
         }
         pageDidChange?(page)
-        scheduleSave()
+        scheduleSave(contentEdited: true)
     }
 
     func saveNow() {
@@ -501,10 +510,12 @@ final class DocumentSession: ObservableObject {
             return
         }
         saveGeneration &+= 1
+        let markModified = hasPendingContentEdit
         annotations.syncActiveLayerFromTopLevel()
         do {
-            try library.saveAnnotations(annotations, for: meta.id)
+            try library.saveAnnotations(annotations, for: meta.id, markModified: markModified)
             hasUnsavedChanges = false
+            hasPendingContentEdit = false
         } catch {
             NSLog("Quillmark: failed to save annotations: \(error)")
         }
@@ -516,9 +527,10 @@ final class DocumentSession: ObservableObject {
         guard hasUnsavedChanges else { return }
         saveGeneration &+= 1
         let targetGeneration = saveGeneration
+        let markModified = hasPendingContentEdit
         annotations.syncActiveLayerFromTopLevel()
         let snapshot = annotations
-        library.saveAnnotationsAsync(snapshot, for: meta.id) { [weak self] error in
+        library.saveAnnotationsAsync(snapshot, for: meta.id, markModified: markModified) { [weak self] error in
             guard let self else { return }
             if let error {
                 NSLog("Quillmark: background save failed: \(error)")
@@ -526,6 +538,7 @@ final class DocumentSession: ObservableObject {
             }
             if self.saveGeneration == targetGeneration {
                 self.hasUnsavedChanges = false
+                self.hasPendingContentEdit = false
             }
         }
     }
@@ -559,7 +572,7 @@ final class DocumentSession: ObservableObject {
         } else {
             pageDidChange?(0)
         }
-        scheduleSave()
+        scheduleSave(contentEdited: true)
     }
 
     private func updateFlags() {
@@ -567,8 +580,11 @@ final class DocumentSession: ObservableObject {
         canRedo = !redoStack.isEmpty
     }
 
-    private func scheduleSave() {
+    private func scheduleSave(contentEdited: Bool) {
         hasUnsavedChanges = true
+        if contentEdited {
+            hasPendingContentEdit = true
+        }
         saveGeneration &+= 1
         saveWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.saveInBackground() }
