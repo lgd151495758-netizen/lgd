@@ -14,6 +14,22 @@ struct ToolbarView: View {
                     session.tool.select(.pen)
                     session.tool.pen = .ballpoint
                 }
+                HStack(spacing: 5) {
+                    ForEach(Array(tool.resolvedPenPresets.enumerated()), id: \.offset) { idx, preset in
+                        let isSelected = (tool.kind == .pen && tool.resolvedActivePenPresetIndex == idx)
+                        PenPresetPill(preset: preset, selected: isSelected) {
+                            session.tool.selectPenPreset(at: idx)
+                        }
+                        .contextMenu {
+                            Button {
+                                session.tool.resetPenPresetsToDefault()
+                            } label: {
+                                Label("恢复默认 4 支快捷笔槽", systemImage: "arrow.counterclockwise")
+                            }
+                        }
+                    }
+                }
+                divider
                 toolButton(title: "套索", symbol: "lasso", selected: tool.kind == .lasso) {
                     session.tool.select(.lasso)
                 }
@@ -83,16 +99,19 @@ struct ToolbarView: View {
         switch tool.kind {
         case .pen:
             ForEach(ToolSettings.palette, id: \.self) { color in
-                colorButton(color, selected: tool.color == color) { session.tool.color = color }
+                colorButton(color, selected: tool.color == color) { session.tool.updatePenColor(color) }
             }
             divider
             ForEach(ToolSettings.widthPresets, id: \.self) { width in
                 sizeButton(diameter: CGFloat(width) * 3 + 2, selected: tool.width == width) {
-                    session.tool.width = width
+                    session.tool.updatePenWidth(width)
                 }
             }
             divider
-            Picker("线型", selection: $session.tool.lineStyle) {
+            Picker("线型", selection: Binding(
+                get: { session.tool.lineStyle },
+                set: { session.tool.updatePenLineStyle($0) }
+            )) {
                 ForEach(StrokeLineStyle.allCases) { style in
                     Text(style.displayName).tag(style)
                 }
@@ -242,7 +261,15 @@ struct ToolbarView: View {
             Circle()
                 .fill(Color(cgColor: color.cgColor))
                 .frame(width: 24, height: 24)
-                .overlay(Circle().stroke(Color.primary.opacity(selected ? 0.9 : 0.15), lineWidth: selected ? 2 : 0.8).padding(selected ? -4 : 0))
+                .overlay(
+                    Circle()
+                        .stroke(Color.primary.opacity(color.isVeryLight ? 0.35 : 0.14), lineWidth: 0.9)
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.primary.opacity(selected ? 0.9 : 0), lineWidth: 2)
+                        .padding(-4)
+                )
         }
         .buttonStyle(.plain)
     }
@@ -261,6 +288,51 @@ struct ToolbarView: View {
             .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: Circle())
         }
         .buttonStyle(.plain)
+    }
+}
+
+/// Compact one-tap customizable pen preset button showing exact color, line thickness, and
+/// solid/dashed/dotted style (with a dark inner backing when displaying chalk white).
+struct PenPresetPill: View {
+    let preset: PenPreset
+    let selected: Bool
+    var compact: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
+                    .fill(preset.color.isVeryLight ? Color(white: 0.22) : Color(.tertiarySystemFill).opacity(selected ? 0.95 : 0.55))
+
+                Canvas { ctx, size in
+                    let pad: CGFloat = compact ? 5 : 6
+                    let start = CGPoint(x: pad, y: size.height - pad)
+                    let end = CGPoint(x: size.width - pad, y: pad)
+                    var path = Path()
+                    path.move(to: start)
+                    path.addLine(to: end)
+                    let lineWidth = min(max(CGFloat(preset.width) * (compact ? 1.15 : 1.35), 1.6), compact ? 3.8 : 4.5)
+                    let dash: [CGFloat]
+                    switch preset.lineStyle {
+                    case .solid: dash = []
+                    case .dashed: dash = [4.5, 3.0]
+                    case .dotted: dash = [0.5, 4.0]
+                    }
+                    let style = StrokeStyle(lineWidth: lineWidth, lineCap: .round, dash: dash)
+                    ctx.stroke(path, with: .color(Color(cgColor: preset.color.cgColor)), style: style)
+                }
+            }
+            .frame(width: compact ? 28 : 34, height: compact ? 28 : 34)
+            .overlay(
+                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
+                    .stroke(selected ? Color.accentColor : Color.primary.opacity(0.14),
+                            lineWidth: selected ? 2.2 : 0.8)
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("快捷笔槽 \(preset.id + 1)：\(preset.lineStyle.displayName)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 

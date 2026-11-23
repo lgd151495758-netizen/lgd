@@ -107,6 +107,9 @@ final class PageInkView: UIView {
             fillLayers[id] = nil
             renderedStrokes[id] = nil
         }
+        var fillIdx = 0
+        var highlightIdx = 0
+        var inkIdx = 0
         for stroke in strokes {
             let shape: CAShapeLayer
             if let existing = strokeLayers[stroke.id] {
@@ -140,13 +143,27 @@ final class PageInkView: UIView {
                 renderedStrokes[stroke.id] = stroke
             }
             if let fl = fillLayers[stroke.id] {
-                fillContainer.addSublayer(fl)
+                Self.ensureLayer(fl, in: fillContainer, at: fillIdx)
+                fillIdx += 1
             }
-            // Re-adding keeps z-order equal to stroke order inside each container.
-            let container = stroke.isHighlighter ? highlightContainer : inkContainer
-            container.addSublayer(shape)
+            if stroke.isHighlighter {
+                Self.ensureLayer(shape, in: highlightContainer, at: highlightIdx)
+                highlightIdx += 1
+            } else {
+                Self.ensureLayer(shape, in: inkContainer, at: inkIdx)
+                inkIdx += 1
+            }
         }
         CATransaction.commit()
+    }
+
+    /// Inserts or repositions `layer` only when its z-order actually differs, avoiding CoreAnimation
+    /// layer-tree churn for hundreds of untouched strokes during precise erasing.
+    private static func ensureLayer(_ layer: CALayer, in container: CALayer, at index: Int) {
+        if let sublayers = container.sublayers, index < sublayers.count, sublayers[index] === layer {
+            return
+        }
+        container.insertSublayer(layer, at: UInt32(index))
     }
 
     private static func applyAppearance(highlighter: Bool, tape: Bool = false, revealed: Bool = false,

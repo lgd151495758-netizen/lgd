@@ -20,6 +20,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     var exportBridge: WebInkBridge { bridge }
 
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
+    private lazy var multiTouchUndo = MultiTouchUndoGestureController(session: session)
     private let pendingFillContainer = CALayer()
     private let pendingContainer = CALayer()
     private let lassoPreviewFillContainer = CALayer()
@@ -267,6 +268,19 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         inkRecognizer.cancelsTouchesInView = true
         view.addGestureRecognizer(inkRecognizer)
 
+        // Two-finger tap Undo / three-finger tap Redo (skip touches inside floating scratchpad).
+        multiTouchUndo.shouldReceiveTouch = { [weak self] touch in
+            guard let self else { return false }
+            if self.session.isScratchpadOpen {
+                let pt = touch.location(in: self.scratchpadPanel)
+                if self.scratchpadPanel.bounds.contains(pt) {
+                    return false
+                }
+            }
+            return true
+        }
+        multiTouchUndo.attach(to: view)
+
         pencilInteraction.delegate = self
         view.addInteraction(pencilInteraction)
 
@@ -278,11 +292,15 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         bridge.onPlacementsChanged = { [weak self] in
             self?.refreshSelectedShapeOverlay()
             self?.refreshLassoSelectionOverlay()
+            PresentationCenter.shared.markContentActive()
         }
         bridge.onToggleTape = { [weak self] id in
             guard let self else { return }
             self.session.toggleTape(id: id, page: Self.page)
             PresentationCenter.shared.requestFrameRefresh()
+        }
+        bridge.onUserActivity = {
+            PresentationCenter.shared.markContentActive()
         }
         session.pageDidChange = { [weak self] changedPage in
             guard let self else { return }
@@ -389,6 +407,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
                 self?.recordCurrentViewport()
+                PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
         webView.scrollView.publisher(for: \.zoomScale)
@@ -396,6 +415,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
                 self?.recordCurrentViewport()
+                PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
 
@@ -622,6 +642,16 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         applyGestureRules()
         restoreSavedViewportIfNeeded()
+        PresentationCenter.shared.requestFrameRefresh()
+    }
+
+    /// Automatically recovers if iPadOS terminates the WebKit WebContent process under 4GB RAM pressure,
+    /// preventing a blank white screen mid-lecture and restoring exact scroll/zoom and ink.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        recordCurrentViewport()
+        session.saveNow()
+        hasRestoredViewport = false
+        loadDocument()
     }
 
     /// The document stays on its page: links to other pages open in Safari, in-page anchors
@@ -2389,16 +2419,26 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
 
     private func eraseMoved(_ touch: UITouch, event: UIEvent?) {
         guard eraseOriginal != nil else { return }
+        let samples = event?.coalescedTouches(for: touch) ?? [touch]
+        let minStepSq: CGFloat = liveTool.eraserMode == .pixel ? 1.44 : 0.25
         var anyChanged = false
-        for sample in event?.coalescedTouches(for: touch) ?? [touch] {
+        for (idx, sample) in samples.enumerated() {
             let p = documentPoint(sample)
-            if applyEraseStep(from: lastErasePoint ?? p, to: p) {
+            let prev = lastErasePoint ?? p
+            let dx = p.x - prev.x
+            let dy = p.y - prev.y
+            let isLast = (idx == samples.count - 1)
+            if !isLast && (dx * dx + dy * dy) < minStepSq {
+                continue
+            }
+            if applyEraseStep(from: prev, to: p) {
                 anyChanged = true
             }
             lastErasePoint = p
         }
         if anyChanged {
             bridge.sync(eraseWorking)
+            PresentationCenter.shared.markContentActive()
         }
         setEraserCursor(lastErasePoint)
     }
@@ -2408,6 +2448,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             eraseOriginal = nil
             lastErasePoint = nil
             setEraserCursor(nil)
+            geometryCache.prune(keeping: Set(eraseWorking.map(\.id)))
         }
         guard let original = eraseOriginal else { return }
         if eraseWorking != original {
@@ -2415,6 +2456,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         } else {
             pushStrokes()
         }
+        PresentationCenter.shared.requestFrameRefresh()
     }
 
     private func applyEraseStep(from a: CGPoint, to b: CGPoint) -> Bool {
@@ -2553,6 +2595,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
 
 extension WebEditorViewController: PresentationContentSource {
     var presentationView: UIView { view }
+    var prefersContinuousProjectionRefresh: Bool { true }
 
     func presentationViewportDidChange() {
         updatePresentationViewport(focusY: nil)

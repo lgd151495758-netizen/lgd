@@ -174,6 +174,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
     private var eraseOriginal: [InkStroke]?
     private var eraseWorking: [InkStroke] = []
     private var lastErasePoint: CGPoint?
+    private lazy var multiTouchUndo = MultiTouchUndoGestureController(session: session)
 
     init(session: DocumentSession) {
         self.session = session
@@ -243,6 +244,8 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         ]
         tapeTapRecognizer.addTarget(self, action: #selector(handleFingerTap(_:)))
         addGestureRecognizer(tapeTapRecognizer)
+
+        multiTouchUndo.attach(to: self)
 
         applyToolConfiguration()
         syncCommittedStrokes()
@@ -502,6 +505,8 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             fillLayers[id] = nil
             renderedStrokes[id] = nil
         }
+        var fillIdx = 0
+        var strokeIdx = 0
         for stroke in strokes {
             let layer: CAShapeLayer
             if let existing = strokeLayers[stroke.id] {
@@ -550,11 +555,20 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
                 renderedStrokes[stroke.id] = stroke
             }
             if let fl = fillLayers[stroke.id] {
-                committedFillContainer.addSublayer(fl)
+                Self.ensureLayer(fl, in: committedFillContainer, at: fillIdx)
+                fillIdx += 1
             }
-            committedContainer.addSublayer(layer)
+            Self.ensureLayer(layer, in: committedContainer, at: strokeIdx)
+            strokeIdx += 1
         }
         CATransaction.commit()
+    }
+
+    private static func ensureLayer(_ layer: CALayer, in container: CALayer, at index: Int) {
+        if let sublayers = container.sublayers, index < sublayers.count, sublayers[index] === layer {
+            return
+        }
+        container.insertSublayer(layer, at: UInt32(index))
     }
 
     @objc private func handleFingerTap(_ recognizer: UITapGestureRecognizer) {
@@ -1776,16 +1790,35 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         eraseWorking = original
         let p = touch.preciseLocation(in: self)
         lastErasePoint = p
-        applyEraseStep(from: p, to: p)
+        if applyEraseStep(from: p, to: p) {
+            renderCommitted(eraseWorking)
+            onContentDidMutate?()
+        }
         setEraserCursor(p)
     }
 
     private func eraseMoved(_ touch: UITouch, event: UIEvent?) {
         guard eraseOriginal != nil else { return }
-        for sample in event?.coalescedTouches(for: touch) ?? [touch] {
+        let samples = event?.coalescedTouches(for: touch) ?? [touch]
+        let minStepSq: CGFloat = liveTool.eraserMode == .pixel ? 1.44 : 0.25
+        var anyChanged = false
+        for (idx, sample) in samples.enumerated() {
             let p = sample.preciseLocation(in: self)
-            applyEraseStep(from: lastErasePoint ?? p, to: p)
+            let prev = lastErasePoint ?? p
+            let dx = p.x - prev.x
+            let dy = p.y - prev.y
+            let isLast = (idx == samples.count - 1)
+            if !isLast && (dx * dx + dy * dy) < minStepSq {
+                continue
+            }
+            if applyEraseStep(from: prev, to: p) {
+                anyChanged = true
+            }
             lastErasePoint = p
+        }
+        if anyChanged {
+            renderCommitted(eraseWorking)
+            onContentDidMutate?()
         }
         setEraserCursor(lastErasePoint)
     }
@@ -1795,6 +1828,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             eraseOriginal = nil
             lastErasePoint = nil
             setEraserCursor(nil)
+            geometryCache.prune(keeping: Set(eraseWorking.map(\.id)))
         }
         guard let original = eraseOriginal else { return }
         if eraseWorking != original {
@@ -1805,14 +1839,13 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         }
     }
 
-    private func applyEraseStep(from a: CGPoint, to b: CGPoint) {
+    private func applyEraseStep(from a: CGPoint, to b: CGPoint) -> Bool {
         let result = EraserEngine.erase(eraseWorking, from: a, to: b, radius: eraserRadius,
                                         mode: liveTool.eraserMode, highlighterOnly: false,
                                         cache: geometryCache)
-        guard result.changed else { return }
+        guard result.changed else { return false }
         eraseWorking = result.strokes
-        renderCommitted(eraseWorking)
-        onContentDidMutate?()
+        return true
     }
 
     private func setEraserCursor(_ point: CGPoint?) {

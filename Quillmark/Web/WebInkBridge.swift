@@ -21,10 +21,15 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
     var onReady: (() -> Void)?
     var onPlacementsChanged: (() -> Void)?
     var onToggleTape: ((UUID) -> Void)?
+    var onUserActivity: (() -> Void)?
 
     /// What the page currently shows, to send only differences.
     private var rendered: [UUID: InkStroke] = [:]
     private var renderedOrder: [UUID] = []
+    /// Coalesces rapid `sync()` calls (e.g. 60Hz precise erasing) so at most one WebKit IPC is in flight.
+    private var isSyncInFlight = false
+    private var syncEpoch: UInt64 = 0
+    private var pendingSync: (strokes: [InkStroke], completions: [() -> Void])?
 
     static let runtimeSource: String = {
         guard let url = Bundle.main.url(forResource: "qm-runtime", withExtension: "js"),
@@ -71,9 +76,14 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
     /// Call before loading a new page.
     func resetForNavigation() {
         isReady = false
+        syncEpoch &+= 1
+        isSyncInFlight = false
+        let queued = pendingSync?.completions ?? []
+        pendingSync = nil
         rendered.removeAll()
         renderedOrder.removeAll()
         placements.removeAll()
+        for done in queued { done() }
     }
 
     // MARK: Coordinates
@@ -115,10 +125,26 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
     }
 
     /// Makes the page show exactly `strokes` (in this z-order). Calls `completion` once the page
-    /// has applied the DOM update.
+    /// has applied the DOM update. Coalesces overlapping rapid calls so WebKit IPC never queues up.
     func sync(_ strokes: [InkStroke], completion: (() -> Void)? = nil) {
         guard isReady else {
             completion?()
+            return
+        }
+        if isSyncInFlight {
+            var completions = pendingSync?.completions ?? []
+            if let completion {
+                completions.append(completion)
+            }
+            pendingSync = (strokes, completions)
+            return
+        }
+        dispatchSync(strokes, completions: completion.map { [$0] } ?? [])
+    }
+
+    private func dispatchSync(_ strokes: [InkStroke], completions: [() -> Void]) {
+        guard isReady else {
+            for done in completions { done() }
             return
         }
         var add: [[String: Any]] = []
@@ -139,7 +165,7 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
         let orderChanged = order != renderedOrder
         renderedOrder = order
         guard !add.isEmpty || !remove.isEmpty || orderChanged else {
-            completion?()
+            for done in completions { done() }
             return
         }
 
@@ -147,9 +173,24 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
         if orderChanged {
             ops["order"] = order.map(\.uuidString)
         }
+        isSyncInFlight = true
+        let epoch = syncEpoch
         webView.callAsyncJavaScript("return window.__qm ? window.__qm.apply(ops) : -1;", arguments: ["ops": ops],
-                                    in: nil, in: .page) { _ in
-            completion?()
+                                    in: nil, in: .page) { [weak self] _ in
+            guard let self else {
+                for done in completions { done() }
+                return
+            }
+            guard self.syncEpoch == epoch else {
+                for done in completions { done() }
+                return
+            }
+            self.isSyncInFlight = false
+            for done in completions { done() }
+            if let next = self.pendingSync {
+                self.pendingSync = nil
+                self.dispatchSync(next.strokes, completions: next.completions)
+            }
         }
     }
 
@@ -179,6 +220,9 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
         switch type {
         case "ready":
             isReady = true
+            syncEpoch &+= 1
+            isSyncInFlight = false
+            pendingSync = nil
             rendered.removeAll()
             renderedOrder.removeAll()
             placements.removeAll()
@@ -197,6 +241,8 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
             if let raw = body["id"] as? String, let id = UUID(uuidString: raw) {
                 onToggleTape?(id)
             }
+        case "activity":
+            onUserActivity?()
         default:
             break
         }

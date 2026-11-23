@@ -65,6 +65,11 @@ struct RGBAColor: Codable, Equatable, Hashable {
         CGColor(srgbRed: CGFloat(r), green: CGFloat(g), blue: CGFloat(b), alpha: CGFloat(a))
     }
 
+    /// True for white / bright chalk colors that need a subtle border on light UI backgrounds.
+    var isVeryLight: Bool {
+        (0.299 * r + 0.587 * g + 0.114 * b) > 0.82
+    }
+
     static let ink = RGBAColor(0.11, 0.11, 0.13)
 }
 
@@ -630,6 +635,14 @@ struct DocumentAnnotations: Codable, Equatable {
     }
 }
 
+/// One customizable quick-access pen slot in the toolbar (color + width + solid/dashed/dotted style).
+struct PenPreset: Codable, Equatable, Identifiable {
+    var id: Int
+    var color: RGBAColor
+    var width: Float
+    var lineStyle: StrokeLineStyle
+}
+
 /// Current tool configuration, persisted between launches.
 struct ToolSettings: Codable, Equatable {
     var kind: ToolKind = .pen
@@ -644,6 +657,11 @@ struct ToolSettings: Codable, Equatable {
     var drawAndHold: Bool = true
     var smoothing: Float = 0.45
     var prediction: Bool = true
+    /// Four quick-switch pen slots (customizable in-place; optional for v1.4 backward compatibility).
+    var penPresets: [PenPreset]?
+    var activePenPresetIndex: Int?
+    /// Two-finger tap to undo and three-finger tap to redo across all canvases (default on).
+    var multiFingerUndo: Bool?
 
     // Cover Tape
     var tapeColor: RGBAColor = ToolSettings.tapePalette[0]
@@ -674,7 +692,90 @@ struct ToolSettings: Codable, Equatable {
         RGBAColor(0.11, 0.55, 0.32),
         RGBAColor(0.48, 0.25, 0.70),
         RGBAColor(0.93, 0.50, 0.10),
+        RGBAColor(0.98, 0.80, 0.12), // bright chalk yellow (great for dark-mode HTML courseware)
+        RGBAColor(0.97, 0.97, 0.99), // chalk white (great for dark-mode HTML courseware)
     ]
+
+    static let defaultPenPresets: [PenPreset] = [
+        PenPreset(id: 0, color: .ink, width: 1.8, lineStyle: .solid),
+        PenPreset(id: 1, color: RGBAColor(0.80, 0.16, 0.16), width: 1.8, lineStyle: .solid),
+        PenPreset(id: 2, color: RGBAColor(0.10, 0.27, 0.66), width: 1.8, lineStyle: .dashed),
+        PenPreset(id: 3, color: RGBAColor(0.97, 0.97, 0.99), width: 1.8, lineStyle: .solid),
+    ]
+
+    var isMultiFingerUndoEnabled: Bool {
+        multiFingerUndo ?? true
+    }
+
+    var resolvedPenPresets: [PenPreset] {
+        if let penPresets, penPresets.count == Self.defaultPenPresets.count {
+            return penPresets
+        }
+        return Self.defaultPenPresets
+    }
+
+    var resolvedActivePenPresetIndex: Int {
+        let presets = resolvedPenPresets
+        if let idx = activePenPresetIndex, idx >= 0, idx < presets.count {
+            return idx
+        }
+        if let match = presets.firstIndex(where: { $0.color == color && $0.width == width && $0.lineStyle == lineStyle }) {
+            return match
+        }
+        return 0
+    }
+
+    /// Switches straight to the pen tool with the saved color, width, and line style of slot `index`.
+    mutating func selectPenPreset(at index: Int) {
+        var presets = resolvedPenPresets
+        guard index >= 0, index < presets.count else { return }
+        if penPresets == nil {
+            penPresets = presets
+        }
+        select(.pen)
+        pen = .ballpoint
+        activePenPresetIndex = index
+        let slot = presets[index]
+        color = slot.color
+        width = slot.width
+        lineStyle = slot.lineStyle
+        presets[index] = slot
+        penPresets = presets
+    }
+
+    mutating func updatePenColor(_ newColor: RGBAColor) {
+        color = newColor
+        syncActivePenPreset()
+    }
+
+    mutating func updatePenWidth(_ newWidth: Float) {
+        width = newWidth
+        syncActivePenPreset()
+    }
+
+    mutating func updatePenLineStyle(_ newStyle: StrokeLineStyle) {
+        lineStyle = newStyle
+        syncActivePenPreset()
+    }
+
+    mutating func resetPenPresetsToDefault() {
+        penPresets = Self.defaultPenPresets
+        let idx = min(max(0, activePenPresetIndex ?? 0), Self.defaultPenPresets.count - 1)
+        activePenPresetIndex = idx
+        let slot = Self.defaultPenPresets[idx]
+        color = slot.color
+        width = slot.width
+        lineStyle = slot.lineStyle
+    }
+
+    private mutating func syncActivePenPreset() {
+        guard kind == .pen else { return }
+        var presets = resolvedPenPresets
+        let idx = resolvedActivePenPresetIndex
+        presets[idx] = PenPreset(id: idx, color: color, width: width, lineStyle: lineStyle)
+        penPresets = presets
+        activePenPresetIndex = idx
+    }
 
     static let tapePalette: [RGBAColor] = [
         RGBAColor(0.95, 0.89, 0.68), // masking tape beige

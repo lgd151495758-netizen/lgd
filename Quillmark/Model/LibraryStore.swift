@@ -94,19 +94,25 @@ final class LibraryStore: ObservableObject {
     let root: URL
 
     private let fileManager = FileManager.default
+    /// Dedicated serial background queue for atomic annotation JSON encoding and disk writes,
+    /// keeping 120Hz Apple Pencil input completely free of main-thread serialization stalls.
+    private let ioQueue = DispatchQueue(label: "app.quillmark.library.io", qos: .utility)
 
-    static let encoder: JSONEncoder = {
+    static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
         return encoder
-    }()
+    }
 
-    static let decoder: JSONDecoder = {
+    static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return decoder
-    }()
+    }
+
+    static let encoder: JSONEncoder = makeEncoder()
+    static let decoder: JSONDecoder = makeDecoder()
 
     init(root: URL? = nil) {
         let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -362,21 +368,65 @@ final class LibraryStore: ObservableObject {
     }
 
     func loadAnnotations(for id: UUID) -> DocumentAnnotations {
-        guard let data = try? Data(contentsOf: annotationsURL(for: id)),
-              let value = try? Self.decoder.decode(DocumentAnnotations.self, from: data) else {
-            return DocumentAnnotations()
+        let url = annotationsURL(for: id)
+        return ioQueue.sync {
+            guard let data = try? Data(contentsOf: url),
+                  let value = try? Self.makeDecoder().decode(DocumentAnnotations.self, from: data) else {
+                return DocumentAnnotations()
+            }
+            return value
         }
-        return value
     }
 
     func saveAnnotations(_ annotations: DocumentAnnotations, for id: UUID) throws {
         var toSave = annotations
         toSave.syncActiveLayerFromTopLevel()
-        try Self.encoder.encode(toSave).write(to: annotationsURL(for: id), options: .atomic)
+        let url = annotationsURL(for: id)
+        try ioQueue.sync {
+            try Self.makeEncoder().encode(toSave).write(to: url, options: .atomic)
+        }
+        touchModifiedDate(for: id)
+    }
+
+    /// Encodes and writes `annotations` atomically on the background serial queue, then updates
+    /// metadata timestamps on the main thread without blocking handwriting frames.
+    func saveAnnotationsAsync(_ annotations: DocumentAnnotations,
+                              for id: UUID,
+                              completion: ((Error?) -> Void)? = nil) {
+        var snapshot = annotations
+        snapshot.syncActiveLayerFromTopLevel()
+        let docFolder = folder(for: id)
+        let url = annotationsURL(for: id)
+        ioQueue.async { [weak self] in
+            do {
+                guard FileManager.default.fileExists(atPath: docFolder.path) else {
+                    DispatchQueue.main.async { completion?(nil) }
+                    return
+                }
+                let data = try Self.makeEncoder().encode(snapshot)
+                try data.write(to: url, options: .atomic)
+                DispatchQueue.main.async {
+                    self?.touchModifiedDate(for: id)
+                    completion?(nil)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion?(error)
+                }
+            }
+        }
+    }
+
+    /// Waits for all queued background annotation writes to finish (used in tests and teardown).
+    func flushPendingWrites() {
+        ioQueue.sync {}
+    }
+
+    private func touchModifiedDate(for id: UUID) {
         guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
         var meta = documents[index]
         meta.modifiedAt = Date()
-        try writeMeta(meta)
+        try? writeMeta(meta)
         documents[index] = meta
         documents.sort { $0.modifiedAt > $1.modifiedAt }
     }

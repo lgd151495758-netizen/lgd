@@ -11,6 +11,9 @@ struct WorkspaceView: View {
     @State private var showQuickOpenPopover = false
     @State private var showPresentationPopover = false
     @State private var exportTargetMeta: DocumentMeta?
+    @State private var isFocusMode = false
+    @State private var undoToastText: String?
+    @State private var undoToastDismissWork: DispatchWorkItem?
 
     let onCreateNotebook: () -> Void
     let onImportPDF: () -> Void
@@ -18,36 +21,83 @@ struct WorkspaceView: View {
     let onImportURL: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            tabBar
-            Divider()
-            if let activeTab = tabManager.activeTab {
-                ToolbarView(session: activeTab.session)
-                    .padding(.horizontal)
-                    .padding(.vertical, 6)
-            }
-            if presentation.isFrozen {
-                Button {
-                    presentation.isFrozen = false
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "snowflake")
-                        Text("大屏画面已冻结 · 可自由切换标签或翻页，轻点此处恢复实时同步")
-                            .font(.caption.weight(.semibold))
+        ZStack(alignment: .top) {
+            VStack(spacing: 0) {
+                if !isFocusMode {
+                    tabBar
+                    Divider()
+                    if let activeTab = tabManager.activeTab {
+                        ToolbarView(session: activeTab.session)
+                            .padding(.horizontal)
+                            .padding(.vertical, 6)
                     }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(Color.orange)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("恢复大屏实时同步")
+                if presentation.isFrozen {
+                    Button {
+                        presentation.isFrozen = false
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "snowflake")
+                            Text("大屏画面已冻结 · 可自由切换标签或翻页，轻点此处恢复实时同步")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .background(Color.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("恢复大屏实时同步")
+                }
+                TabDeckRepresentable(tabManager: tabManager, library: library)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            TabDeckRepresentable(tabManager: tabManager, library: library)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if isFocusMode, let activeTab = tabManager.activeTab {
+                HStack {
+                    Spacer()
+                    FocusModeFloatingBar(
+                        session: activeTab.session,
+                        presentation: presentation,
+                        onExitFocus: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                isFocusMode = false
+                            }
+                        }
+                    )
+                }
+                .padding(.top, presentation.isFrozen ? 38 : 10)
+                .padding(.trailing, 14)
+            }
+
+            if let toast = undoToastText {
+                Text(toast)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.black.opacity(0.76), in: Capsule())
+                    .padding(.top, isFocusMode ? 16 : 108)
+                    .allowsHitTesting(false)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+            }
         }
         .background(Color(.systemBackground))
         .ignoresSafeArea(edges: .bottom)
+        .onReceive(NotificationCenter.default.publisher(for: .quillmarkUndoRedoFeedback)) { note in
+            guard let msg = note.userInfo?["message"] as? String else { return }
+            undoToastDismissWork?.cancel()
+            withAnimation(.easeOut(duration: 0.15)) {
+                undoToastText = msg
+            }
+            let work = DispatchWorkItem {
+                withAnimation(.easeIn(duration: 0.2)) {
+                    undoToastText = nil
+                }
+            }
+            undoToastDismissWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.85, execute: work)
+        }
         .sheet(item: $exportTargetMeta) { meta in
             ExportDocumentSheet(
                 meta: meta,
@@ -192,6 +242,19 @@ struct WorkspaceView: View {
                 .popover(isPresented: $showPresentationPopover) {
                     PresentationPopover(presentation: presentation)
                 }
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isFocusMode = true
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("进入专注书写模式（折叠顶栏）")
             }
         }
         .padding(.horizontal, 10)
@@ -549,6 +612,12 @@ private struct PresentationPopover: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            Toggle("智能节能投屏", isOn: $presentation.smartPowerSaving)
+            Text("开启后，PDF 静止时暂停后台截屏、互动网页空闲自动降频（60fps 笔迹与激光笔实时同步不受影响），可显著降低长时间上课的机身发热与耗电。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
             Divider()
 
             HStack(alignment: .top, spacing: 8) {
@@ -606,5 +675,84 @@ private struct TabDeckRepresentable: UIViewControllerRepresentable {
 
     static func dismantleUIViewController(_ uiViewController: TabDeckViewController, coordinator: ()) {
         uiViewController.teardownAllTabs()
+    }
+}
+
+/// Compact floating capsule shown in the top-trailing corner during Focus Writing Mode
+/// (strictly on the iPad SwiftUI overlay, never projected onto the external display).
+private struct FocusModeFloatingBar: View {
+    @ObservedObject var session: DocumentSession
+    @ObservedObject var presentation: PresentationCenter
+    let onExitFocus: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(Array(session.tool.resolvedPenPresets.enumerated()), id: \.offset) { idx, preset in
+                let isSelected = (session.tool.kind == .pen && session.tool.resolvedActivePenPresetIndex == idx)
+                PenPresetPill(preset: preset, selected: isSelected, compact: true) {
+                    session.tool.selectPenPreset(at: idx)
+                }
+            }
+
+            Divider().frame(height: 20)
+
+            Button {
+                session.tool.toggleEraser()
+            } label: {
+                Image(systemName: "eraser")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(session.tool.kind == .eraser ? Color.accentColor : Color.primary)
+                    .frame(width: 28, height: 28)
+                    .background(session.tool.kind == .eraser ? Color.accentColor.opacity(0.18) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("切换橡皮")
+
+            Button {
+                session.undo()
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.subheadline.weight(.medium))
+                    .frame(width: 28, height: 28)
+            }
+            .buttonStyle(.plain)
+            .disabled(!session.canUndo)
+            .accessibilityLabel("撤销")
+
+            if presentation.isExternalDisplayConnected {
+                Button {
+                    presentation.isFrozen.toggle()
+                } label: {
+                    Image(systemName: presentation.isFrozen ? "snowflake" : "pause.circle")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(presentation.isFrozen ? Color.white : Color.primary)
+                        .frame(width: 28, height: 28)
+                        .background(presentation.isFrozen ? Color.orange : Color.secondary.opacity(0.14),
+                                    in: RoundedRectangle(cornerRadius: 7))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(presentation.isFrozen ? "恢复大屏同步" : "冻结大屏画面")
+            }
+
+            Divider().frame(height: 20)
+
+            Button(action: onExitFocus) {
+                HStack(spacing: 3) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    Text("展开")
+                        .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color.accentColor.opacity(0.16), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("退出专注模式，展开顶栏")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(.regularMaterial, in: Capsule())
+        .shadow(color: .black.opacity(0.14), radius: 8, y: 3)
     }
 }

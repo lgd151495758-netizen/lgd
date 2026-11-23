@@ -4,10 +4,68 @@ import UIKit
 /// Provides frames of the active document area (strictly below the toolbar) for projection.
 protocol PresentationContentSource: AnyObject {
     var presentationView: UIView { get }
+    /// `true` for interactive HTML pages that may run JS/CSS/canvas animations; `false` for static PDFs.
+    var prefersContinuousProjectionRefresh: Bool { get }
     /// Called when the external display connects, disconnects, resizes, or changes fill mode.
     func presentationViewportDidChange()
     /// Captures the visible document content asynchronously on the main thread.
     func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void)
+}
+
+extension PresentationContentSource {
+    var prefersContinuousProjectionRefresh: Bool { false }
+}
+
+/// Pure decision policy for adaptive projection capture rate so iPad Air 4 stays cool during
+/// long lectures while keeping interactive HTML animations and PDF scrolling silky smooth.
+struct ProjectionRefreshDecision: Equatable {
+    enum Mode: Equatable {
+        /// Display link paused (0 fps background captures; 60fps vector ink/laser still runs live).
+        case paused
+        /// Full 24 fps capture during active scrolling, zooming, DOM changes, or ink commit.
+        case active
+        /// Low-power 6 fps keepalive pulse for idle interactive HTML courseware animations.
+        case lowPowerPulse
+    }
+
+    var mode: Mode
+    var shouldCaptureImmediately: Bool
+}
+
+enum ProjectionRefreshPolicy {
+    static let staticBurstWindow: TimeInterval = 0.65
+    static let interactiveActiveWindow: TimeInterval = 2.5
+    static let mirrorActiveWindow: TimeInterval = 2.0
+
+    static func decide(isFrozen: Bool,
+                       smartPowerSaving: Bool,
+                       isShowingContentOnly: Bool,
+                       prefersContinuous: Bool,
+                       secondsSinceActivity: TimeInterval) -> ProjectionRefreshDecision {
+        if isFrozen {
+            return ProjectionRefreshDecision(mode: .paused, shouldCaptureImmediately: false)
+        }
+        guard smartPowerSaving else {
+            return ProjectionRefreshDecision(mode: .active, shouldCaptureImmediately: true)
+        }
+        if !isShowingContentOnly {
+            if secondsSinceActivity < mirrorActiveWindow {
+                return ProjectionRefreshDecision(mode: .active, shouldCaptureImmediately: true)
+            }
+            return ProjectionRefreshDecision(mode: .lowPowerPulse, shouldCaptureImmediately: false)
+        }
+        if prefersContinuous {
+            if secondsSinceActivity < interactiveActiveWindow {
+                return ProjectionRefreshDecision(mode: .active, shouldCaptureImmediately: true)
+            }
+            return ProjectionRefreshDecision(mode: .lowPowerPulse, shouldCaptureImmediately: false)
+        } else {
+            if secondsSinceActivity < staticBurstWindow {
+                return ProjectionRefreshDecision(mode: .active, shouldCaptureImmediately: true)
+            }
+            return ProjectionRefreshDecision(mode: .paused, shouldCaptureImmediately: false)
+        }
+    }
 }
 
 struct PendingOverlayStroke {
@@ -222,6 +280,7 @@ final class PresentationCenter: ObservableObject {
         didSet {
             guard isFrozen != oldValue else { return }
             if isFrozen {
+                displayLink?.isPaused = true
                 presenter?.updateLiveOverlay(.empty)
             } else {
                 updateOverlayVisibility()
@@ -230,9 +289,20 @@ final class PresentationCenter: ObservableObject {
         }
     }
 
+    /// On: pauses static PDF background screenshots when idle (0 fps) and steps idle HTML capture
+    /// down to 6 fps to dramatically reduce heat and battery drain on iPad Air 4.
+    @Published var smartPowerSaving: Bool {
+        didSet {
+            defaults.set(smartPowerSaving, forKey: Self.smartPowerSavingKey)
+            markContentActive()
+        }
+    }
+
     static let framesPerSecond: Float = 24
+    static let idlePulseFramesPerSecond: Float = 6
     private static let contentOnlyKey = "presentation.contentOnly"
     private static let fillModeKey = "presentation.fillMode.v2"
+    private static let smartPowerSavingKey = "presentation.smartPowerSaving.v1"
 
     private let defaults: UserDefaults
     private var externalWindow: UIWindow?
@@ -247,6 +317,9 @@ final class PresentationCenter: ObservableObject {
     private var accessoryTokens: [ObjectIdentifier: (host: WeakViewController, token: AnyObject)] = [:]
     private var displayLink: CADisplayLink?
     private var displayLinkProxy: DisplayLinkProxy?
+    private var currentLoopMode: ProjectionRefreshDecision.Mode = .active
+    private var lastActivityAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
+    private var lastCaptureDispatchedAt: CFAbsoluteTime = 0
     private var isCapturingFrame = false
     private var captureStartedAt: CFAbsoluteTime = 0
     private var observers: [NSObjectProtocol] = []
@@ -255,6 +328,7 @@ final class PresentationCenter: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         contentOnly = defaults.object(forKey: Self.contentOnlyKey) as? Bool ?? true
+        smartPowerSaving = defaults.object(forKey: Self.smartPowerSavingKey) as? Bool ?? true
         if let raw = defaults.string(forKey: Self.fillModeKey), let saved = PresentationFillMode(rawValue: raw) {
             fillMode = saved
         } else {
@@ -481,9 +555,22 @@ final class PresentationCenter: ObservableObject {
         presenter?.updateLiveOverlay(state)
     }
 
-    func requestFrameRefresh() {
+    /// Wakes the projection loop immediately to full 24 fps when scrolling, zooming, flipping pages,
+    /// interacting with HTML widgets, or committing ink.
+    func markContentActive() {
+        lastActivityAt = CFAbsoluteTimeGetCurrent()
         guard presenter != nil, !isFrozen else { return }
-        captureNextFrame()
+        if let link = displayLink {
+            if link.isPaused || currentLoopMode != .active {
+                applyLoopMode(.active, to: link)
+            }
+        }
+    }
+
+    func requestFrameRefresh() {
+        markContentActive()
+        guard presenter != nil, !isFrozen else { return }
+        captureNextFrame(force: true)
     }
 
     private func notifyViewportChanged() {
@@ -523,12 +610,12 @@ final class PresentationCenter: ObservableObject {
 
     private func start() {
         guard displayLink == nil else { return }
+        lastActivityAt = CFAbsoluteTimeGetCurrent()
         let proxy = DisplayLinkProxy { [weak self] in
-            self?.captureNextFrame()
+            self?.displayLinkTick()
         }
         let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick))
-        link.preferredFrameRateRange = CAFrameRateRange(minimum: 12, maximum: Self.framesPerSecond,
-                                                        preferred: Self.framesPerSecond)
+        applyLoopMode(.active, to: link)
         link.add(to: .main, forMode: .common)
         displayLinkProxy = proxy
         displayLink = link
@@ -538,15 +625,65 @@ final class PresentationCenter: ObservableObject {
         displayLink?.invalidate()
         displayLink = nil
         displayLinkProxy = nil
+        currentLoopMode = .paused
     }
 
-    private func captureNextFrame() {
+    private func applyLoopMode(_ mode: ProjectionRefreshDecision.Mode, to link: CADisplayLink) {
+        currentLoopMode = mode
+        switch mode {
+        case .paused:
+            link.isPaused = true
+        case .active:
+            link.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 12,
+                maximum: Self.framesPerSecond,
+                preferred: Self.framesPerSecond
+            )
+            link.isPaused = false
+        case .lowPowerPulse:
+            link.preferredFrameRateRange = CAFrameRateRange(
+                minimum: 4,
+                maximum: Self.idlePulseFramesPerSecond,
+                preferred: Self.idlePulseFramesPerSecond
+            )
+            link.isPaused = false
+        }
+    }
+
+    private func displayLinkTick() {
+        guard let link = displayLink else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let decision = ProjectionRefreshPolicy.decide(
+            isFrozen: isFrozen,
+            smartPowerSaving: smartPowerSaving,
+            isShowingContentOnly: isShowingContentOnly,
+            prefersContinuous: contentSource?.prefersContinuousProjectionRefresh ?? false,
+            secondsSinceActivity: max(0, now - lastActivityAt)
+        )
+        if decision.mode != currentLoopMode {
+            applyLoopMode(decision.mode, to: link)
+        }
+        switch decision.mode {
+        case .paused:
+            return
+        case .lowPowerPulse:
+            let minInterval = 1.0 / Double(Self.idlePulseFramesPerSecond + 0.5)
+            guard now - lastCaptureDispatchedAt >= minInterval else { return }
+            captureNextFrame(force: false)
+        case .active:
+            captureNextFrame(force: false)
+        }
+    }
+
+    private func captureNextFrame(force: Bool = false) {
         guard let presenter, !isFrozen else { return }
         let now = CFAbsoluteTimeGetCurrent()
         if isCapturingFrame {
-            if now - captureStartedAt < 2.0 { return }
+            if !force && now - captureStartedAt < 2.0 { return }
+            if force && now - captureStartedAt < 0.25 { return }
             isCapturingFrame = false
         }
+        lastCaptureDispatchedAt = now
 
         if contentOnly, let source = contentSource, source.presentationView.window != nil {
             isCapturingFrame = true

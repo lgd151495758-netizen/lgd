@@ -88,8 +88,11 @@ final class DocumentSession: ObservableObject {
     private let library: LibraryStore
     private var saveWork: DispatchWorkItem?
     private var hasUnsavedChanges = false
+    private var saveGeneration: UInt64 = 0
     private var observers: [NSObjectProtocol] = []
     private let undoLimit = 500
+    /// Caps full-document `replaceAll` snapshots in `undoStack` to keep memory lean on 4GB iPads.
+    private let maxReplaceAllSnapshots = 10
 
     init(meta: DocumentMeta, library: LibraryStore, tool: ToolSettings = ToolSettings.load()) {
         self.meta = meta
@@ -433,8 +436,24 @@ final class DocumentSession: ObservableObject {
         if undoStack.count > undoLimit {
             undoStack.removeFirst(undoStack.count - undoLimit)
         }
+        trimExcessReplaceAllSnapshots()
         redoStack.removeAll()
         updateFlags()
+    }
+
+    private func trimExcessReplaceAllSnapshots() {
+        var replaceAllIndices: [Int] = []
+        for (idx, cmd) in undoStack.enumerated() {
+            if case .replaceAll = cmd {
+                replaceAllIndices.append(idx)
+            }
+        }
+        guard replaceAllIndices.count > maxReplaceAllSnapshots else { return }
+        let overflow = replaceAllIndices.count - maxReplaceAllSnapshots
+        let toDrop = Set(replaceAllIndices.prefix(overflow))
+        undoStack = undoStack.enumerated().compactMap { idx, cmd in
+            toDrop.contains(idx) ? nil : cmd
+        }
     }
 
     func undo() {
@@ -477,13 +496,37 @@ final class DocumentSession: ObservableObject {
     func saveNow() {
         saveWork?.cancel()
         saveWork = nil
-        guard hasUnsavedChanges else { return }
+        guard hasUnsavedChanges else {
+            library.flushPendingWrites()
+            return
+        }
+        saveGeneration &+= 1
         annotations.syncActiveLayerFromTopLevel()
         do {
             try library.saveAnnotations(annotations, for: meta.id)
             hasUnsavedChanges = false
         } catch {
             NSLog("Quillmark: failed to save annotations: \(error)")
+        }
+    }
+
+    /// Background autosave triggered after the 1-second debounce so 120Hz handwriting never stutters.
+    private func saveInBackground() {
+        saveWork = nil
+        guard hasUnsavedChanges else { return }
+        saveGeneration &+= 1
+        let targetGeneration = saveGeneration
+        annotations.syncActiveLayerFromTopLevel()
+        let snapshot = annotations
+        library.saveAnnotationsAsync(snapshot, for: meta.id) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                NSLog("Quillmark: background save failed: \(error)")
+                return
+            }
+            if self.saveGeneration == targetGeneration {
+                self.hasUnsavedChanges = false
+            }
         }
     }
 
@@ -526,8 +569,9 @@ final class DocumentSession: ObservableObject {
 
     private func scheduleSave() {
         hasUnsavedChanges = true
+        saveGeneration &+= 1
         saveWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.saveNow() }
+        let work = DispatchWorkItem { [weak self] in self?.saveInBackground() }
         saveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }

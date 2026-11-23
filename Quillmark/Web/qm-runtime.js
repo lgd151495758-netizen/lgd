@@ -110,8 +110,16 @@
         }
         cache.set(s.el, info);
       }
-      s.svg.style.display = info.shown ? '' : 'none';
-      s.svg.style.transform = 'translate(' + (info.x - origin.x) + 'px,' + (info.y - origin.y) + 'px)';
+      var nextDisplay = info.shown ? '' : 'none';
+      if (s.lastDisplay !== nextDisplay) {
+        s.svg.style.display = nextDisplay;
+        s.lastDisplay = nextDisplay;
+      }
+      var nextTransform = 'translate(' + (info.x - origin.x) + 'px,' + (info.y - origin.y) + 'px)';
+      if (s.lastTransform !== nextTransform) {
+        s.svg.style.transform = nextTransform;
+        s.lastTransform = nextTransform;
+      }
       report[id] = [info.x, info.y, info.shown ? 1 : 0];
     });
     var json = JSON.stringify(report);
@@ -222,13 +230,21 @@
         if (old) { old.svg.remove(); }
         var svg = makeSVG(stroke);
         layer.appendChild(svg);
-        strokes.set(stroke.id, { svg: svg, anchor: stroke.anchor, el: null });
+        strokes.set(stroke.id, { svg: svg, anchor: stroke.anchor, el: null, lastDisplay: null, lastTransform: null });
       });
-      (ops.order || []).forEach(function (id) {
-        var s = strokes.get(id);
-        if (s) { layer.appendChild(s.svg); }
-      });
-      lastReport = '';
+      if (ops.order) {
+        // Minimal-diff DOM reordering: only insert moved/new SVGs instead of re-appending every stroke.
+        var expected = layer.firstChild;
+        for (var i = 0; i < ops.order.length; i++) {
+          var s = strokes.get(ops.order[i]);
+          if (!s) { continue; }
+          if (s.svg !== expected) {
+            layer.insertBefore(s.svg, expected);
+          } else {
+            expected = expected.nextSibling;
+          }
+        }
+      }
       layout();
       return strokes.size;
     },
@@ -258,6 +274,21 @@
   document.addEventListener('transitionend', schedule, true);
   document.addEventListener('animationend', schedule, true);
   document.addEventListener('toggle', schedule, true);
+
+  // Wake smart projection to full 24fps during live finger interaction with canvas/sliders/buttons.
+  var lastActivityPost = 0;
+  function notifyActivity() {
+    var now = Date.now();
+    if (now - lastActivityPost > 300) {
+      lastActivityPost = now;
+      post({ type: 'activity' });
+    }
+  }
+  window.addEventListener('pointerdown', notifyActivity, { passive: true, capture: true });
+  window.addEventListener('pointermove', function (e) {
+    if (e.buttons || e.pressure > 0) { notifyActivity(); }
+  }, { passive: true, capture: true });
+  window.addEventListener('input', notifyActivity, { passive: true, capture: true });
 
   // Prevent WebKit text selection / Scribble from reacting to Apple Pencil touches.
   window.addEventListener('pointerdown', function (e) {

@@ -28,6 +28,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     // Unified gesture & vector overlay hierarchy (sibling above pdfView; iPad chrome never projected)
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
     private let tapeTapRecognizer = UITapGestureRecognizer()
+    private lazy var multiTouchUndo = MultiTouchUndoGestureController(session: session)
     private let lassoPreviewFillContainer = CALayer()
     private let lassoPreviewContainer = CALayer()
     private let liveFillLayer = CAShapeLayer()
@@ -275,6 +276,19 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         tapeTapRecognizer.addTarget(self, action: #selector(handleFingerTap(_:)))
         view.addGestureRecognizer(tapeTapRecognizer)
 
+        // Two-finger tap to Undo / three-finger tap to Redo (skip touches inside floating scratchpad).
+        multiTouchUndo.shouldReceiveTouch = { [weak self] touch in
+            guard let self else { return false }
+            if self.session.isScratchpadOpen {
+                let pt = touch.location(in: self.scratchpadPanel)
+                if self.scratchpadPanel.bounds.contains(pt) {
+                    return false
+                }
+            }
+            return true
+        }
+        multiTouchUndo.attach(to: view)
+
         pencilInteraction.delegate = self
         view.addInteraction(pencilInteraction)
 
@@ -428,6 +442,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
                 self?.recordCurrentViewport()
+                PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
         NotificationCenter.default.publisher(for: .PDFViewScaleChanged, object: pdfView)
@@ -435,6 +450,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
                 self?.recordCurrentViewport()
+                PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
         attachScrollViewObserversIfNeeded()
@@ -448,6 +464,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
                 self?.recordCurrentViewport()
+                PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
         scrollView.publisher(for: \.zoomScale)
@@ -455,6 +472,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 self?.refreshSelectedShapeOverlay()
                 self?.refreshLassoSelectionOverlay()
                 self?.recordCurrentViewport()
+                PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
     }
@@ -2276,17 +2294,37 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         eraseWorking = original
         let p = pagePoint(touch, pageIndex: pageIdx)
         lastErasePoint = p
-        applyEraseStep(from: p, to: p)
+        if applyEraseStep(from: p, to: p) {
+            overlays[pageIdx]?.renderPreview(eraseWorking)
+            PresentationCenter.shared.markContentActive()
+        }
         setEraserCursor(p, pageIndex: pageIdx)
     }
 
     private func eraseMoved(_ touch: UITouch, event: UIEvent?) {
         guard eraseOriginal != nil else { return }
         let pageIdx = activeErasePageIndex
-        for sample in event?.coalescedTouches(for: touch) ?? [touch] {
+        let samples = event?.coalescedTouches(for: touch) ?? [touch]
+        let minStepSq: CGFloat = liveTool.eraserMode == .pixel ? 1.44 : 0.25
+        var anyChanged = false
+        for (idx, sample) in samples.enumerated() {
             let p = pagePoint(sample, pageIndex: pageIdx)
-            applyEraseStep(from: lastErasePoint ?? p, to: p)
+            let prev = lastErasePoint ?? p
+            let dx = p.x - prev.x
+            let dy = p.y - prev.y
+            let isLast = (idx == samples.count - 1)
+            if !isLast && (dx * dx + dy * dy) < minStepSq {
+                continue
+            }
+            if applyEraseStep(from: prev, to: p) {
+                anyChanged = true
+            }
             lastErasePoint = p
+        }
+        // Render & wake projection at most once per display frame instead of 4x per frame.
+        if anyChanged {
+            overlays[pageIdx]?.renderPreview(eraseWorking)
+            PresentationCenter.shared.markContentActive()
         }
         setEraserCursor(lastErasePoint, pageIndex: pageIdx)
     }
@@ -2297,6 +2335,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             eraseOriginal = nil
             lastErasePoint = nil
             setEraserCursor(nil)
+            geometryCache.prune(keeping: Set(eraseWorking.map(\.id)))
         }
         guard let original = eraseOriginal else { return }
         if eraseWorking != original {
@@ -2304,16 +2343,16 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         } else {
             overlays[pageIdx]?.sync()
         }
+        PresentationCenter.shared.requestFrameRefresh()
     }
 
-    private func applyEraseStep(from a: CGPoint, to b: CGPoint) {
+    private func applyEraseStep(from a: CGPoint, to b: CGPoint) -> Bool {
         let result = EraserEngine.erase(eraseWorking, from: a, to: b, radius: eraserRadius,
                                         mode: liveTool.eraserMode, highlighterOnly: false,
                                         cache: geometryCache)
-        guard result.changed else { return }
+        guard result.changed else { return false }
         eraseWorking = result.strokes
-        overlays[activeErasePageIndex]?.renderPreview(eraseWorking)
-        PresentationCenter.shared.requestFrameRefresh()
+        return true
     }
 
     private func setEraserCursor(_ pagePoint: CGPoint?, pageIndex: Int = 0) {
