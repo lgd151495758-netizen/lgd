@@ -10,7 +10,9 @@ struct WorkspaceView: View {
 
     @State private var showQuickOpenPopover = false
     @State private var showPresentationPopover = false
+    @State private var exportTargetMeta: DocumentMeta?
 
+    let onCreateNotebook: () -> Void
     let onImportPDF: () -> Void
     let onImportHTML: () -> Void
     let onImportURL: () -> Void
@@ -46,6 +48,14 @@ struct WorkspaceView: View {
         }
         .background(Color(.systemBackground))
         .ignoresSafeArea(edges: .bottom)
+        .sheet(item: $exportTargetMeta) { meta in
+            ExportDocumentSheet(
+                meta: meta,
+                library: library,
+                activeSession: tabManager.session(for: meta.id),
+                liveBridge: tabManager.liveWebBridge(for: meta.id)
+            )
+        }
     }
 
     private var tabBar: some View {
@@ -95,6 +105,12 @@ struct WorkspaceView: View {
                                 library: library,
                                 tabManager: tabManager,
                                 dismiss: { showQuickOpenPopover = false },
+                                onCreateNotebook: {
+                                    showQuickOpenPopover = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                        onCreateNotebook()
+                                    }
+                                },
                                 onImportPDF: {
                                     showQuickOpenPopover = false
                                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
@@ -129,7 +145,13 @@ struct WorkspaceView: View {
 
             HStack(spacing: 6) {
                 if let activeTab = tabManager.activeTab {
-                    ActiveTabTrailingControls(session: activeTab.session)
+                    ActiveTabTrailingControls(
+                        session: activeTab.session,
+                        onExport: {
+                            tabManager.saveAllTabs()
+                            exportTargetMeta = activeTab.meta
+                        }
+                    )
                 }
                 if presentation.isExternalDisplayConnected {
                     Button {
@@ -229,21 +251,79 @@ private struct DocumentTabPill: View {
     }
 }
 
-/// Observes the active tab's `DocumentSession` directly so page numbers & clear options update live.
+/// Observes the active tab's `DocumentSession` directly so page numbers, class layers, export,
+/// and clear options update live.
 private struct ActiveTabTrailingControls: View {
     @ObservedObject var session: DocumentSession
+    let onExport: () -> Void
+
+    @State private var showPageNavigator = false
+    @State private var showLayersPopover = false
 
     var body: some View {
         HStack(spacing: 6) {
-            if session.pdfPageCount > 1 {
-                Text("\(session.activeDocumentPageIndex + 1)/\(session.pdfPageCount)")
-                    .font(.caption.monospacedDigit().weight(.medium))
-                    .foregroundStyle(.secondary)
+            if session.pdfPageCount >= 1 && session.meta.layout != .live {
+                Button {
+                    showPageNavigator = true
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("\(session.activeDocumentPageIndex + 1)/\(session.pdfPageCount)")
+                            .font(.caption.monospacedDigit().weight(.medium))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .bold))
+                    }
+                    .foregroundStyle(.primary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
-                    .background(Color.secondary.opacity(0.12), in: Capsule())
-                    .accessibilityLabel("第 \(session.activeDocumentPageIndex + 1) 页，共 \(session.pdfPageCount) 页")
+                    .background(Color.secondary.opacity(0.14), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("页面导航：第 \(session.activeDocumentPageIndex + 1) 页，共 \(session.pdfPageCount) 页")
+                .popover(isPresented: $showPageNavigator) {
+                    PDFPageNavigatorPopover(session: session) {
+                        showPageNavigator = false
+                    }
+                }
             }
+
+            Button {
+                session.refreshLayerSummaries()
+                showLayersPopover = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "square.3.layers.3d")
+                    Text(session.hasMultipleLayers ? session.activeLayerName : "图层")
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .frame(maxWidth: 74)
+                }
+                .foregroundStyle(session.hasMultipleLayers ? Color.accentColor : Color.primary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(session.hasMultipleLayers ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.14),
+                            in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("切换班级板书图层")
+            .popover(isPresented: $showLayersPopover) {
+                ClassLayersPopover(session: session) {
+                    showLayersPopover = false
+                }
+            }
+
+            Button(action: onExport) {
+                HStack(spacing: 4) {
+                    Image(systemName: "square.and.arrow.up")
+                    Text("导出")
+                        .font(.caption.weight(.medium))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color.secondary.opacity(0.14), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("导出带批注 PDF 或图片")
+
             clearMenu
         }
     }
@@ -313,6 +393,7 @@ private struct QuickOpenDocumentPopover: View {
     @ObservedObject var library: LibraryStore
     @ObservedObject var tabManager: TabManager
     let dismiss: () -> Void
+    let onCreateNotebook: () -> Void
     let onImportPDF: () -> Void
     let onImportHTML: () -> Void
     let onImportURL: () -> Void
@@ -333,15 +414,21 @@ private struct QuickOpenDocumentPopover: View {
                 Spacer()
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Button(action: onCreateNotebook) {
+                    Label("空白本", systemImage: "note.text.badge.plus")
+                        .font(.caption.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
                 Button(action: onImportPDF) {
-                    Label("导入 PDF", systemImage: "doc.fill")
+                    Label("PDF", systemImage: "doc.fill")
                         .font(.caption.weight(.medium))
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 Button(action: onImportHTML) {
-                    Label("导入 HTML", systemImage: "doc.badge.plus")
+                    Label("HTML", systemImage: "doc.badge.plus")
                         .font(.caption.weight(.medium))
                         .frame(maxWidth: .infinity)
                 }
@@ -496,12 +583,18 @@ private struct TabDeckRepresentable: UIViewControllerRepresentable {
         tabManager.onFlushTabState = { [weak controller] id in
             controller?.flushTabState(for: id)
         }
+        tabManager.onResolveLiveBridge = { [weak controller] id in
+            controller?.liveWebBridge(for: id)
+        }
         return controller
     }
 
     func updateUIViewController(_ uiViewController: TabDeckViewController, context: Context) {
         tabManager.onFlushTabState = { [weak uiViewController] id in
             uiViewController?.flushTabState(for: id)
+        }
+        tabManager.onResolveLiveBridge = { [weak uiViewController] id in
+            uiViewController?.liveWebBridge(for: id)
         }
         uiViewController.sync(
             tabs: tabManager.tabs,

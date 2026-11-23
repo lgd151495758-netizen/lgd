@@ -308,6 +308,36 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             self.scratchpadPanel.canvas.syncCommittedStrokes()
             PresentationCenter.shared.requestFrameRefresh()
         }
+        session.requestJumpToPDFPage = { [weak self] pageIndex in
+            guard let self, let doc = self.pdfView.document,
+                  pageIndex >= 0, pageIndex < doc.pageCount,
+                  let page = doc.page(at: pageIndex) else { return }
+            self.clearSelectedShape()
+            self.clearLassoSelection()
+            self.pdfView.go(to: page)
+            self.updateActiveDocumentPageIndex()
+            self.recordCurrentViewport()
+            PresentationCenter.shared.requestFrameRefresh()
+        }
+        session.pdfDocumentDidReload = { [weak self] targetPageIndex in
+            guard let self else { return }
+            self.clearSelectedShape()
+            self.clearLassoSelection()
+            let savedScale = self.pdfView.scaleFactor
+            self.overlays.removeAll()
+            self.pdfView.document = self.session.pdfDocument
+            if savedScale.isFinite, savedScale > 0.1 {
+                self.pdfView.scaleFactor = savedScale
+            }
+            if let doc = self.pdfView.document,
+               targetPageIndex >= 0, targetPageIndex < doc.pageCount,
+               let page = doc.page(at: targetPageIndex) {
+                self.pdfView.go(to: page)
+            }
+            self.updateActiveDocumentPageIndex()
+            self.recordCurrentViewport()
+            PresentationCenter.shared.requestFrameRefresh()
+        }
         session.$tool
             .sink { [weak self] _ in
                 DispatchQueue.main.async {

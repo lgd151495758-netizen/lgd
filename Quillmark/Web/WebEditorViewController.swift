@@ -16,6 +16,8 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     private let library: LibraryStore
     private let bridge = WebInkBridge()
     private var webView: WKWebView { bridge.webView }
+    /// Exposed for `DocumentExportService` to capture live DOM + SVG ink without reloading.
+    var exportBridge: WebInkBridge { bridge }
 
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
     private let pendingFillContainer = CALayer()

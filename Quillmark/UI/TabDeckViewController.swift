@@ -47,6 +47,10 @@ final class TabDeckViewController: UIViewController {
         controllers[id]?.saveStateNow()
     }
 
+    func liveWebBridge(for id: UUID) -> WebInkBridge? {
+        (controllers[id] as? WebEditorViewController)?.exportBridge
+    }
+
     func sync(tabs: [DocumentTab], activeTabID: UUID?, isWorkspaceVisible: Bool, library: LibraryStore) {
         loadViewIfNeeded()
 

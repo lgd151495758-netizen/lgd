@@ -25,7 +25,9 @@ enum ImportError: LocalizedError {
 enum HTMLImportService {
     static let archiveName = "page.webarchive"
 
-    static func importDocument(from source: ImportSource, into library: LibraryStore) async throws -> DocumentMeta {
+    static func importDocument(from source: ImportSource,
+                               into library: LibraryStore,
+                               folderID: UUID? = nil) async throws -> DocumentMeta {
         let fileManager = FileManager.default
         let staging = fileManager.temporaryDirectory.appendingPathComponent("import-\(UUID().uuidString)", isDirectory: true)
         let sourceFolder = staging.appendingPathComponent("source", isDirectory: true)
@@ -38,20 +40,23 @@ enum HTMLImportService {
                 let (pdfData, title) = try loadLocalPDF(url)
                 return try library.createDocument(title: title, pdfData: pdfData, layout: .pdf,
                                                   sourceKind: .pdfFile, sourceURL: url.lastPathComponent,
-                                                  stagedSource: nil)
+                                                  stagedSource: nil, folderID: folderID)
+            }
+            if ImageImportService.isImageFile(url) {
+                return try ImageImportService.importImageFile(url, folderID: folderID, into: library)
             }
             let entry = try stageLocalHTML(url, into: sourceFolder)
             let title = htmlTitle(of: entry) ?? url.deletingPathExtension().lastPathComponent
             return try library.createDocument(title: title, pdfData: nil, layout: .live, sourceKind: .htmlFile,
                                               sourceURL: url.lastPathComponent, stagedSource: sourceFolder,
-                                              sourceEntry: entry.lastPathComponent)
+                                              sourceEntry: entry.lastPathComponent, folderID: folderID)
         case .web(let url):
             let output = try await WebArchiver.archive(url)
             try output.archive.write(to: sourceFolder.appendingPathComponent(archiveName), options: .atomic)
             let title = nonEmpty(output.title) ?? url.host ?? "网页"
             return try library.createDocument(title: title, pdfData: nil, layout: .live, sourceKind: .webURL,
                                               sourceURL: url.absoluteString, stagedSource: sourceFolder,
-                                              sourceEntry: archiveName)
+                                              sourceEntry: archiveName, folderID: folderID)
         }
     }
 

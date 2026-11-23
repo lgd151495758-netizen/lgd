@@ -32,7 +32,7 @@ final class DocumentSession: ObservableObject {
     }
 
     let meta: DocumentMeta
-    let pdfDocument: PDFDocument?
+    private(set) var pdfDocument: PDFDocument?
 
     @Published var tool: ToolSettings {
         didSet { tool.save() }
@@ -55,14 +55,26 @@ final class DocumentSession: ObservableObject {
     @Published private(set) var canRedo = false
     /// Zero-based currently visible main page index (used by multi-page PDF documents).
     @Published var activeDocumentPageIndex: Int = 0
+    @Published private(set) var pdfPageCount: Int = 0
+    /// Multi-class annotation layers for teaching the same document across different classes.
+    @Published private(set) var layers: [InkLayer] = []
+    @Published private(set) var activeLayerID: UUID = DocumentAnnotations.implicitDefaultLayerID
 
     /// Called after the strokes of a single page changed (page index; negative values are scratchpad pages).
     var pageDidChange: ((Int) -> Void)?
-    /// Called after a multi-page command (`replaceAll`) changed multiple pages at once.
+    /// Called after a multi-page command (`replaceAll`) or layer switch changed multiple pages at once.
     var allPagesDidChange: (() -> Void)?
+    /// Called when the user selects a target page from the PDF page navigator popover.
+    var requestJumpToPDFPage: ((Int) -> Void)?
+    /// Called after a new blank page is inserted into the PDF on disk (passes newly inserted page index).
+    var pdfDocumentDidReload: ((Int) -> Void)?
 
-    var pdfPageCount: Int {
-        pdfDocument?.pageCount ?? 0
+    var activeLayerName: String {
+        layers.first(where: { $0.id == activeLayerID })?.name ?? annotations.activeLayerName
+    }
+
+    var hasMultipleLayers: Bool {
+        layers.count > 1
     }
 
     /// Negative page ID for the currently active scratchpad page (`-1, -2, ...`).
@@ -87,7 +99,11 @@ final class DocumentSession: ObservableObject {
         self.annotations = loaded
         self.scratchpadPageCount = loaded.resolvedScratchpadPageCount
         self.scratchpadPaper = loaded.scratchpadPaper ?? .grid
-        self.pdfDocument = PDFDocument(url: library.pdfURL(for: meta.id))
+        let pdf = PDFDocument(url: library.pdfURL(for: meta.id))
+        self.pdfDocument = pdf
+        self.pdfPageCount = pdf?.pageCount ?? 0
+        self.layers = loaded.resolvedLayers
+        self.activeLayerID = loaded.resolvedActiveLayerID
         let observer = NotificationCenter.default.addObserver(forName: UIApplication.willResignActiveNotification,
                                                               object: nil, queue: .main) { [weak self] _ in
             self?.saveNow()
@@ -200,6 +216,7 @@ final class DocumentSession: ObservableObject {
         if let paper = loaded.scratchpadPaper {
             scratchpadPaper = paper
         }
+        refreshPublishedLayers()
         undoStack.removeAll()
         redoStack.removeAll()
         updateFlags()
@@ -208,6 +225,112 @@ final class DocumentSession: ObservableObject {
         } else {
             pageDidChange?(0)
         }
+    }
+
+    // MARK: Multi-Class Annotation Layers
+
+    func switchLayer(to id: UUID) {
+        guard id != activeLayerID else { return }
+        guard annotations.switchToLayer(id) else { return }
+        applyLayerChange()
+    }
+
+    @discardableResult
+    func createLayer(name: String, template: DocumentAnnotations.NewLayerTemplate) -> InkLayer {
+        let created = annotations.createLayer(name: name, template: template)
+        applyLayerChange()
+        return created
+    }
+
+    func renameLayer(id: UUID, to newName: String) {
+        guard annotations.renameLayer(id, to: newName) else { return }
+        refreshPublishedLayers()
+        hasUnsavedChanges = true
+        saveNow()
+    }
+
+    func deleteLayer(id: UUID) {
+        guard annotations.deleteLayer(id) else { return }
+        applyLayerChange()
+    }
+
+    private func applyLayerChange() {
+        scratchpadPageCount = annotations.resolvedScratchpadPageCount
+        scratchpadPageIndex = min(max(0, scratchpadPageIndex), max(0, scratchpadPageCount - 1))
+        refreshPublishedLayers()
+        undoStack.removeAll()
+        redoStack.removeAll()
+        updateFlags()
+        if let allPagesDidChange {
+            allPagesDidChange()
+        } else {
+            pageDidChange?(0)
+        }
+        hasUnsavedChanges = true
+        saveNow()
+    }
+
+    private func refreshPublishedLayers() {
+        layers = annotations.resolvedLayers
+        activeLayerID = annotations.resolvedActiveLayerID
+    }
+
+    // MARK: PDF Navigation & Blank Page Insertion
+
+    func jumpToPDFPage(_ index: Int) {
+        guard pdfPageCount > 0 else { return }
+        let clamped = min(max(0, index), pdfPageCount - 1)
+        activeDocumentPageIndex = clamped
+        requestJumpToPDFPage?(clamped)
+    }
+
+    /// Inserts a crisp vector blank page (`blank`/`grid`/`dot`/`graph`) directly after `pageIndex`
+    /// in the underlying PDF, shifting annotation page indices across every class layer cleanly.
+    @discardableResult
+    func insertBlankPDFPage(after pageIndex: Int, paper: ScratchpadPaperStyle) throws -> Int {
+        guard let doc = pdfDocument, doc.pageCount > 0 else {
+            throw ImportError.invalidPDF
+        }
+        let clampedAnchor = min(max(0, pageIndex), doc.pageCount - 1)
+        let insertIndex = clampedAnchor + 1
+        let referenceSize: CGSize
+        if let refPage = doc.page(at: clampedAnchor) {
+            let box = refPage.bounds(for: .cropBox)
+            let rot = ((refPage.rotation % 360) + 360) % 360
+            referenceSize = (rot == 90 || rot == 270)
+                ? CGSize(width: box.height, height: box.width)
+                : box.size
+        } else {
+            referenceSize = NotebookOrientation.portraitA4.pageSize
+        }
+
+        guard let blankPage = BlankNotebookService.makeSingleBlankPage(size: referenceSize, paper: paper) else {
+            throw ImportError.invalidPDF
+        }
+
+        doc.insert(blankPage, at: insertIndex)
+        guard let updatedData = doc.dataRepresentation() else {
+            doc.removePage(at: insertIndex)
+            throw ImportError.invalidPDF
+        }
+        let pdfURL = library.pdfURL(for: meta.id)
+        try updatedData.write(to: pdfURL, options: .atomic)
+
+        // Reload a fresh PDFDocument from disk so PDFView renders cleanly with no stale page caches.
+        let reloaded = PDFDocument(url: pdfURL) ?? doc
+        pdfDocument = reloaded
+        pdfPageCount = reloaded.pageCount
+
+        annotations.shiftPageIndicesForInsertedPage(at: insertIndex)
+        refreshPublishedLayers()
+        undoStack.removeAll()
+        redoStack.removeAll()
+        updateFlags()
+        activeDocumentPageIndex = insertIndex
+        hasUnsavedChanges = true
+        saveNow()
+        pdfDocumentDidReload?(insertIndex)
+        return insertIndex
     }
 
     func selectScratchpadPage(_ index: Int) {
@@ -249,9 +372,16 @@ final class DocumentSession: ObservableObject {
         replaceStrokes(onPage: page, before: before, after: after)
     }
 
+    /// Refreshes published layer stroke counts (call before opening the Layers popover).
+    func refreshLayerSummaries() {
+        annotations.syncActiveLayerFromTopLevel()
+        refreshPublishedLayers()
+    }
+
     /// Clears handwriting across all main document pages as one undoable step (preserving sticky-note pages).
     /// When `keepTapes` is `true`, Cover Tapes are preserved and reset to covered (`revealed = false`).
     func clearAllDocumentHandwriting(keepTapes: Bool) {
+        annotations.syncActiveLayerFromTopLevel()
         let before = annotations
         var after = annotations
         var updatedPages: [String: PageAnnotations] = [:]
@@ -269,6 +399,7 @@ final class DocumentSession: ObservableObject {
             }
         }
         after.pages = updatedPages
+        after.syncActiveLayerFromTopLevel()
         guard after != before else { return }
         perform(.replaceAll(before: before, after: after))
     }
@@ -347,6 +478,7 @@ final class DocumentSession: ObservableObject {
         saveWork?.cancel()
         saveWork = nil
         guard hasUnsavedChanges else { return }
+        annotations.syncActiveLayerFromTopLevel()
         do {
             try library.saveAnnotations(annotations, for: meta.id)
             hasUnsavedChanges = false
@@ -375,6 +507,7 @@ final class DocumentSession: ObservableObject {
             if let paper = after.scratchpadPaper {
                 scratchpadPaper = paper
             }
+            refreshPublishedLayers()
         }
         if let page = command.page {
             pageDidChange?(page)

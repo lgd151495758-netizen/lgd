@@ -330,7 +330,46 @@ struct ViewportState: Codable, Equatable {
     }
 }
 
+/// Independent annotation layer on the same document (e.g. "默认板书", "九(1)班", "九(2)班")
+/// so a teacher can teach multiple classes on one PDF/HTML without duplicating source files.
+struct InkLayer: Codable, Equatable, Identifiable {
+    var id: UUID
+    var name: String
+    var createdAt: Date
+    var pages: [String: PageAnnotations]
+    var scratchpadPages: [PageAnnotations]?
+
+    init(id: UUID = UUID(),
+         name: String,
+         createdAt: Date = Date(),
+         pages: [String: PageAnnotations] = [:],
+         scratchpadPages: [PageAnnotations]? = nil) {
+        self.id = id
+        self.name = name
+        self.createdAt = createdAt
+        self.pages = pages
+        self.scratchpadPages = scratchpadPages
+    }
+
+    /// Total stroke count across all main document pages in this layer.
+    var mainStrokeCount: Int {
+        pages.values.reduce(0) { $0 + $1.strokes.count }
+    }
+}
+
 struct DocumentAnnotations: Codable, Equatable {
+    enum NewLayerTemplate: Equatable {
+        /// Start completely clean (no handwriting, no cover tapes).
+        case blank
+        /// Keep Cover Tapes from the active layer and reset them to covered (`revealed = false`).
+        case keepTapesFromCurrent
+        /// Duplicate all strokes, shapes, cover tapes, and scratchpad pages from the active layer.
+        case duplicateCurrent
+    }
+
+    static let implicitDefaultLayerID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+    static let defaultLayerName = "默认板书"
+
     var version: Int = 1
     /// Keyed by zero-based page index as a string, so the JSON stays a plain object.
     var pages: [String: PageAnnotations] = [:]
@@ -342,6 +381,10 @@ struct DocumentAnnotations: Codable, Equatable {
     var scratchpadFrame: CGRect?
     /// Last scroll offset, zoom scale, and PDF page index for reopening at the previous position.
     var viewport: ViewportState?
+    /// Multi-class annotation layers (optional for backward compatibility with v1.3 documents).
+    var layers: [InkLayer]?
+    /// Currently active layer ID when `layers` is populated.
+    var activeLayerID: UUID?
 
     /// Negative page indices (`-1, -2, ...`) map to zero-based scratchpad pages (`0, 1, ...`).
     static func scratchpadPageID(_ scratchpadIndex: Int) -> Int {
@@ -350,6 +393,203 @@ struct DocumentAnnotations: Codable, Equatable {
 
     var resolvedScratchpadPageCount: Int {
         max(1, scratchpadPages?.count ?? 0)
+    }
+
+    /// Non-empty scratchpad pages in display order alongside their zero-based page index.
+    var nonEmptyScratchpadPages: [(index: Int, strokes: [InkStroke])] {
+        guard let list = scratchpadPages else { return [] }
+        return list.enumerated().compactMap { idx, page in
+            page.strokes.isEmpty ? nil : (idx, page.strokes)
+        }
+    }
+
+    /// All layers with the currently active layer reflecting the latest top-level `pages` and `scratchpadPages`.
+    var resolvedLayers: [InkLayer] {
+        guard var list = layers, !list.isEmpty else {
+            return [
+                InkLayer(
+                    id: activeLayerID ?? Self.implicitDefaultLayerID,
+                    name: Self.defaultLayerName,
+                    createdAt: Date(timeIntervalSince1970: 0),
+                    pages: pages,
+                    scratchpadPages: scratchpadPages
+                ),
+            ]
+        }
+        let currentID = activeLayerID ?? list[0].id
+        if let idx = list.firstIndex(where: { $0.id == currentID }) {
+            list[idx].pages = pages
+            list[idx].scratchpadPages = scratchpadPages
+        }
+        return list
+    }
+
+    var resolvedActiveLayerID: UUID {
+        if let list = layers, !list.isEmpty {
+            if let activeLayerID, list.contains(where: { $0.id == activeLayerID }) {
+                return activeLayerID
+            }
+            return list[0].id
+        }
+        return activeLayerID ?? Self.implicitDefaultLayerID
+    }
+
+    var activeLayerName: String {
+        let currentID = resolvedActiveLayerID
+        return resolvedLayers.first(where: { $0.id == currentID })?.name ?? Self.defaultLayerName
+    }
+
+    var hasMultipleLayers: Bool {
+        (layers?.count ?? 0) > 1
+    }
+
+    /// Writes the active top-level `pages` and `scratchpadPages` back into `layers` if layers are enabled.
+    mutating func syncActiveLayerFromTopLevel() {
+        guard var list = layers, !list.isEmpty else { return }
+        let currentID = resolvedActiveLayerID
+        if let idx = list.firstIndex(where: { $0.id == currentID }) {
+            list[idx].pages = pages
+            list[idx].scratchpadPages = scratchpadPages
+            activeLayerID = currentID
+            layers = list
+        }
+    }
+
+    /// Materializes the implicit single layer into `layers` so multi-layer operations have stable IDs.
+    @discardableResult
+    mutating func ensureLayersInitialized(defaultName: String = DocumentAnnotations.defaultLayerName) -> UUID {
+        if var list = layers, !list.isEmpty {
+            let currentID = resolvedActiveLayerID
+            activeLayerID = currentID
+            if let idx = list.firstIndex(where: { $0.id == currentID }) {
+                list[idx].pages = pages
+                list[idx].scratchpadPages = scratchpadPages
+                layers = list
+            }
+            return currentID
+        }
+        let id = activeLayerID ?? Self.implicitDefaultLayerID
+        let initial = InkLayer(id: id, name: defaultName, createdAt: Date(),
+                               pages: pages, scratchpadPages: scratchpadPages)
+        layers = [initial]
+        activeLayerID = id
+        return id
+    }
+
+    /// Switches the active annotation layer, saving current strokes into the previous layer first.
+    @discardableResult
+    mutating func switchToLayer(_ targetID: UUID) -> Bool {
+        syncActiveLayerFromTopLevel()
+        guard let list = layers, let target = list.first(where: { $0.id == targetID }) else {
+            return false
+        }
+        activeLayerID = target.id
+        pages = target.pages
+        scratchpadPages = target.scratchpadPages
+        return true
+    }
+
+    /// Creates a new class layer derived from `template` and switches to it immediately.
+    @discardableResult
+    mutating func createLayer(name: String, template: NewLayerTemplate) -> InkLayer {
+        ensureLayersInitialized()
+        syncActiveLayerFromTopLevel()
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedName = trimmed.isEmpty ? "班级 \((layers?.count ?? 1) + 1)" : trimmed
+
+        let newPages: [String: PageAnnotations]
+        let newScratchpad: [PageAnnotations]?
+        switch template {
+        case .blank:
+            newPages = [:]
+            newScratchpad = nil
+        case .keepTapesFromCurrent:
+            var keptPages: [String: PageAnnotations] = [:]
+            for (key, page) in pages {
+                let kept: [InkStroke] = page.strokes.compactMap { stroke in
+                    guard stroke.isTape else { return nil }
+                    var covered = stroke
+                    covered.id = UUID()
+                    covered.revealed = false
+                    return covered
+                }
+                if !kept.isEmpty {
+                    keptPages[key] = PageAnnotations(strokes: kept)
+                }
+            }
+            newPages = keptPages
+            newScratchpad = nil
+        case .duplicateCurrent:
+            newPages = pages
+            newScratchpad = scratchpadPages
+        }
+
+        let created = InkLayer(id: UUID(), name: resolvedName, createdAt: Date(),
+                               pages: newPages, scratchpadPages: newScratchpad)
+        var list = layers ?? []
+        list.append(created)
+        layers = list
+        activeLayerID = created.id
+        pages = created.pages
+        scratchpadPages = created.scratchpadPages
+        return created
+    }
+
+    @discardableResult
+    mutating func renameLayer(_ id: UUID, to newName: String) -> Bool {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        ensureLayersInitialized()
+        guard var list = layers, let idx = list.firstIndex(where: { $0.id == id }) else { return false }
+        list[idx].name = trimmed
+        layers = list
+        return true
+    }
+
+    /// Deletes a layer when at least two layers exist. If the active layer is deleted, switches to an adjacent one.
+    @discardableResult
+    mutating func deleteLayer(_ id: UUID) -> Bool {
+        syncActiveLayerFromTopLevel()
+        guard var list = layers, list.count > 1,
+              let idx = list.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let removingActive = (resolvedActiveLayerID == id)
+        list.remove(at: idx)
+        layers = list
+        if removingActive {
+            let nextIdx = min(idx, list.count - 1)
+            let nextLayer = list[nextIdx]
+            activeLayerID = nextLayer.id
+            pages = nextLayer.pages
+            scratchpadPages = nextLayer.scratchpadPages
+        }
+        return true
+    }
+
+    /// Shifts all PDF page indices `>= insertIndex` up by `+1` in both top-level `pages` and every class layer.
+    mutating func shiftPageIndicesForInsertedPage(at insertIndex: Int) {
+        func shifted(_ dict: [String: PageAnnotations]) -> [String: PageAnnotations] {
+            var result: [String: PageAnnotations] = [:]
+            result.reserveCapacity(dict.count)
+            for (key, value) in dict {
+                if let pageNum = Int(key), pageNum >= insertIndex {
+                    result[String(pageNum + 1)] = value
+                } else {
+                    result[key] = value
+                }
+            }
+            return result
+        }
+
+        syncActiveLayerFromTopLevel()
+        pages = shifted(pages)
+        if var list = layers {
+            for i in list.indices {
+                list[i].pages = shifted(list[i].pages)
+            }
+            layers = list
+        }
     }
 
     func page(_ index: Int) -> PageAnnotations {

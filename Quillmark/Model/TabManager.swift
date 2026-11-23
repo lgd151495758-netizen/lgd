@@ -26,6 +26,16 @@ final class TabManager: ObservableObject {
 
     /// Called before saving or leaving a tab so the live view controller can flush its current viewport.
     var onFlushTabState: (@MainActor (UUID) -> Void)?
+    /// Resolves the live `WebInkBridge` for an open HTML tab so exports preserve live DOM state.
+    var onResolveLiveBridge: (@MainActor (UUID) -> WebInkBridge?)?
+
+    func liveWebBridge(for id: UUID) -> WebInkBridge? {
+        onResolveLiveBridge?(id)
+    }
+
+    func session(for id: UUID) -> DocumentSession? {
+        tabs.first(where: { $0.id == id })?.session
+    }
 
     var activeTab: DocumentTab? {
         guard let activeTabID else { return nil }
