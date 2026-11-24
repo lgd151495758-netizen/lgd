@@ -46,7 +46,7 @@ struct ProtractorState: Equatable {
     static let closeButtonWidth: CGFloat = 36
 
     var center: CGPoint = .zero
-    var radius: CGFloat = defaultRadius
+    var radius: CGFloat = ProtractorState.defaultRadius
     /// Primary (blue) reference ray angle in UIKit screen radians.
     var ray1Angle: CGFloat = 0
     /// Secondary (orange) measuring ray angle in UIKit screen radians.
