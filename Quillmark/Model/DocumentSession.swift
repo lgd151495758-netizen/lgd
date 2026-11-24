@@ -35,8 +35,16 @@ final class DocumentSession: ObservableObject {
     private(set) var pdfDocument: PDFDocument?
 
     @Published var tool: ToolSettings {
-        didSet { tool.save() }
+        didSet {
+            tool.save()
+            if tool.kind != .eraser && autoReturnToPenAfterErase {
+                autoReturnToPenAfterErase = false
+            }
+        }
     }
+    /// Set to `true` only when entering `.eraser` via Apple Pencil double-tap so lifting the pen
+    /// tip after erasing automatically switches back to `.pen`.
+    @Published private(set) var autoReturnToPenAfterErase = false
     @Published var geometryAid: GeometryAid = .none
     @Published var isScratchpadOpen: Bool = false
     @Published var scratchpadSplitMode: ScratchpadSplitMode = .floating
@@ -427,8 +435,20 @@ final class DocumentSession: ObservableObject {
         }
     }
 
+    /// Selects a tool explicitly from the toolbar UI (manual eraser selection stays in eraser mode).
+    func selectToolManually(_ kind: ToolKind) {
+        autoReturnToPenAfterErase = false
+        tool.select(kind)
+        if kind == .pen {
+            tool.pen = .ballpoint
+        }
+    }
+
     /// Apple Pencil (2nd generation) double-tap, following the user's system preference.
+    /// Switching into `.eraser` via double-tap arms one-shot auto-return back to `.pen` once the
+    /// pen tip lifts off the screen after erasing.
     func handlePencilDoubleTap(_ action: UIPencilPreferredAction) {
+        let previousKind = tool.kind
         switch action {
         case .ignore:
             return
@@ -437,6 +457,19 @@ final class DocumentSession: ObservableObject {
         default:
             tool.toggleEraser()
         }
+        if tool.kind == .eraser && previousKind != .eraser {
+            autoReturnToPenAfterErase = true
+        } else {
+            autoReturnToPenAfterErase = false
+        }
+    }
+
+    /// Called when an erase touch ends (pen tip lifts off screen) across PDF, HTML, or Scratchpad.
+    func didFinishEraseStroke() {
+        guard autoReturnToPenAfterErase, tool.kind == .eraser else { return }
+        autoReturnToPenAfterErase = false
+        tool.select(.pen)
+        tool.pen = .ballpoint
     }
 
     func perform(_ command: Command) {

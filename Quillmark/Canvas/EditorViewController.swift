@@ -79,6 +79,11 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         case compassResize
         case compassButton(CompassState.HitZone, startPoint: CGPoint)
         case compassDraw(pageIndex: Int, sweep: CompassSweep, crossedCloseHaptic: Bool)
+        case protractorCenter(grabOffset: CGPoint)
+        case protractorRay1
+        case protractorRay2
+        case protractorRotate(lastAngle: CGFloat)
+        case protractorButton(ProtractorState.HitZone, startPoint: CGPoint)
         case shapeCreate(pageIndex: Int, preset: ShapePreset, startPage: CGPoint, rawStartView: CGPoint, currentPrimitive: GeometricPrimitive?)
         case selectedHandle(index: Int, context: ShapeEditContext)
         case selectedBody(startPage: CGPoint, context: ShapeEditContext)
@@ -89,8 +94,9 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         case lassoAction(LassoSelectionOverlay.ActionButton, startPoint: CGPoint)
     }
 
-    // Virtual Compass, Selected Shape, Lasso & Snap Points
+    // Virtual Compass, Smart Protractor, Selected Shape, Lasso & Snap Points
     private var compassState = CompassState()
+    private var protractorState = ProtractorState()
     private var selectedStrokeID: UUID?
     private var selectedPageIndex: Int = 0
     private var lassoSelectedIDs: [UUID] = []
@@ -991,9 +997,21 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 compassState.center = CGPoint(x: bounds.midX, y: bounds.midY)
             }
             geometryOverlay.compass = compassState
+        } else if aid == .protractor {
+            clearSelectedShape()
+            clearLassoSelection()
+            let bounds = view.bounds
+            if bounds.width > 0, bounds.height > 0,
+               protractorState.center == .zero || !bounds.insetBy(dx: 24, dy: 24).contains(protractorState.center) {
+                protractorState.center = CGPoint(x: bounds.midX, y: bounds.midY)
+            }
+            geometryOverlay.protractor = protractorState
         }
         geometryOverlay.aid = aid
         syncGeometryOverlayAppearance()
+        if aid == .protractor {
+            autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: false)
+        }
     }
 
     private func clampGeometryAidsToBounds() {
@@ -1004,6 +1022,11 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             compassState.center.x = min(max(safe.minX, compassState.center.x), safe.maxX)
             compassState.center.y = min(max(safe.minY, compassState.center.y), safe.maxY)
             geometryOverlay.compass = compassState
+        }
+        if protractorState.center != .zero {
+            protractorState.center.x = min(max(safe.minX, protractorState.center.x), safe.maxX)
+            protractorState.center.y = min(max(safe.minY, protractorState.center.y), safe.maxY)
+            geometryOverlay.protractor = protractorState
         }
     }
 
@@ -1297,6 +1320,28 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     // MARK: Compass & Active Geometry Interaction Dispatch
 
     private func beginGeometryAidInteraction(at viewPoint: CGPoint, allowDrawing: Bool) -> ActiveInteraction? {
+        if session.geometryAid == .protractor {
+            let hit = protractorState.hitTest(viewPoint, in: view.bounds)
+            switch hit {
+            case .none:
+                return nil
+            case .autoDetectButton, .cycleAngleButton, .stampAngleButton, .closeButton:
+                return .protractorButton(hit, startPoint: viewPoint)
+            case .center:
+                refreshAllVisibleViewSnapPoints()
+                let offset = CGPoint(x: protractorState.center.x - viewPoint.x, y: protractorState.center.y - viewPoint.y)
+                return .protractorCenter(grabOffset: offset)
+            case .ray1Handle:
+                refreshAllVisibleViewSnapPoints()
+                return .protractorRay1
+            case .ray2Handle:
+                refreshAllVisibleViewSnapPoints()
+                return .protractorRay2
+            case .ringRotate:
+                let startAngle = atan2(viewPoint.y - protractorState.center.y, viewPoint.x - protractorState.center.x)
+                return .protractorRotate(lastAngle: startAngle)
+            }
+        }
         guard session.geometryAid == .compass else { return nil }
         let hit = compassState.hitTest(viewPoint, in: view.bounds)
         switch hit {
@@ -1343,7 +1388,40 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             updateSnapFeedback(snap)
             return true
 
-        case .compassButton, .selectedAction, .lassoAction:
+        case let .protractorCenter(grabOffset):
+            let rawCenter = CGPoint(x: viewPoint.x + grabOffset.x, y: viewPoint.y + grabOffset.y)
+            let snap = protractorState.moveCenter(to: rawCenter, snapPoints: cachedViewSnapPoints)
+            if snap != nil {
+                autoDetectProtractorAngle(allowImageFallback: false, triggerHaptic: false)
+            } else if protractorState.autoDetectedSource != nil {
+                protractorState.autoDetectedSource = nil
+                protractorState.detectedRayAngles = []
+            }
+            geometryOverlay.protractor = protractorState
+            updateSnapFeedback(snap)
+            return true
+
+        case .protractorRay1:
+            let snap = protractorState.aimRay1(to: viewPoint, snapPoints: cachedViewSnapPoints)
+            geometryOverlay.protractor = protractorState
+            updateSnapFeedback(snap)
+            return true
+
+        case .protractorRay2:
+            let snap = protractorState.aimRay2(to: viewPoint, snapPoints: cachedViewSnapPoints)
+            geometryOverlay.protractor = protractorState
+            updateSnapFeedback(snap)
+            return true
+
+        case let .protractorRotate(lastAngle):
+            let currentAngle = atan2(viewPoint.y - protractorState.center.y, viewPoint.x - protractorState.center.x)
+            let delta = atan2(sin(currentAngle - lastAngle), cos(currentAngle - lastAngle))
+            protractorState.rotateBoth(by: delta)
+            activeInteraction = .protractorRotate(lastAngle: currentAngle)
+            geometryOverlay.protractor = protractorState
+            return true
+
+        case .compassButton, .protractorButton, .selectedAction, .lassoAction:
             return true
 
         case var .compassDraw(pageIdx, sweep, crossedCloseHaptic):
@@ -1442,13 +1520,25 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         case .none, .normalInput:
             return false
 
-        case .compassNeedle, .compassResize:
+        case .compassNeedle, .compassResize, .protractorRay1, .protractorRay2, .protractorRotate:
             finishGeometryAidInteraction()
+            return true
+
+        case .protractorCenter:
+            finishGeometryAidInteraction()
+            autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: true)
             return true
 
         case let .compassButton(button, startPoint):
             if hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y) < 28 {
                 executeCompassButton(button)
+            }
+            finishGeometryAidInteraction()
+            return true
+
+        case let .protractorButton(button, startPoint):
+            if hypot(viewPoint.x - startPoint.x, viewPoint.y - startPoint.y) < 28 {
+                executeProtractorButton(button)
             }
             finishGeometryAidInteraction()
             return true
@@ -1590,6 +1680,81 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         }
     }
 
+    private func executeProtractorButton(_ button: ProtractorState.HitZone) {
+        switch button {
+        case .autoDetectButton:
+            autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: true)
+        case .cycleAngleButton:
+            protractorState.cycleAngle()
+            geometryOverlay.protractor = protractorState
+            haptic.impactOccurred()
+        case .stampAngleButton:
+            guard let pageIdx = pageIndex(at: protractorState.center) else { return }
+            liveTool = session.tool
+            let centerPage = pagePoint(fromView: protractorState.center, pageIndex: pageIdx)
+            let arcRadiusPage = min(34, protractorState.radius * 0.28) / viewScale(for: pageIdx)
+            if let primitive = protractorState.stampPrimitive(center: centerPage, radius: arcRadiusPage) {
+                let stroke = makeGeometricStroke(primitive)
+                session.addStroke(stroke, page: pageIdx)
+                haptic.impactOccurred()
+            }
+        case .closeButton:
+            session.geometryAid = .none
+            haptic.impactOccurred()
+        default:
+            break
+        }
+    }
+
+    /// Automatically measures the angle at `protractorState.center`: first checks exact vector strokes
+    /// on the page, then falls back to local radial contrast scanning of printed PDF diagrams.
+    private func autoDetectProtractorAngle(allowImageFallback: Bool, triggerHaptic: Bool) {
+        guard session.geometryAid == .protractor else { return }
+        if let pageIdx = pageIndex(at: protractorState.center) {
+            let centerPage = pagePoint(fromView: protractorState.center, pageIndex: pageIdx)
+            let pageTol = 16 / viewScale(for: pageIdx)
+            let vectorRays = ProtractorAngleDetector.detectVectorRays(
+                at: centerPage,
+                from: session.strokes(onPage: pageIdx),
+                origins: [:],
+                tolerance: pageTol
+            )
+            if protractorState.applyDetectedRays(vectorRays, source: .vector) {
+                geometryOverlay.protractor = protractorState
+                if triggerHaptic { haptic.impactOccurred(intensity: 0.7) }
+                return
+            }
+        }
+
+        guard allowImageFallback, pdfView.bounds.width > 48, pdfView.bounds.height > 48 else { return }
+        let patchSize: CGFloat = 144
+        let half = patchSize / 2
+        let ptInPDF = view.convert(protractorState.center, to: pdfView)
+        guard pdfView.bounds.contains(ptInPDF) else { return }
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: patchSize, height: patchSize), format: format)
+        let patchImage = renderer.image { rendererCtx in
+            let ctx = rendererCtx.cgContext
+            UIColor.white.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: patchSize, height: patchSize))
+            ctx.translateBy(x: half - ptInPDF.x, y: half - ptInPDF.y)
+            pdfView.drawHierarchy(in: pdfView.bounds, afterScreenUpdates: false)
+        }
+        guard let cgImage = patchImage.cgImage,
+              let detected = ProtractorAngleDetector.detectImageRays(in: cgImage, center: CGPoint(x: half, y: half)) else {
+            return
+        }
+        protractorState.center.x += detected.vertexOffset.x
+        protractorState.center.y += detected.vertexOffset.y
+        if protractorState.applyDetectedRays(detected.rayAngles, source: .image) {
+            geometryOverlay.protractor = protractorState
+            if triggerHaptic { haptic.impactOccurred(intensity: 0.7) }
+        }
+    }
+
     private func handleGeometryControlTap(at viewPoint: CGPoint) {
         if let lasso = geometryOverlay.lassoSelection,
            case let .action(button) = lasso.hitTest(viewPoint, in: view.bounds) {
@@ -1599,6 +1764,16 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         if let selected = geometryOverlay.selectedShape,
            case let .action(button) = selected.hitTest(viewPoint, in: view.bounds, bodyHit: false) {
             executeSelectedShapeAction(button)
+            return
+        }
+        if session.geometryAid == .protractor {
+            let hit = protractorState.hitTest(viewPoint, in: view.bounds)
+            switch hit {
+            case .autoDetectButton, .cycleAngleButton, .stampAngleButton, .closeButton:
+                executeProtractorButton(hit)
+            default:
+                break
+            }
             return
         }
         guard session.geometryAid == .compass else { return }
@@ -1638,6 +1813,9 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         case let .selectedHandle(_, context), let .selectedBody(_, context):
             finishGeometryAidInteraction()
             commitEditedShape(context)
+        case .protractorCenter:
+            finishGeometryAidInteraction()
+            autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: true)
         default:
             geometryOverlay.isResizingCompass = false
             geometryOverlay.isEditingSelectedShape = false
@@ -2344,6 +2522,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             overlays[pageIdx]?.sync()
         }
         PresentationCenter.shared.requestFrameRefresh()
+        session.didFinishEraseStroke()
     }
 
     private func applyEraseStep(from a: CGPoint, to b: CGPoint) -> Bool {

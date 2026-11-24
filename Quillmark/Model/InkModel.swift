@@ -662,6 +662,8 @@ struct ToolSettings: Codable, Equatable {
     var activePenPresetIndex: Int?
     /// Two-finger tap to undo and three-finger tap to redo across all canvases (default on).
     var multiFingerUndo: Bool?
+    /// Four pinned favorite colors shown directly on the toolbar (customizable via the color palette).
+    var quickColors: [RGBAColor]?
 
     // Cover Tape
     var tapeColor: RGBAColor = ToolSettings.tapePalette[0]
@@ -695,6 +697,53 @@ struct ToolSettings: Codable, Equatable {
         RGBAColor(0.98, 0.80, 0.12), // bright chalk yellow (great for dark-mode HTML courseware)
         RGBAColor(0.97, 0.97, 0.99), // chalk white (great for dark-mode HTML courseware)
     ]
+
+    /// The 4 most frequently used math teaching colors displayed directly on the toolbar.
+    static let defaultQuickColors: [RGBAColor] = [
+        .ink,                        // classic black
+        RGBAColor(0.80, 0.16, 0.16), // emphasis red
+        RGBAColor(0.10, 0.27, 0.66), // deep blue
+        RGBAColor(0.11, 0.55, 0.32), // forest green
+    ]
+
+    /// Curated 16-swatch classroom palette shown inside the Color Palette popover.
+    static let extendedPalette: [RGBAColor] = [
+        .ink,                        // classic black
+        RGBAColor(0.42, 0.45, 0.50), // slate gray
+        RGBAColor(0.97, 0.97, 0.99), // chalk white (dark HTML courseware)
+        RGBAColor(0.10, 0.27, 0.66), // deep blue
+        RGBAColor(0.05, 0.52, 0.88), // bright azure
+        RGBAColor(0.02, 0.68, 0.78), // cyan
+        RGBAColor(0.80, 0.16, 0.16), // crimson red
+        RGBAColor(0.94, 0.32, 0.42), // coral rose
+        RGBAColor(0.84, 0.20, 0.58), // magenta
+        RGBAColor(0.48, 0.25, 0.70), // violet
+        RGBAColor(0.36, 0.34, 0.84), // indigo
+        RGBAColor(0.11, 0.55, 0.32), // forest green
+        RGBAColor(0.16, 0.72, 0.42), // emerald
+        RGBAColor(0.54, 0.66, 0.12), // olive
+        RGBAColor(0.93, 0.50, 0.10), // vivid orange
+        RGBAColor(0.98, 0.80, 0.12), // bright chalk yellow
+    ]
+
+    var resolvedQuickColors: [RGBAColor] {
+        if let quickColors, quickColors.count == Self.defaultQuickColors.count {
+            return quickColors
+        }
+        return Self.defaultQuickColors
+    }
+
+    mutating func setQuickColor(_ newColor: RGBAColor, at index: Int) {
+        var colors = resolvedQuickColors
+        guard index >= 0, index < colors.count else { return }
+        colors[index] = newColor
+        quickColors = colors
+        color = newColor
+    }
+
+    mutating func resetQuickColorsToDefault() {
+        quickColors = Self.defaultQuickColors
+    }
 
     static let defaultPenPresets: [PenPreset] = [
         PenPreset(id: 0, color: .ink, width: 1.8, lineStyle: .solid),

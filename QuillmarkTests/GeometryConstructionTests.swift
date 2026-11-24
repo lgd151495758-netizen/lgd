@@ -353,4 +353,170 @@ final class GeometryConstructionTests: XCTestCase {
         XCTAssertEqual(overlay.hitTest(CGPoint(x: fillBtn.1.midX, y: fillBtn.1.midY), in: bounds, bodyHit: false),
                        .action(.toggleFillOrCenter))
     }
+
+    // MARK: v1.5.2 Smart Auto-Measuring Protractor
+
+    func testProtractorStateAnglesHitTestingReflexAndStamping() throws {
+        let bounds = CGRect(x: 0, y: 0, width: 1024, height: 768)
+        var pro = ProtractorState(center: CGPoint(x: 420, y: 380), radius: 132,
+                                  ray1Angle: 0, ray2Angle: -.pi / 3)
+
+        // Default 60° readout & reflex toggle (60° <-> 300°).
+        XCTAssertEqual(pro.measuredDegrees, 60.0, accuracy: 0.05)
+        XCTAssertEqual(pro.formattedDegrees, "60°")
+        XCTAssertFalse(pro.isRightAngle)
+        pro.cycleAngle()
+        XCTAssertTrue(pro.measureReflex)
+        XCTAssertEqual(pro.measuredDegrees, 300.0, accuracy: 0.05)
+        pro.cycleAngle()
+        XCTAssertFalse(pro.measureReflex)
+        XCTAssertEqual(pro.measuredDegrees, 60.0, accuracy: 0.05)
+
+        // Rotating both rays together preserves the exact measured angle.
+        pro.rotateBoth(by: 0.73)
+        XCTAssertEqual(pro.measuredDegrees, 60.0, accuracy: 0.05)
+
+        // Hit-testing all handles, outer ring, and floating action bar buttons.
+        XCTAssertEqual(pro.hitTest(pro.center, in: bounds), .center)
+        XCTAssertEqual(pro.hitTest(pro.ray1HandleCenter, in: bounds), .ray1Handle)
+        XCTAssertEqual(pro.hitTest(pro.ray2HandleCenter, in: bounds), .ray2Handle)
+        let buttons = pro.buttonFrames(in: bounds)
+        XCTAssertEqual(pro.hitTest(CGPoint(x: buttons.autoDetect.midX, y: buttons.autoDetect.midY), in: bounds), .autoDetectButton)
+        XCTAssertEqual(pro.hitTest(CGPoint(x: buttons.cycleAngle.midX, y: buttons.cycleAngle.midY), in: bounds), .cycleAngleButton)
+        XCTAssertEqual(pro.hitTest(CGPoint(x: buttons.stampAngle.midX, y: buttons.stampAngle.midY), in: bounds), .stampAngleButton)
+        XCTAssertEqual(pro.hitTest(CGPoint(x: buttons.close.midX, y: buttons.close.midY), in: bounds), .closeButton)
+
+        // Non-90° stamp produces a permanent vector arc.
+        guard case .arc = pro.stampPrimitive(center: pro.center, radius: 32) else {
+            return XCTFail("Expected .arc primitive for 60° angle stamp")
+        }
+
+        // Exact 90° angle displays right-angle indicator and stamps a crisp ∟ 3-point open polyline.
+        pro.ray1Angle = 0
+        pro.ray2Angle = -.pi / 2
+        XCTAssertTrue(pro.isRightAngle)
+        XCTAssertEqual(pro.formattedDegrees, "90° 直角")
+        guard case let .polygon(verts, false) = pro.stampPrimitive(center: pro.center, radius: 32) else {
+            return XCTFail("Expected 3-vertex open polyline ∟ for 90° stamp")
+        }
+        XCTAssertEqual(verts.count, 3)
+
+        // Overlay intercepts protractor handles and passes unrelated touches through.
+        let overlay = GeometryToolOverlayView(frame: bounds)
+        overlay.protractor = pro
+        overlay.aid = .protractor
+        XCTAssertTrue(overlay.point(inside: pro.center, with: nil))
+        XCTAssertTrue(overlay.point(inside: pro.ray2HandleCenter, with: nil))
+        XCTAssertFalse(overlay.point(inside: CGPoint(x: 40, y: 40), with: nil))
+
+        // Session switches cleanly between compass and protractor via shared aid state.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("pro-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let library = LibraryStore(root: root)
+        let meta = try library.createDocument(title: "pro", pdfData: Data(), layout: .live,
+                                              sourceKind: .htmlFile, sourceURL: nil, stagedSource: nil)
+        let session = DocumentSession(meta: meta, library: library, tool: ToolSettings())
+        session.toggleGeometryAid(.compass)
+        XCTAssertEqual(session.geometryAid, .compass)
+        session.toggleGeometryAid(.protractor)
+        XCTAssertEqual(session.geometryAid, .protractor)
+        session.toggleGeometryAid(.protractor)
+        XCTAssertEqual(session.geometryAid, .none)
+    }
+
+    func testProtractorVectorAutoAngleDetectionOnTrianglesCrossingsAndFreehand() {
+        // 1. Equilateral triangle vertex -> exact 60.0°
+        let eqPrim = ShapeBuilder.build(preset: .equilateralTriangle,
+                                        from: CGPoint(x: 100, y: 100),
+                                        to: CGPoint(x: 260, y: 240)).primitive
+        guard case let .polygon(eqVerts, true) = eqPrim else {
+            return XCTFail("Expected equilateral triangle")
+        }
+        let eqStroke = InkStroke(id: UUID(), pen: .ballpoint, color: .ink, width: 2, smoothing: 0,
+                                 points: [], tool: .pen, lineStyle: .solid, geometry: eqPrim)
+        let eqRays = ProtractorAngleDetector.detectVectorRays(at: eqVerts[0], from: [eqStroke])
+        var pro = ProtractorState(center: eqVerts[0])
+        XCTAssertTrue(pro.applyDetectedRays(eqRays, source: .vector))
+        XCTAssertEqual(pro.measuredDegrees, 60.0, accuracy: 0.05)
+
+        // 2. X-intersection at 50° / 130° -> starts at 50°, cycles to supplementary 130°!
+        let crossCenter = CGPoint(x: 300, y: 300)
+        let rad50 = 50.0 * CGFloat.pi / 180
+        let seg1 = InkStroke(id: UUID(), pen: .ballpoint, color: .ink, width: 2, smoothing: 0, points: [], tool: .pen,
+                             geometry: .segment(a: CGPoint(x: 180, y: 300), b: CGPoint(x: 420, y: 300)))
+        let seg2 = InkStroke(id: UUID(), pen: .ballpoint, color: .ink, width: 2, smoothing: 0, points: [], tool: .pen,
+                             geometry: .segment(a: CGPoint(x: crossCenter.x - 100 * cos(rad50), y: crossCenter.y - 100 * sin(rad50)),
+                                                b: CGPoint(x: crossCenter.x + 100 * cos(rad50), y: crossCenter.y + 100 * sin(rad50))))
+        let crossRays = ProtractorAngleDetector.detectVectorRays(at: crossCenter, from: [seg1, seg2])
+        XCTAssertEqual(crossRays.count, 4)
+        XCTAssertTrue(pro.applyDetectedRays(crossRays, source: .vector))
+        XCTAssertEqual(pro.measuredDegrees, 50.0, accuracy: 0.05)
+        pro.cycleAngle()
+        XCTAssertEqual(pro.measuredDegrees, 130.0, accuracy: 0.05)
+
+        // 3. Hand-drawn straight strokes forming a 45° corner.
+        let v = CGPoint(x: 200, y: 200)
+        let rawH = (0...10).map { i in InkPoint(x: Float(v.x) + Float(i * 10), y: Float(v.y)) }
+        let rawD = (0...10).map { i in InkPoint(x: Float(v.x) + Float(i * 8), y: Float(v.y) - Float(i * 8)) }
+        let sH = InkStroke(id: UUID(), pen: .ballpoint, color: .ink, width: 2, smoothing: 0, points: rawH, tool: .pen)
+        let sD = InkStroke(id: UUID(), pen: .ballpoint, color: .ink, width: 2, smoothing: 0, points: rawD, tool: .pen)
+        let freeRays = ProtractorAngleDetector.detectVectorRays(at: v, from: [sH, sD])
+        XCTAssertTrue(pro.applyDetectedRays(freeRays, source: .vector))
+        XCTAssertEqual(pro.measuredDegrees, 45.0, accuracy: 0.5)
+    }
+
+    func testProtractorImageAutoAngleDetectionOnLightAndDarkDiagrams() throws {
+        func renderAnglePatch(background: UIColor, stroke: UIColor, vertex: CGPoint,
+                              anglesDeg: [CGFloat], addLabelNoise: Bool) -> CGImage {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            let renderer = UIGraphicsImageRenderer(size: CGSize(width: 144, height: 144), format: format)
+            let image = renderer.image { rendererCtx in
+                let ctx = rendererCtx.cgContext
+                background.setFill()
+                ctx.fill(CGRect(x: 0, y: 0, width: 144, height: 144))
+
+                ctx.setStrokeColor(stroke.cgColor)
+                ctx.setLineWidth(2.2)
+                ctx.setLineCap(.round)
+                for deg in anglesDeg {
+                    let rad = deg * .pi / 180
+                    ctx.move(to: vertex)
+                    ctx.addLine(to: CGPoint(x: vertex.x + 68 * cos(rad), y: vertex.y + 68 * sin(rad)))
+                }
+                ctx.strokePath()
+
+                if addLabelNoise {
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: UIFont.systemFont(ofSize: 13, weight: .semibold),
+                        .foregroundColor: stroke,
+                    ]
+                    ("A" as NSString).draw(at: CGPoint(x: vertex.x - 18, y: vertex.y - 6), withAttributes: attrs)
+                }
+            }
+            return image.cgImage!
+        }
+
+        // 1. Light PDF diagram: asymmetric 60° angle (0° right, -60° up-right) + nearby "A" text noise,
+        //    with user drop point intentionally 4px off the exact corner!
+        let trueVertex = CGPoint(x: 72, y: 72)
+        let lightPatch = renderAnglePatch(background: .white, stroke: .black,
+                                          vertex: trueVertex, anglesDeg: [0, -60], addLabelNoise: true)
+        let droppedPoint = CGPoint(x: 76, y: 74)
+        let lightDetected = try XCTUnwrap(ProtractorAngleDetector.detectImageRays(in: lightPatch, center: droppedPoint))
+        var pro = ProtractorState(center: droppedPoint)
+        XCTAssertTrue(pro.applyDetectedRays(lightDetected.rayAngles, source: .image))
+        XCTAssertEqual(pro.measuredDegrees, 60.0, accuracy: 1.5,
+                       "printed light PDF 60° corner should auto-measure accurately even when dropped slightly off-center")
+
+        // 2. Dark HTML courseware diagram: chalk-white 90° corner on charcoal dark canvas.
+        let darkPatch = renderAnglePatch(background: UIColor(white: 0.10, alpha: 1),
+                                         stroke: UIColor(white: 0.96, alpha: 1),
+                                         vertex: trueVertex, anglesDeg: [20, 110], addLabelNoise: false)
+        let darkDetected = try XCTUnwrap(ProtractorAngleDetector.detectImageRays(in: darkPatch, center: trueVertex))
+        XCTAssertTrue(pro.applyDetectedRays(darkDetected.rayAngles, source: .image))
+        XCTAssertEqual(pro.measuredDegrees, 90.0, accuracy: 1.5,
+                       "dark-theme HTML 90° corner should auto-measure accurately")
+    }
 }

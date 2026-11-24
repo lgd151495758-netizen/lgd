@@ -687,17 +687,21 @@ private struct FocusModeFloatingBar: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            ForEach(Array(session.tool.resolvedPenPresets.enumerated()), id: \.offset) { idx, preset in
-                let isSelected = (session.tool.kind == .pen && session.tool.resolvedActivePenPresetIndex == idx)
-                PenPresetPill(preset: preset, selected: isSelected, compact: true) {
-                    session.tool.selectPenPreset(at: idx)
-                }
+            Button {
+                session.selectToolManually(.pen)
+            } label: {
+                Image(systemName: "pencil")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(session.tool.kind == .pen ? Color.accentColor : Color.primary)
+                    .frame(width: 28, height: 28)
+                    .background(session.tool.kind == .pen ? Color.accentColor.opacity(0.18) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 7))
             }
-
-            Divider().frame(height: 20)
+            .buttonStyle(.plain)
+            .accessibilityLabel("切换画笔")
 
             Button {
-                session.tool.toggleEraser()
+                session.selectToolManually(.eraser)
             } label: {
                 Image(systemName: "eraser")
                     .font(.subheadline.weight(.medium))

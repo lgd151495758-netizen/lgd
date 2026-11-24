@@ -396,4 +396,73 @@ final class EfficiencyAndStabilityTests: XCTestCase {
         let afterInkModifiedAt = try XCTUnwrap(library.documents.first(where: { $0.id == olderDoc.id })?.modifiedAt)
         XCTAssertGreaterThan(afterInkModifiedAt, originalOlderModifiedAt)
     }
+
+    // MARK: 8. Apple Pencil Double-Tap Eraser Auto-Returns to Pen on Lift
+
+    func testPencilDoubleTapAutoReturnsToPenOnLiftButManualEraserStays() throws {
+        let meta = try library.createDocument(title: "double-tap", pdfData: makePDFData(),
+                                              layout: .pdf, sourceKind: .pdfFile, sourceURL: "dt.pdf", stagedSource: nil)
+        let session = DocumentSession(meta: meta, library: library, tool: ToolSettings())
+        XCTAssertEqual(session.tool.kind, .pen)
+        XCTAssertFalse(session.autoReturnToPenAfterErase)
+
+        // 1. Apple Pencil double-tap switches to eraser and arms one-shot auto-return.
+        session.handlePencilDoubleTap(.switchEraser)
+        XCTAssertEqual(session.tool.kind, .eraser)
+        XCTAssertTrue(session.autoReturnToPenAfterErase)
+
+        // Lifting the pen tip after erasing automatically switches straight back to `.pen`.
+        session.didFinishEraseStroke()
+        XCTAssertEqual(session.tool.kind, .pen)
+        XCTAssertFalse(session.autoReturnToPenAfterErase)
+
+        // 2. Also works when Apple Pencil system preference is `.switchPrevious` landing on `.eraser`.
+        session.handlePencilDoubleTap(.switchPrevious)
+        XCTAssertEqual(session.tool.kind, .eraser)
+        XCTAssertTrue(session.autoReturnToPenAfterErase)
+        session.didFinishEraseStroke()
+        XCTAssertEqual(session.tool.kind, .pen)
+        XCTAssertFalse(session.autoReturnToPenAfterErase)
+
+        // 3. Double-tapping a second time before erasing cancels auto-return cleanly.
+        session.handlePencilDoubleTap(.switchEraser)
+        XCTAssertTrue(session.autoReturnToPenAfterErase)
+        session.handlePencilDoubleTap(.switchEraser)
+        XCTAssertEqual(session.tool.kind, .pen)
+        XCTAssertFalse(session.autoReturnToPenAfterErase)
+
+        // 4. Manually tapping the Eraser button in the toolbar stays in eraser mode after lifting.
+        session.selectToolManually(.eraser)
+        XCTAssertEqual(session.tool.kind, .eraser)
+        XCTAssertFalse(session.autoReturnToPenAfterErase)
+        session.didFinishEraseStroke()
+        XCTAssertEqual(session.tool.kind, .eraser, "manual eraser selection must not auto-deselect")
+    }
+
+    // MARK: 9. Compact 4 Quick Colors + Custom Color Palette
+
+    func testQuickFourColorsCustomizationPersistenceAndReset() throws {
+        let suite = "quick-colors-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        var tool = ToolSettings()
+        XCTAssertEqual(tool.resolvedQuickColors.count, 4)
+        XCTAssertEqual(tool.resolvedQuickColors, ToolSettings.defaultQuickColors)
+        XCTAssertEqual(ToolSettings.extendedPalette.count, 16)
+
+        // Replace slot 3 with chalk white and verify active color + persistence.
+        let chalkWhite = RGBAColor(0.97, 0.97, 0.99)
+        tool.setQuickColor(chalkWhite, at: 3)
+        XCTAssertEqual(tool.color, chalkWhite)
+        XCTAssertEqual(tool.resolvedQuickColors[3], chalkWhite)
+
+        tool.save(to: defaults)
+        var reloaded = ToolSettings.load(from: defaults)
+        XCTAssertEqual(reloaded.resolvedQuickColors[3], chalkWhite)
+        XCTAssertEqual(reloaded.color, chalkWhite)
+
+        reloaded.resetQuickColorsToDefault()
+        XCTAssertEqual(reloaded.resolvedQuickColors, ToolSettings.defaultQuickColors)
+    }
 }

@@ -13,6 +13,9 @@ final class GeometryToolOverlayView: UIView {
     var compass = CompassState() {
         didSet { setNeedsDisplay() }
     }
+    var protractor = ProtractorState() {
+        didSet { setNeedsDisplay() }
+    }
     /// Selected geometric shape for post-creation vertex editing & quick actions (iPad-only).
     var selectedShape: SelectedShapeOverlay? {
         didSet {
@@ -135,6 +138,14 @@ final class GeometryToolOverlayView: UIView {
             case .none, .drawCircle:
                 return false
             }
+        case .protractor:
+            switch protractor.hitTest(point, in: bounds) {
+            case .center, .ray1Handle, .ray2Handle, .ringRotate,
+                 .autoDetectButton, .cycleAngleButton, .stampAngleButton, .closeButton:
+                return true
+            case .none:
+                return false
+            }
         }
     }
 
@@ -172,6 +183,8 @@ final class GeometryToolOverlayView: UIView {
         }
         if aid == .compass {
             drawCompass(in: ctx)
+        } else if aid == .protractor {
+            drawProtractor(in: ctx)
         }
         if let snap = activeSnapPoint {
             drawSnapIndicator(at: snap, kind: activeSnapKind, in: ctx)
@@ -545,6 +558,268 @@ final class GeometryToolOverlayView: UIView {
         drawCenteredText("⊙圆心", in: buttons.centerMark, font: font,
                          color: compass.showCenterMark ? .systemBlue : .secondaryLabel)
         drawCenteredText("○整圆", in: buttons.fullCircle, font: font, color: .systemBlue)
+    }
+
+    private func drawProtractor(in ctx: CGContext) {
+        let c = protractor.center
+        let r = protractor.radius
+        let sweep = protractor.sweep
+        let accent: UIColor = protractor.isRightAngle ? .systemGreen : .systemBlue
+        let dialRect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
+
+        // 1. Translucent frosted circular dial so printed diagrams underneath remain clearly legible.
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 10,
+                      color: UIColor.black.withAlphaComponent(0.14).cgColor)
+        UIColor.systemBackground.withAlphaComponent(0.68).setFill()
+        ctx.fillEllipse(in: dialRect)
+        ctx.restoreGState()
+
+        // Outer dial ring border
+        ctx.saveGState()
+        UIColor.label.withAlphaComponent(0.24).setStroke()
+        ctx.setLineWidth(1.2)
+        ctx.strokeEllipse(in: dialRect)
+
+        // Inner ring guide
+        let innerGuideR = r * 0.72
+        UIColor.label.withAlphaComponent(0.10).setStroke()
+        ctx.setLineWidth(0.8)
+        ctx.strokeEllipse(in: CGRect(x: c.x - innerGuideR, y: c.y - innerGuideR,
+                                     width: innerGuideR * 2, height: innerGuideR * 2))
+        ctx.restoreGState()
+
+        // 2. Highlighted measured angle sector (wedge) between Ray 1 and Ray 2.
+        if sweep.magnitudeRadians > 0.005 {
+            let wedge = UIBezierPath()
+            wedge.move(to: c)
+            wedge.addArc(withCenter: c, radius: r,
+                         startAngle: sweep.startAngle, endAngle: sweep.endAngle,
+                         clockwise: sweep.clockwise)
+            wedge.close()
+            accent.withAlphaComponent(0.14).setFill()
+            wedge.fill()
+
+            // Crisp colored rim arc along the measured sweep
+            let rimArc = UIBezierPath(arcCenter: c, radius: r,
+                                      startAngle: sweep.startAngle, endAngle: sweep.endAngle,
+                                      clockwise: sweep.clockwise)
+            accent.withAlphaComponent(0.88).setStroke()
+            rimArc.lineWidth = 3.0
+            rimArc.lineCapStyle = .round
+            rimArc.stroke()
+
+            // Inner right-angle square `∟` or inner angle arc
+            if protractor.isRightAngle {
+                let side: CGFloat = 24
+                let u1 = CGPoint(x: cos(protractor.ray1Angle), y: sin(protractor.ray1Angle))
+                let u2 = CGPoint(x: cos(protractor.ray2Angle), y: sin(protractor.ray2Angle))
+                let p1 = CGPoint(x: c.x + side * u1.x, y: c.y + side * u1.y)
+                let pCorner = CGPoint(x: c.x + side * (u1.x + u2.x), y: c.y + side * (u1.y + u2.y))
+                let p2 = CGPoint(x: c.x + side * u2.x, y: c.y + side * u2.y)
+                ctx.saveGState()
+                accent.setStroke()
+                ctx.setLineWidth(2.0)
+                ctx.setLineJoin(.miter)
+                ctx.move(to: p1)
+                ctx.addLine(to: pCorner)
+                ctx.addLine(to: p2)
+                ctx.strokePath()
+                ctx.restoreGState()
+            } else {
+                let innerR: CGFloat = 34
+                let innerArc = UIBezierPath(arcCenter: c, radius: innerR,
+                                            startAngle: sweep.startAngle, endAngle: sweep.endAngle,
+                                            clockwise: sweep.clockwise)
+                accent.withAlphaComponent(0.75).setStroke()
+                innerArc.lineWidth = 1.8
+                innerArc.stroke()
+            }
+        }
+
+        // 3. Precision degree ticks anchored at Ray 1 = 0° in the active sweep direction.
+        let tickDir: CGFloat = sweep.clockwise ? 1 : -1
+        ctx.saveGState()
+        let tickFont = UIFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium)
+        for deg in stride(from: 0, to: 360, by: 5) {
+            let theta = protractor.ray1Angle + tickDir * CGFloat(deg) * .pi / 180
+            let cosT = cos(theta)
+            let sinT = sin(theta)
+            let isMajor30 = (deg % 30 == 0)
+            let isMajor10 = (deg % 10 == 0)
+            let tickLen: CGFloat = isMajor30 ? 11 : (isMajor10 ? 7.5 : 4)
+            let alpha: CGFloat = isMajor30 ? 0.55 : (isMajor10 ? 0.35 : 0.20)
+            ctx.setStrokeColor(UIColor.label.withAlphaComponent(alpha).cgColor)
+            ctx.setLineWidth(isMajor30 ? 1.3 : 0.8)
+            ctx.move(to: CGPoint(x: c.x + (r - tickLen) * cosT, y: c.y + (r - tickLen) * sinT))
+            ctx.addLine(to: CGPoint(x: c.x + r * cosT, y: c.y + r * sinT))
+            ctx.strokePath()
+
+            if isMajor30 && deg <= 180 {
+                let labelR = r - 22
+                let lp = CGPoint(x: c.x + labelR * cosT, y: c.y + labelR * sinT)
+                let rect = CGRect(x: lp.x - 16, y: lp.y - 7, width: 32, height: 14)
+                drawCenteredText("\(deg)°", in: rect, font: tickFont,
+                                 color: UIColor.secondaryLabel.withAlphaComponent(0.85))
+            }
+        }
+        ctx.restoreGState()
+
+        // 4. Extended laser sightlines + solid measuring arms (Ray 1 = Blue, Ray 2 = Orange).
+        drawProtractorRay(angle: protractor.ray1Angle, color: .systemBlue, handleCenter: protractor.ray1HandleCenter, in: ctx)
+        drawProtractorRay(angle: protractor.ray2Angle, color: .systemOrange, handleCenter: protractor.ray2HandleCenter, in: ctx)
+
+        // 5. Precision vertex crosshair O (hollow center pinhole so exact printed corner remains visible).
+        let centerR: CGFloat = 16
+        let centerRect = CGRect(x: c.x - centerR, y: c.y - centerR, width: centerR * 2, height: centerR * 2)
+        UIColor.systemBlue.withAlphaComponent(0.12).setFill()
+        ctx.fillEllipse(in: centerRect)
+        UIColor.systemBlue.withAlphaComponent(0.85).setStroke()
+        ctx.setLineWidth(1.6)
+        ctx.strokeEllipse(in: centerRect)
+
+        ctx.saveGState()
+        ctx.setStrokeColor(UIColor.systemBlue.cgColor)
+        ctx.setLineWidth(1.2)
+        // Broken crosshair leaving a clear 4px pinhole right over the vertex
+        ctx.move(to: CGPoint(x: c.x - 10, y: c.y)); ctx.addLine(to: CGPoint(x: c.x - 3, y: c.y))
+        ctx.move(to: CGPoint(x: c.x + 3, y: c.y)); ctx.addLine(to: CGPoint(x: c.x + 10, y: c.y))
+        ctx.move(to: CGPoint(x: c.x, y: c.y - 10)); ctx.addLine(to: CGPoint(x: c.x, y: c.y - 3))
+        ctx.move(to: CGPoint(x: c.x, y: c.y + 3)); ctx.addLine(to: CGPoint(x: c.x, y: c.y + 10))
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // 6. Giant high-contrast automatic digital degree readout badge (no squinting at ticks!).
+        let bisector = sweep.bisectorAngle
+        let badgeDist = r * 0.54
+        let rawBadgeCenter = CGPoint(x: c.x + badgeDist * cos(bisector), y: c.y + badgeDist * sin(bisector))
+        let badgeCenter = CGPoint(
+            x: min(max(44, rawBadgeCenter.x), max(44, bounds.width - 44)),
+            y: min(max(24, rawBadgeCenter.y), max(24, bounds.height - 24))
+        )
+        let prefix = protractor.autoDetectedSource != nil ? "⚡ " : ""
+        let readoutText = "\(prefix)\(protractor.formattedDegrees)"
+        drawLargeAngleReadoutPill(readoutText, centeredAt: badgeCenter, accent: accent, in: ctx)
+
+        // 7. Compact floating action bar (⚡识别 | ↻换角 | ∠标角 | ✕)
+        drawProtractorActionBar(in: ctx)
+    }
+
+    private func drawProtractorRay(angle: CGFloat, color: UIColor, handleCenter: CGPoint, in ctx: CGContext) {
+        let c = protractor.center
+        let r = protractor.radius
+        let cosA = cos(angle)
+        let sinA = sin(angle)
+        let extPoint = CGPoint(x: c.x + (r + 88) * cosA, y: c.y + (r + 88) * sinA)
+
+        // Extended dashed laser sightline beyond the dial rim for effortless printed-edge alignment.
+        ctx.saveGState()
+        ctx.setStrokeColor(color.withAlphaComponent(0.55).cgColor)
+        ctx.setLineWidth(1.3)
+        ctx.setLineDash(phase: 0, lengths: [6, 4])
+        ctx.move(to: handleCenter)
+        ctx.addLine(to: extPoint)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Crisp solid measuring ray from vertex O to handle
+        ctx.saveGState()
+        ctx.setStrokeColor(color.withAlphaComponent(0.92).cgColor)
+        ctx.setLineWidth(2.2)
+        ctx.setLineCap(.round)
+        ctx.move(to: c)
+        ctx.addLine(to: handleCenter)
+        ctx.strokePath()
+        ctx.restoreGState()
+
+        // Draggable handle knob
+        let hr: CGFloat = 13.5
+        let hRect = CGRect(x: handleCenter.x - hr, y: handleCenter.y - hr, width: hr * 2, height: hr * 2)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4,
+                      color: UIColor.black.withAlphaComponent(0.22).cgColor)
+        UIColor.systemBackground.withAlphaComponent(0.96).setFill()
+        ctx.fillEllipse(in: hRect)
+        ctx.restoreGState()
+
+        color.setStroke()
+        ctx.setLineWidth(2.4)
+        ctx.strokeEllipse(in: hRect)
+
+        color.setFill()
+        ctx.fillEllipse(in: CGRect(x: handleCenter.x - 3.5, y: handleCenter.y - 3.5, width: 7, height: 7))
+    }
+
+    private func drawLargeAngleReadoutPill(_ text: String, centeredAt center: CGPoint, accent: UIColor, in ctx: CGContext) {
+        let font = UIFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold)
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        let rect = CGRect(x: center.x - size.width / 2 - 12, y: center.y - size.height / 2 - 5,
+                          width: size.width + 24, height: size.height + 10)
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 7,
+                      color: UIColor.black.withAlphaComponent(0.24).cgColor)
+        let path = UIBezierPath(roundedRect: rect, cornerRadius: rect.height / 2)
+        accent.withAlphaComponent(0.95).setFill()
+        path.fill()
+        ctx.restoreGState()
+
+        UIColor.white.withAlphaComponent(0.55).setStroke()
+        let border = UIBezierPath(roundedRect: rect, cornerRadius: rect.height / 2)
+        border.lineWidth = 1.0
+        border.stroke()
+
+        drawCenteredText(text, in: rect, font: font, color: .white)
+    }
+
+    private func drawProtractorActionBar(in ctx: CGContext) {
+        let bar = protractor.actionBarFrame(in: bounds)
+        let buttons = protractor.buttonFrames(in: bounds)
+
+        ctx.saveGState()
+        ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 8,
+                      color: UIColor.black.withAlphaComponent(0.18).cgColor)
+        let bgPath = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        UIColor.systemBackground.withAlphaComponent(0.95).setFill()
+        bgPath.fill()
+        ctx.restoreGState()
+
+        UIColor.separator.withAlphaComponent(0.6).setStroke()
+        let border = UIBezierPath(roundedRect: bar, cornerRadius: bar.height / 2)
+        border.lineWidth = 0.8
+        border.stroke()
+
+        if protractor.autoDetectedSource != nil {
+            let pill = UIBezierPath(roundedRect: buttons.autoDetect.insetBy(dx: 3, dy: 3), cornerRadius: 14)
+            UIColor.systemGreen.withAlphaComponent(0.18).setFill()
+            pill.fill()
+        }
+        if protractor.measureReflex {
+            let pill = UIBezierPath(roundedRect: buttons.cycleAngle.insetBy(dx: 3, dy: 3), cornerRadius: 14)
+            UIColor.systemBlue.withAlphaComponent(0.18).setFill()
+            pill.fill()
+        }
+
+        ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
+        ctx.setLineWidth(0.8)
+        for divX in [buttons.autoDetect.maxX, buttons.cycleAngle.maxX, buttons.stampAngle.maxX] {
+            ctx.move(to: CGPoint(x: divX, y: bar.minY + 7))
+            ctx.addLine(to: CGPoint(x: divX, y: bar.maxY - 7))
+        }
+        ctx.strokePath()
+
+        let font = UIFont.systemFont(ofSize: 12, weight: .semibold)
+        drawCenteredText("⚡识别", in: buttons.autoDetect, font: font,
+                         color: protractor.autoDetectedSource != nil ? .systemGreen : .label)
+        let cycleTitle: String
+        if protractor.detectedRayAngles.count >= 3 {
+            cycleTitle = "↻邻角"
+        } else {
+            cycleTitle = protractor.measureReflex ? "↻劣角" : "↻优角"
+        }
+        drawCenteredText(cycleTitle, in: buttons.cycleAngle, font: font,
+                         color: protractor.measureReflex ? .systemBlue : .label)
+        drawCenteredText("∠标角", in: buttons.stampAngle, font: font, color: .systemBlue)
+        drawCenteredText("✕", in: buttons.close, font: .systemFont(ofSize: 13, weight: .bold), color: .secondaryLabel)
     }
 
     private func drawSnapIndicator(at point: CGPoint, kind: SnapKind?, in ctx: CGContext) {

@@ -887,6 +887,7 @@ enum GeometrySnapEngine {
 enum GeometryAid: String, Equatable {
     case none
     case compass
+    case protractor
 }
 
 struct CompassState: Equatable {

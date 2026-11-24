@@ -1,9 +1,13 @@
 import SwiftUI
+import UIKit
 
 /// Floating editor toolbar: tool selector, options of the current tool, undo/redo, finger drawing.
 struct ToolbarView: View {
     @ObservedObject var session: DocumentSession
     @ObservedObject private var presentation = PresentationCenter.shared
+
+    @State private var showColorPalette = false
+    @State private var editingQuickSlotIndex: Int?
 
     private var tool: ToolSettings { session.tool }
 
@@ -11,44 +15,25 @@ struct ToolbarView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
                 toolButton(title: "画笔", symbol: "pencil", selected: tool.kind == .pen) {
-                    session.tool.select(.pen)
-                    session.tool.pen = .ballpoint
+                    session.selectToolManually(.pen)
                 }
-                HStack(spacing: 5) {
-                    ForEach(Array(tool.resolvedPenPresets.enumerated()), id: \.offset) { idx, preset in
-                        let isSelected = (tool.kind == .pen && tool.resolvedActivePenPresetIndex == idx)
-                        PenPresetPill(preset: preset, selected: isSelected) {
-                            session.tool.selectPenPreset(at: idx)
-                        }
-                        .contextMenu {
-                            Button {
-                                session.tool.resetPenPresetsToDefault()
-                            } label: {
-                                Label("恢复默认 4 支快捷笔槽", systemImage: "arrow.counterclockwise")
-                            }
-                        }
-                    }
-                }
-                divider
                 toolButton(title: "套索", symbol: "lasso", selected: tool.kind == .lasso) {
-                    session.tool.select(.lasso)
+                    session.selectToolManually(.lasso)
                 }
                 toolButton(title: "胶带", symbol: "bandage", selected: tool.kind == .tape) {
-                    session.tool.select(.tape)
+                    session.selectToolManually(.tape)
                 }
                 toolButton(title: "图形", symbol: "square.on.circle", selected: tool.kind == .shape) {
-                    session.tool.select(.shape)
+                    session.selectToolManually(.shape)
                 }
                 toolButton(title: "激光笔", symbol: "laser.burst", selected: tool.kind == .laser) {
-                    session.tool.select(.laser)
+                    session.selectToolManually(.laser)
                 }
                 toolButton(title: "橡皮", symbol: "eraser", selected: tool.kind == .eraser) {
-                    session.tool.select(.eraser)
+                    session.selectToolManually(.eraser)
                 }
                 divider
-                toolButton(title: "圆规", symbol: "compass.drawing", selected: session.geometryAid == .compass) {
-                    session.toggleGeometryAid(.compass)
-                }
+                geometryAidMenu
                 toolButton(title: "便签", symbol: "note.text", selected: session.isScratchpadOpen) {
                     session.toggleScratchpad()
                 }
@@ -98,20 +83,15 @@ struct ToolbarView: View {
     private var options: some View {
         switch tool.kind {
         case .pen:
-            ForEach(ToolSettings.palette, id: \.self) { color in
-                colorButton(color, selected: tool.color == color) { session.tool.updatePenColor(color) }
-            }
+            quickColorStrip
             divider
             ForEach(ToolSettings.widthPresets, id: \.self) { width in
                 sizeButton(diameter: CGFloat(width) * 3 + 2, selected: tool.width == width) {
-                    session.tool.updatePenWidth(width)
+                    session.tool.width = width
                 }
             }
             divider
-            Picker("线型", selection: Binding(
-                get: { session.tool.lineStyle },
-                set: { session.tool.updatePenLineStyle($0) }
-            )) {
+            Picker("线型", selection: $session.tool.lineStyle) {
                 ForEach(StrokeLineStyle.allCases) { style in
                     Text(style.displayName).tag(style)
                 }
@@ -172,9 +152,7 @@ struct ToolbarView: View {
                 }
             }
             divider
-            ForEach(ToolSettings.palette, id: \.self) { color in
-                colorButton(color, selected: tool.color == color) { session.tool.color = color }
-            }
+            quickColorStrip
             divider
             ForEach(ToolSettings.widthPresets, id: \.self) { width in
                 sizeButton(diameter: CGFloat(width) * 3 + 2, selected: tool.width == width) {
@@ -218,6 +196,140 @@ struct ToolbarView: View {
                 }
             }
         }
+    }
+
+    /// Shows only the 4 most-used colors on the toolbar + a compact rainbow color-palette trigger.
+    private var quickColorStrip: some View {
+        let quickColors = tool.resolvedQuickColors
+        let isCustomActive = !quickColors.contains(tool.color)
+        return HStack(spacing: 10) {
+            ForEach(Array(quickColors.enumerated()), id: \.offset) { idx, color in
+                let isSelected = (tool.color == color)
+                colorButton(color, selected: isSelected) {
+                    if isSelected {
+                        editingQuickSlotIndex = idx
+                        showColorPalette = true
+                    } else {
+                        session.tool.color = color
+                    }
+                }
+                .contextMenu {
+                    Button {
+                        editingQuickSlotIndex = idx
+                        showColorPalette = true
+                    } label: {
+                        Label("自定义此常用色…", systemImage: "paintpalette")
+                    }
+                    Button {
+                        session.tool.resetQuickColorsToDefault()
+                    } label: {
+                        Label("恢复默认 4 种常用色", systemImage: "arrow.counterclockwise")
+                    }
+                }
+            }
+
+            Button {
+                editingQuickSlotIndex = nil
+                showColorPalette = true
+            } label: {
+                ZStack {
+                    Circle()
+                        .strokeBorder(
+                            AngularGradient(
+                                colors: [.red, .orange, .yellow, .green, .blue, .purple, .red],
+                                center: .center
+                            ),
+                            lineWidth: 2.6
+                        )
+                        .frame(width: 26, height: 26)
+                    if isCustomActive {
+                        Circle()
+                            .fill(Color(cgColor: tool.color.cgColor))
+                            .frame(width: 17, height: 17)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.primary.opacity(tool.color.isVeryLight ? 0.35 : 0.12), lineWidth: 0.8)
+                            )
+                    } else {
+                        Image(systemName: "paintpalette.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(Color.primary.opacity(0.8))
+                    }
+                }
+                .overlay(
+                    Circle()
+                        .stroke(Color.primary.opacity(isCustomActive ? 0.9 : 0), lineWidth: 2)
+                        .padding(-4)
+                )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("打开调色盘选择更多颜色")
+            .popover(isPresented: $showColorPalette) {
+                ColorPalettePopover(
+                    session: session,
+                    editingSlotIndex: $editingQuickSlotIndex,
+                    dismiss: { showColorPalette = false }
+                )
+            }
+        }
+    }
+
+    private var geometryAidMenu: some View {
+        let aid = session.geometryAid
+        let isActive = (aid != .none)
+        let title: String
+        let symbol: String
+        switch aid {
+        case .none:
+            title = "尺规"
+            symbol = "compass.drawing"
+        case .compass:
+            title = "圆规"
+            symbol = "compass.drawing"
+        case .protractor:
+            title = "量角器"
+            symbol = "angle"
+        }
+
+        return Menu {
+            Button {
+                session.toggleGeometryAid(.compass)
+            } label: {
+                Label(aid == .compass ? "圆规（使用中）" : "圆规",
+                      systemImage: aid == .compass ? "checkmark.circle.fill" : "compass.drawing")
+            }
+            Button {
+                session.toggleGeometryAid(.protractor)
+            } label: {
+                Label(aid == .protractor ? "量角器（使用中）" : "量角器",
+                      systemImage: aid == .protractor ? "checkmark.circle.fill" : "angle")
+            }
+            if isActive {
+                Divider()
+                Button(role: .destructive) {
+                    session.geometryAid = .none
+                } label: {
+                    Label("关闭尺规", systemImage: "xmark.circle")
+                }
+            }
+        } label: {
+            VStack(spacing: 2) {
+                Image(systemName: symbol)
+                HStack(spacing: 1) {
+                    Text(title).font(.caption2)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .opacity(0.65)
+                }
+            }
+            .frame(minWidth: 44)
+            .padding(.horizontal, 2)
+            .padding(.vertical, 2)
+            .background(isActive ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+            .foregroundStyle(isActive ? Color.accentColor : Color.primary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("几何尺规工具（圆规与量角器）")
     }
 
     private var divider: some View {
@@ -291,48 +403,160 @@ struct ToolbarView: View {
     }
 }
 
-/// Compact one-tap customizable pen preset button showing exact color, line thickness, and
-/// solid/dashed/dotted style (with a dark inner backing when displaying chalk white).
-struct PenPresetPill: View {
-    let preset: PenPreset
-    let selected: Bool
-    var compact: Bool = false
-    let action: () -> Void
+/// Compact color palette popover with 16 curated classroom swatches, native full-gamut ColorPicker,
+/// and one-tap assignment into the 4 toolbar quick-color slots.
+private struct ColorPalettePopover: View {
+    @ObservedObject var session: DocumentSession
+    @Binding var editingSlotIndex: Int?
+    let dismiss: () -> Void
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
+
+    private var colorBinding: Binding<Color> {
+        Binding(
+            get: { Color(cgColor: session.tool.color.cgColor) },
+            set: { newColor in
+                let rgba = RGBAColor(swiftUIColor: newColor)
+                applyPickedColor(rgba)
+            }
+        )
+    }
 
     var body: some View {
-        Button(action: action) {
-            ZStack {
-                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
-                    .fill(preset.color.isVeryLight ? Color(white: 0.22) : Color(.tertiarySystemFill).opacity(selected ? 0.95 : 0.55))
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Label(editingSlotIndex.map { "自定义常用色 \($0 + 1)" } ?? "调色盘", systemImage: "paintpalette")
+                    .font(.headline)
+                Spacer()
+                Button("完成") {
+                    dismiss()
+                }
+                .font(.subheadline.weight(.semibold))
+            }
 
-                Canvas { ctx, size in
-                    let pad: CGFloat = compact ? 5 : 6
-                    let start = CGPoint(x: pad, y: size.height - pad)
-                    let end = CGPoint(x: size.width - pad, y: pad)
-                    var path = Path()
-                    path.move(to: start)
-                    path.addLine(to: end)
-                    let lineWidth = min(max(CGFloat(preset.width) * (compact ? 1.15 : 1.35), 1.6), compact ? 3.8 : 4.5)
-                    let dash: [CGFloat]
-                    switch preset.lineStyle {
-                    case .solid: dash = []
-                    case .dashed: dash = [4.5, 3.0]
-                    case .dotted: dash = [0.5, 4.0]
+            // 16 curated teaching colors (light + dark courseware friendly)
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(ToolSettings.extendedPalette, id: \.self) { color in
+                    let isSelected = (session.tool.color == color)
+                    Button {
+                        applyPickedColor(color)
+                    } label: {
+                        Circle()
+                            .fill(Color(cgColor: color.cgColor))
+                            .frame(width: 34, height: 34)
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.primary.opacity(color.isVeryLight ? 0.35 : 0.12), lineWidth: 1)
+                            )
+                            .overlay(
+                                Circle()
+                                    .stroke(Color.accentColor.opacity(isSelected ? 1 : 0), lineWidth: 2.5)
+                                    .padding(-4)
+                            )
                     }
-                    let style = StrokeStyle(lineWidth: lineWidth, lineCap: .round, dash: dash)
-                    ctx.stroke(path, with: .color(Color(cgColor: preset.color.cgColor)), style: style)
+                    .buttonStyle(.plain)
                 }
             }
-            .frame(width: compact ? 28 : 34, height: compact ? 28 : 34)
-            .overlay(
-                RoundedRectangle(cornerRadius: compact ? 7 : 8, style: .continuous)
-                    .stroke(selected ? Color.accentColor : Color.primary.opacity(0.14),
-                            lineWidth: selected ? 2.2 : 0.8)
-            )
+
+            Divider()
+
+            // Native iPadOS full-spectrum ColorPicker (wheel / spectrum / sliders / eyedropper)
+            ColorPicker("自由选色（色轮 / 吸管）", selection: colorBinding, supportsOpacity: false)
+                .font(.subheadline.weight(.medium))
+
+            Divider()
+
+            // One-tap bar to pin the current color into any of the 4 toolbar quick slots
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(editingSlotIndex == nil ? "点下方槽位，将当前色设为常用：" : "正在替换高亮槽位（点其他切换）：")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 4)
+                    Button("恢复默认") {
+                        session.tool.resetQuickColorsToDefault()
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                HStack(spacing: 12) {
+                    ForEach(Array(session.tool.resolvedQuickColors.enumerated()), id: \.offset) { idx, slotColor in
+                        let isEditingTarget = (editingSlotIndex == idx)
+                        Button {
+                            if isEditingTarget {
+                                editingSlotIndex = nil
+                            } else if editingSlotIndex != nil {
+                                editingSlotIndex = idx
+                                session.tool.color = slotColor
+                            } else {
+                                session.tool.setQuickColor(session.tool.color, at: idx)
+                            }
+                        } label: {
+                            VStack(spacing: 3) {
+                                Circle()
+                                    .fill(Color(cgColor: slotColor.cgColor))
+                                    .frame(width: 28, height: 28)
+                                    .overlay(
+                                        Circle()
+                                            .stroke(Color.primary.opacity(slotColor.isVeryLight ? 0.35 : 0.14), lineWidth: 0.9)
+                                    )
+                                    .overlay(
+                                        Circle()
+                                            .stroke(Color.accentColor.opacity(isEditingTarget ? 1 : 0), lineWidth: 2.2)
+                                            .padding(-3.5)
+                                    )
+                                Text("常用\(idx + 1)")
+                                    .font(.caption2)
+                                    .foregroundStyle(isEditingTarget ? Color.accentColor : Color.secondary)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("快捷笔槽 \(preset.id + 1)：\(preset.lineStyle.displayName)")
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .padding(16)
+        .frame(width: 280)
+    }
+
+    private func applyPickedColor(_ color: RGBAColor) {
+        if let idx = editingSlotIndex {
+            session.tool.setQuickColor(color, at: idx)
+        } else {
+            session.tool.color = color
+        }
+    }
+}
+
+private extension RGBAColor {
+    init(swiftUIColor: Color) {
+        let uiColor = UIColor(swiftUIColor)
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 1
+        if uiColor.getRed(&r, green: &g, blue: &b, alpha: &a) {
+            self.init(
+                Float(min(max(r, 0), 1)),
+                Float(min(max(g, 0), 1)),
+                Float(min(max(b, 0), 1)),
+                1
+            )
+        } else if let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+                  let converted = uiColor.cgColor.converted(to: srgb, intent: .defaultIntent, options: nil),
+                  let comps = converted.components, comps.count >= 3 {
+            self.init(
+                Float(min(max(comps[0], 0), 1)),
+                Float(min(max(comps[1], 0), 1)),
+                Float(min(max(comps[2], 0), 1)),
+                1
+            )
+        } else {
+            self = .ink
+        }
     }
 }
 
