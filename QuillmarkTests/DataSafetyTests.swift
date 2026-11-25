@@ -132,10 +132,10 @@ final class DataSafetyTests: XCTestCase {
         var badStroke = makeStroke()
         badStroke.width = .nan
         badStroke.points[0].x = .infinity
-        badStroke.geometry = .circle(center: CGPoint(x: CGFloat.nan, y: 50), radius: .infinity, showCenterMark: true)
+        badStroke.geometry = .circle(center: CGPoint(x: CGFloat.nan, y: 50), radius: CGFloat.infinity, showCenterMark: true)
         dirty.pages["0"] = PageAnnotations(strokes: [badStroke])
-        dirty.viewport = ViewportState(offsetX: .nan, offsetY: 10, zoomScale: 1, pageIndex: 0)
-        dirty.scratchpadFrame = CGRect(x: .nan, y: 0, width: 200, height: 200)
+        dirty.viewport = ViewportState(offsetX: CGFloat.nan, offsetY: 10, zoomScale: 1, pageIndex: 0)
+        dirty.scratchpadFrame = CGRect(x: CGFloat.nan, y: 0, width: 200, height: 200)
 
         XCTAssertNoThrow(try library.saveAnnotations(dirty, for: meta.id))
         let reloaded = library.loadAnnotations(for: meta.id)
