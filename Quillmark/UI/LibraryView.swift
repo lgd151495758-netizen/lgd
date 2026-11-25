@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 struct LibraryView: View {
     @EnvironmentObject private var library: LibraryStore
     @StateObject private var tabManager = TabManager()
+    @StateObject private var searchEngine = LibrarySearchEngine()
 
     private struct PendingClear {
         let meta: DocumentMeta
@@ -50,6 +51,7 @@ struct LibraryView: View {
     }
 
     @State private var searchText = ""
+    @State private var showFullTextSearch = false
     @State private var folderFilter: FolderFilter = .all
     @State private var sortOrder: SortOrder = .modifiedDesc
 
@@ -236,12 +238,31 @@ struct LibraryView: View {
                             .buttonStyle(.plain)
                             .accessibilityLabel("返回已打开的文档标签页")
                         }
+                        fullTextSearchButton
                         moreMenu
                         importMenu
                     }
                 }
             }
         }
+    }
+
+    private var fullTextSearchButton: some View {
+        Button {
+            showFullTextSearch = true
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "doc.text.magnifyingglass")
+                Text("全文检索")
+                    .font(.subheadline.weight(.medium))
+            }
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Color.accentColor.opacity(0.12), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("跨文档全文检索")
     }
 
     private func withImportAndRenameModals<V: View>(_ view: V) -> some View {
@@ -266,6 +287,15 @@ struct LibraryView: View {
                 let items = newItems
                 selectedPhotoItems = []
                 importSelectedPhotos(items)
+            }
+            .sheet(isPresented: $showFullTextSearch) {
+                FullTextSearchSheet(
+                    library: library,
+                    tabManager: tabManager,
+                    engine: searchEngine
+                ) { meta, targetPDFPage in
+                    tabManager.open(meta, library: library, targetPDFPage: targetPDFPage)
+                }
             }
             .sheet(isPresented: $showNewNotebookSheet) {
                 NewBlankNotebookSheet(

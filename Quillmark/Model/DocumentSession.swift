@@ -3,6 +3,12 @@ import Foundation
 import PDFKit
 import UIKit
 
+extension Notification.Name {
+    /// Posted on the main thread to display a subtle iPad-only toast (never projected to students)
+    /// for quick actions such as Apple Pencil double-tap, clear-page undo, or geometry tools.
+    static let quillmarkUndoRedoFeedback = Notification.Name("app.quillmark.undoRedoFeedback")
+}
+
 /// Editing state for one open document: annotations, tool, undo/redo and autosave.
 /// Every change goes through a `Command`, so undo/redo is the inverse command.
 final class DocumentSession: ObservableObject {
@@ -81,8 +87,10 @@ final class DocumentSession: ObservableObject {
     var pageDidChange: ((Int) -> Void)?
     /// Called after a multi-page command (`replaceAll`) or layer switch changed multiple pages at once.
     var allPagesDidChange: (() -> Void)?
-    /// Called when the user selects a target page from the PDF page navigator popover.
+    /// Called when the user selects a target page from the PDF page navigator popover or full-text search.
     var requestJumpToPDFPage: ((Int) -> Void)?
+    /// Queued target PDF page index applied once `EditorViewController` finishes mounting/activating.
+    private(set) var pendingJumpToPDFPageIndex: Int?
     /// Called after a new blank page is inserted into the PDF on disk (passes newly inserted page index).
     var pdfDocumentDidReload: ((Int) -> Void)?
 
@@ -348,7 +356,13 @@ final class DocumentSession: ObservableObject {
         guard pdfPageCount > 0 else { return }
         let clamped = min(max(0, index), pdfPageCount - 1)
         activeDocumentPageIndex = clamped
+        pendingJumpToPDFPageIndex = clamped
         requestJumpToPDFPage?(clamped)
+    }
+
+    func consumePendingJumpToPDFPage() -> Int? {
+        defer { pendingJumpToPDFPageIndex = nil }
+        return pendingJumpToPDFPageIndex
     }
 
     /// Inserts a crisp vector blank page (`blank`/`grid`/`dot`/`graph`) directly after `pageIndex`
@@ -382,6 +396,7 @@ final class DocumentSession: ObservableObject {
         }
         let pdfURL = library.pdfURL(for: meta.id)
         try updatedData.write(to: pdfURL, options: .atomic)
+        try? FileManager.default.removeItem(at: library.searchTextCacheURL(for: meta.id))
 
         // Reload a fresh PDFDocument from disk so PDFView renders cleanly with no stale page caches.
         let reloaded = PDFDocument(url: pdfURL) ?? doc

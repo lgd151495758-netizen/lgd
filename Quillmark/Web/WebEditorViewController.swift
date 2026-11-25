@@ -20,7 +20,6 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     var exportBridge: WebInkBridge { bridge }
 
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
-    private lazy var multiTouchUndo = MultiTouchUndoGestureController(session: session)
     private let pendingFillContainer = CALayer()
     private let pendingContainer = CALayer()
     private let lassoPreviewFillContainer = CALayer()
@@ -274,19 +273,6 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         // Pencil touches must never reach the page (no accidental clicks, Scribble, or text selection).
         inkRecognizer.cancelsTouchesInView = true
         view.addGestureRecognizer(inkRecognizer)
-
-        // Two-finger tap Undo / three-finger tap Redo (skip touches inside floating scratchpad).
-        multiTouchUndo.shouldReceiveTouch = { [weak self] touch in
-            guard let self else { return false }
-            if self.session.isScratchpadOpen {
-                let pt = touch.location(in: self.scratchpadPanel)
-                if self.scratchpadPanel.bounds.contains(pt) {
-                    return false
-                }
-            }
-            return true
-        }
-        multiTouchUndo.attach(to: view)
 
         pencilInteraction.delegate = self
         view.addInteraction(pencilInteraction)

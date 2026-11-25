@@ -773,8 +773,6 @@ struct ToolSettings: Codable, Equatable {
     /// Four quick-switch pen slots (customizable in-place; optional for v1.4 backward compatibility).
     var penPresets: [PenPreset]?
     var activePenPresetIndex: Int?
-    /// Two-finger tap to undo and three-finger tap to redo across all canvases (default on).
-    var multiFingerUndo: Bool?
     /// Four pinned favorite colors shown directly on the toolbar (customizable via the color palette).
     var quickColors: [RGBAColor]?
 
@@ -913,10 +911,6 @@ struct ToolSettings: Codable, Equatable {
         PenPreset(id: 2, color: RGBAColor(0.10, 0.27, 0.66), width: 1.8, lineStyle: .dashed),
         PenPreset(id: 3, color: RGBAColor(0.97, 0.97, 0.99), width: 1.8, lineStyle: .solid),
     ]
-
-    var isMultiFingerUndoEnabled: Bool {
-        multiFingerUndo ?? true
-    }
 
     var resolvedPenPresets: [PenPreset] {
         if let penPresets, penPresets.count == Self.defaultPenPresets.count {

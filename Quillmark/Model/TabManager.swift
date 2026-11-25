@@ -68,8 +68,9 @@ final class TabManager: ObservableObject {
     }
 
     /// Opens `meta` in a new tab (or switches to it if already open) and displays the workspace.
+    /// When `targetPDFPage` is provided for a PDF document, jumps straight to that zero-based page.
     @discardableResult
-    func open(_ meta: DocumentMeta, library: LibraryStore) -> DocumentTab {
+    func open(_ meta: DocumentMeta, library: LibraryStore, targetPDFPage: Int? = nil) -> DocumentTab {
         let sharedTool = activeTab?.session.tool ?? ToolSettings.load()
 
         if let existing = tabs.first(where: { $0.id == meta.id }) {
@@ -84,6 +85,9 @@ final class TabManager: ObservableObject {
                 activeTabID = existing.id
             }
             isWorkspaceVisible = true
+            if let targetPDFPage, meta.layout != .live {
+                existing.session.jumpToPDFPage(targetPDFPage)
+            }
             return existing
         }
 
@@ -91,6 +95,9 @@ final class TabManager: ObservableObject {
             onFlushTabState?(prevID)
         }
         let session = DocumentSession(meta: meta, library: library, tool: sharedTool)
+        if let targetPDFPage, meta.layout != .live {
+            session.jumpToPDFPage(targetPDFPage)
+        }
         let tab = DocumentTab(meta: meta, session: session)
         tabs.append(tab)
         activeTabID = tab.id

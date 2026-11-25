@@ -201,7 +201,6 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
     private var eraseOriginal: [InkStroke]?
     private var eraseWorking: [InkStroke] = []
     private var lastErasePoint: CGPoint?
-    private lazy var multiTouchUndo = MultiTouchUndoGestureController(session: session)
 
     init(session: DocumentSession) {
         self.session = session
@@ -271,8 +270,6 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         ]
         tapeTapRecognizer.addTarget(self, action: #selector(handleFingerTap(_:)))
         addGestureRecognizer(tapeTapRecognizer)
-
-        multiTouchUndo.attach(to: self)
 
         applyToolConfiguration()
         syncCommittedStrokes()

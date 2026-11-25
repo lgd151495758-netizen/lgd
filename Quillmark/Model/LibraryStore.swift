@@ -201,6 +201,7 @@ final class LibraryStore: ObservableObject {
     func metaURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("meta.json") }
     func sourceFolder(for id: UUID) -> URL { folder(for: id).appendingPathComponent("source", isDirectory: true) }
     func thumbnailURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("thumbnail.png") }
+    func searchTextCacheURL(for id: UUID) -> URL { folder(for: id).appendingPathComponent("search-text.json") }
 
     func folderName(for folderID: UUID?) -> String? {
         guard let folderID else { return nil }

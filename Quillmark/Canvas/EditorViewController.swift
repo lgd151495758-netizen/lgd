@@ -28,7 +28,6 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     // Unified gesture & vector overlay hierarchy (sibling above pdfView; iPad chrome never projected)
     private let inkRecognizer = InkGestureRecognizer(target: nil, action: nil)
     private let tapeTapRecognizer = UITapGestureRecognizer()
-    private lazy var multiTouchUndo = MultiTouchUndoGestureController(session: session)
     private let lassoPreviewFillContainer = CALayer()
     private let lassoPreviewContainer = CALayer()
     private let liveFillLayer = CAShapeLayer()
@@ -282,19 +281,6 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         tapeTapRecognizer.addTarget(self, action: #selector(handleFingerTap(_:)))
         view.addGestureRecognizer(tapeTapRecognizer)
 
-        // Two-finger tap to Undo / three-finger tap to Redo (skip touches inside floating scratchpad).
-        multiTouchUndo.shouldReceiveTouch = { [weak self] touch in
-            guard let self else { return false }
-            if self.session.isScratchpadOpen {
-                let pt = touch.location(in: self.scratchpadPanel)
-                if self.scratchpadPanel.bounds.contains(pt) {
-                    return false
-                }
-            }
-            return true
-        }
-        multiTouchUndo.attach(to: view)
-
         pencilInteraction.delegate = self
         view.addInteraction(pencilInteraction)
 
@@ -329,15 +315,13 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             PresentationCenter.shared.requestFrameRefresh()
         }
         session.requestJumpToPDFPage = { [weak self] pageIndex in
-            guard let self, let doc = self.pdfView.document,
-                  pageIndex >= 0, pageIndex < doc.pageCount,
-                  let page = doc.page(at: pageIndex) else { return }
-            self.clearSelectedShape()
-            self.clearLassoSelection()
-            self.pdfView.go(to: page)
-            self.updateActiveDocumentPageIndex()
-            self.recordCurrentViewport()
-            PresentationCenter.shared.requestFrameRefresh()
+            guard let self else { return }
+            guard self.hasRestoredViewport, self.view.window != nil, self.pdfView.bounds.width > 0 else {
+                // Keep `pendingJumpToPDFPageIndex` queued until layout / tab activation completes.
+                return
+            }
+            let target = self.session.consumePendingJumpToPDFPage() ?? pageIndex
+            self.navigatePDFToPage(target)
         }
         session.pdfDocumentDidReload = { [weak self] targetPageIndex in
             guard let self else { return }
@@ -542,6 +526,10 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             updatePresentationViewport(focusY: nil)
             PresentationCenter.shared.setContentSource(self)
             pushPresentationOverlay()
+            if hasRestoredViewport, pdfView.bounds.width > 0,
+               let pendingPage = session.consumePendingJumpToPDFPage() {
+                navigatePDFToPage(pendingPage)
+            }
         } else {
             stopLaserLoop()
             laserEngine.cancel()
@@ -572,8 +560,30 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         ))
     }
 
+    private func navigatePDFToPage(_ pageIndex: Int) {
+        guard let doc = pdfView.document,
+              pageIndex >= 0, pageIndex < doc.pageCount,
+              let page = doc.page(at: pageIndex) else { return }
+        clearSelectedShape()
+        clearLassoSelection()
+        pdfView.go(to: page)
+        updateActiveDocumentPageIndex()
+        recordCurrentViewport()
+        PresentationCenter.shared.requestFrameRefresh()
+    }
+
     private func restoreSavedViewportIfNeeded() {
         guard !hasRestoredViewport, !isRestoringViewport else { return }
+        if let pendingPage = session.consumePendingJumpToPDFPage() {
+            isRestoringViewport = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+                guard let self else { return }
+                self.isRestoringViewport = false
+                self.hasRestoredViewport = true
+                self.navigatePDFToPage(pendingPage)
+            }
+            return
+        }
         guard let saved = session.savedViewport, saved.isValid else {
             hasRestoredViewport = true
             return

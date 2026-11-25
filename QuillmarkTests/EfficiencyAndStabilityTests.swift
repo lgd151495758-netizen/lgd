@@ -80,47 +80,26 @@ final class EfficiencyAndStabilityTests: XCTestCase {
         XCTAssertEqual(reloaded.lineStyle, .dashed)
     }
 
-    // MARK: 2. Multi-Finger Tap Undo / Redo Gesture Controller
+    // MARK: 2. No Multi-Touch Tap Undo/Redo Gestures Attached (Prevents Accidental Palm Undo)
 
     @MainActor
-    func testMultiTouchUndoGestureControllerTriggersUndoRedoAndNotification() throws {
+    func testCanvasesDoNotAttachMultiTouchTapUndoGestures() throws {
         let meta = try library.createDocument(title: "gesture-test", pdfData: makePDFData(),
                                               layout: .pdf, sourceKind: .pdfFile, sourceURL: "g.pdf", stagedSource: nil)
         let session = DocumentSession(meta: meta, library: library, tool: ToolSettings())
-        let controller = MultiTouchUndoGestureController(session: session)
-        let host = UIView(frame: CGRect(x: 0, y: 0, width: 400, height: 400))
-        controller.attach(to: host)
 
-        XCTAssertEqual(controller.twoFingerUndoTap.numberOfTouchesRequired, 2)
-        XCTAssertEqual(controller.threeFingerRedoTap.numberOfTouchesRequired, 3)
-        XCTAssertFalse(controller.twoFingerUndoTap.cancelsTouchesInView)
-        XCTAssertFalse(controller.threeFingerRedoTap.cancelsTouchesInView)
-        XCTAssertEqual(controller.twoFingerUndoTap.allowedTouchTypes, [NSNumber(value: UITouch.TouchType.direct.rawValue)])
+        let pdfEditor = EditorViewController(session: session)
+        pdfEditor.loadViewIfNeeded()
+        let pdfMultiFingerTaps = (pdfEditor.view.gestureRecognizers ?? [])
+            .compactMap { $0 as? UITapGestureRecognizer }
+            .filter { $0.numberOfTouchesRequired >= 2 }
+        XCTAssertTrue(pdfMultiFingerTaps.isEmpty, "PDF canvas must not attach multi-finger tap undo/redo gestures")
 
-        var feedbackMessages: [String] = []
-        let token = NotificationCenter.default.addObserver(forName: .quillmarkUndoRedoFeedback, object: nil, queue: nil) { note in
-            if let msg = note.userInfo?["message"] as? String {
-                feedbackMessages.append(msg)
-            }
-        }
-        defer { NotificationCenter.default.removeObserver(token) }
-
-        let s1 = makeStroke(y: 60)
-        session.addStroke(s1, page: 0)
-        XCTAssertEqual(session.strokes(onPage: 0).count, 1)
-
-        controller.triggerUndo()
-        XCTAssertTrue(session.strokes(onPage: 0).isEmpty)
-        XCTAssertEqual(feedbackMessages.last, "已撤销")
-
-        controller.triggerRedo()
-        XCTAssertEqual(session.strokes(onPage: 0).map(\.id), [s1.id])
-        XCTAssertEqual(feedbackMessages.last, "已重做")
-
-        // When disabled, gesture triggers are ignored cleanly.
-        session.tool.multiFingerUndo = false
-        controller.triggerUndo()
-        XCTAssertEqual(session.strokes(onPage: 0).count, 1)
+        let scratchpad = ScratchpadCanvasView(session: session)
+        let scratchMultiFingerTaps = (scratchpad.gestureRecognizers ?? [])
+            .compactMap { $0 as? UITapGestureRecognizer }
+            .filter { $0.numberOfTouchesRequired >= 2 }
+        XCTAssertTrue(scratchMultiFingerTaps.isEmpty, "Scratchpad canvas must not attach multi-finger tap undo/redo gestures")
     }
 
     // MARK: 3. Multi-Tab LRU Memory Hibernation & Seamless Revival

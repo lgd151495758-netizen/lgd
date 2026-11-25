@@ -522,20 +522,20 @@ final class PresentationToolsTests: XCTestCase {
         engine.move(to: CGPoint(x: 80, y: 20), now: 10.1)
         engine.end(now: 10.2)
 
-        // Lift for 1.0s (within hold window), then circle 2 -> chains both disconnected strokes!
-        engine.begin(at: CGPoint(x: 200, y: 120), color: ToolSettings.laserPalette[0], now: 11.2)
-        engine.move(to: CGPoint(x: 260, y: 120), now: 11.3)
-        engine.end(now: 11.4)
+        // Lift for 0.6s (within hold window), then circle 2 -> chains both disconnected strokes!
+        engine.begin(at: CGPoint(x: 200, y: 120), color: ToolSettings.laserPalette[0], now: 10.8)
+        engine.move(to: CGPoint(x: 260, y: 120), now: 10.9)
+        engine.end(now: 11.0)
         XCTAssertEqual(engine.strokes.count, 2)
 
-        // Wait into fade phase (1.6s hold + 0.45s fade = 2.05s after lift -> fading at ~50%).
-        let fading = engine.frame(at: 11.4 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
+        // Wait into fade phase (0.9s hold + 0.3s fade = 1.2s after lift -> fading at ~50%).
+        let fading = engine.frame(at: 11.0 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
         XCTAssertTrue(fading.isActive)
         XCTAssertLessThan(fading.opacity, 0.7)
 
         // Press & hold pen tip on screen before expiry -> revives ALL strokes to 100% brightness indefinitely!
         engine.begin(at: CGPoint(x: 320, y: 200), color: ToolSettings.laserPalette[0],
-                     now: 11.4 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
+                     now: 11.0 + LaserPointerEngine.liftHoldDuration + LaserPointerEngine.liftFadeDuration * 0.5)
         XCTAssertEqual(engine.strokes.count, 3)
 
         // Even 10 seconds later while still holding pen on screen, all marks stay at 100% brightness.

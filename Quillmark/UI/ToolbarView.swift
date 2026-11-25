@@ -68,16 +68,6 @@ struct ToolbarView: View {
                 }
                 .disabled(!session.canUndo)
                 .accessibilityLabel("撤销")
-                .contextMenu {
-                    Button {
-                        session.tool.multiFingerUndo = !session.tool.isMultiFingerUndoEnabled
-                    } label: {
-                        Label(
-                            session.tool.isMultiFingerUndoEnabled ? "关闭双指撤销 / 三指重做" : "开启双指撤销 / 三指重做",
-                            systemImage: session.tool.isMultiFingerUndoEnabled ? "hand.tap.fill" : "hand.tap"
-                        )
-                    }
-                }
 
                 Button {
                     session.redo()

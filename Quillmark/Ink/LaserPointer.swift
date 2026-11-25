@@ -20,16 +20,16 @@ struct LaserRenderFrame {
 /// - Supports circling or underlining multiple separate places in sequence even when the pen tip
 ///   lifts between strokes (accumulates disconnected strokes while the previous laser marks remain
 ///   visible).
-/// - After lifting the pen, keeps all marks at full 100% brightness for `liftHoldDuration` (1.6s),
-///   then smoothly fades out over `liftFadeDuration` (0.9s).
+/// - After lifting the pen, keeps all marks at full 100% brightness for `liftHoldDuration` (0.9s),
+///   then smoothly fades out over `liftFadeDuration` (0.6s).
 /// - Touching & holding the pen tip down anywhere on the screen revives and locks all visible laser
 ///   marks at 100% brightness indefinitely until the teacher lifts the pen again.
 /// - Renders identically on iPad and the 60fps external presentation display.
 final class LaserPointerEngine {
     /// Full-brightness dwell window after lifting the pen so the teacher can circle multiple areas.
-    static let liftHoldDuration: TimeInterval = 1.6
+    static let liftHoldDuration: TimeInterval = 0.9
     /// Smooth fade-out duration following `liftHoldDuration`.
-    static let liftFadeDuration: TimeInterval = 0.9
+    static let liftFadeDuration: TimeInterval = 0.6
     /// Total time from pen lift until marks fully clear.
     static var totalLiftDuration: TimeInterval { liftHoldDuration + liftFadeDuration }
     static let trailGlowRadius: CGFloat = 4.2
