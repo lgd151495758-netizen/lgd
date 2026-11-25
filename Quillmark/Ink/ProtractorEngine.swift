@@ -704,11 +704,131 @@ enum ProtractorAngleDetector {
             if accepted.count >= 6 { break }
         }
 
-        let sortedAngles = deduplicateSortedAngles(accepted.map(\.angle), minSeparationDegrees: 10)
+        // 6. Weighted PCA line-fitting along each detected ray eliminates parallax error from any
+        //    1-2px vertex quantization offset and solves the exact sub-pixel corner intersection.
+        var refinedAngles: [CGFloat] = []
+        var fittedLines: [(mx: CGFloat, my: CGFloat, dx: CGFloat, dy: CGFloat)] = []
+        let pcaRStart: CGFloat = 12
+        for item in accepted {
+            if let fit = refineRayWithWeightedPCA(
+                contrast: contrast,
+                width: width,
+                height: height,
+                cx: bestCenterX,
+                cy: bestCenterY,
+                approxTheta: item.angle,
+                rStart: pcaRStart,
+                rEnd: finalMaxR,
+                noiseFloor: noiseFloor
+            ) {
+                refinedAngles.append(fit.angle)
+                fittedLines.append((fit.mx, fit.my, cos(fit.angle), sin(fit.angle)))
+            } else {
+                refinedAngles.append(item.angle)
+            }
+        }
+
+        // If the two strongest rays yielded crisp PCA lines, intersect them for sub-pixel vertex snapping.
+        if fittedLines.count >= 2 {
+            let l1 = fittedLines[0]
+            let l2 = fittedLines[1]
+            let cross = l1.dx * l2.dy - l1.dy * l2.dx
+            if abs(cross) > 0.22 {
+                let t = ((l2.mx - l1.mx) * l2.dy - (l2.my - l1.my) * l2.dx) / cross
+                let vx = l1.mx + t * l1.dx
+                let vy = l1.my + t * l1.dy
+                if vx.isFinite, vy.isFinite,
+                   vx >= 8, vx <= CGFloat(width - 8),
+                   vy >= 8, vy <= CGFloat(height - 8),
+                   hypot(vx - center.x, vy - center.y) <= CGFloat(searchRadius + 2) {
+                    bestCenterX = vx
+                    bestCenterY = vy
+                }
+            }
+        }
+
+        let sortedAngles = deduplicateSortedAngles(refinedAngles, minSeparationDegrees: 10)
         guard sortedAngles.count >= 2 else { return nil }
 
         let offset = CGPoint(x: bestCenterX - center.x, y: bestCenterY - center.y)
         return ImageRayDetectionResult(vertexOffset: offset, rayAngles: sortedAngles)
+    }
+
+    private static func refineRayWithWeightedPCA(contrast: [UInt8],
+                                                 width: Int,
+                                                 height: Int,
+                                                 cx: CGFloat,
+                                                 cy: CGFloat,
+                                                 approxTheta: CGFloat,
+                                                 rStart: CGFloat,
+                                                 rEnd: CGFloat,
+                                                 noiseFloor: UInt8) -> (angle: CGFloat, mx: CGFloat, my: CGFloat)? {
+        guard rEnd > rStart + 8 else { return nil }
+        let cosT = cos(approxTheta)
+        let sinT = sin(approxTheta)
+        let perpX = -sinT
+        let perpY = cosT
+
+        var visited = Set<Int>()
+        visited.reserveCapacity(256)
+        var points: [(x: Double, y: Double, w: Double)] = []
+        points.reserveCapacity(192)
+        var sumW = 0.0
+        var sumX = 0.0
+        var sumY = 0.0
+
+        var r = rStart
+        while r <= rEnd {
+            let bx = cx + r * cosT
+            let by = cy + r * sinT
+            for step in -3...3 {
+                let d = CGFloat(step) * 0.9
+                let ix = Int(floor(bx + d * perpX))
+                let iy = Int(floor(by + d * perpY))
+                guard ix >= 0, ix < width, iy >= 0, iy < height else { continue }
+                let idx = iy * width + ix
+                guard visited.insert(idx).inserted else { continue }
+                let c = contrast[idx]
+                guard c >= noiseFloor else { continue }
+                let w = Double(c)
+                let gx = Double(ix) + 0.5
+                let gy = Double(iy) + 0.5
+                points.append((gx, gy, w))
+                sumW += w
+                sumX += w * gx
+                sumY += w * gy
+            }
+            r += 1.0
+        }
+
+        guard sumW > 0, points.count >= 10 else { return nil }
+        let mx = sumX / sumW
+        let my = sumY / sumW
+        var sxx = 0.0
+        var sxy = 0.0
+        var syy = 0.0
+        for p in points {
+            let dx = p.x - mx
+            let dy = p.y - my
+            sxx += p.w * dx * dx
+            sxy += p.w * dx * dy
+            syy += p.w * dy * dy
+        }
+
+        let tr = sxx + syy
+        let detTerm = hypot(sxx - syy, 2 * sxy)
+        let lam1 = 0.5 * (tr + detTerm)
+        let lam2 = max(0.0, 0.5 * (tr - detTerm))
+        // Reject diffuse/blobby noise patches; straight printed strokes have a very small λ2/λ1 ratio.
+        guard lam1 > 1e-3, (lam2 / lam1) <= 0.08 else { return nil }
+
+        var eigAngle = CGFloat(0.5 * atan2(2 * sxy, sxx - syy))
+        if cos(eigAngle) * cosT + sin(eigAngle) * sinT < 0 {
+            eigAngle += .pi
+        }
+        let delta = ProtractorState.normalizedSigned(eigAngle - approxTheta)
+        guard abs(delta) <= 6.0 * .pi / 180.0 else { return nil }
+        return (ProtractorState.normalizedPositive(eigAngle), CGFloat(mx), CGFloat(my))
     }
 
     private static func hasInkNear(contrast: [UInt8], width: Int, x: Int, y: Int, floor: UInt8) -> Bool {
