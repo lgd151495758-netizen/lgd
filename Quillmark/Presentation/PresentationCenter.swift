@@ -77,6 +77,14 @@ struct PendingOverlayStroke {
     var fillColor: CGColor? = nil
 }
 
+/// Chrome-free geometry tool state mirrored onto the external display when the teacher enables
+/// "大屏显示尺规", so students can watch compass constructions and protractor angle measurements live.
+enum ProjectedGeometryAid {
+    case none
+    case compass(CompassState, sweep: CompassSweep?, strokeColor: CGColor)
+    case protractor(ProtractorState)
+}
+
 /// Real-time vector ink state mirrored directly onto the external display at 60 fps while drawing,
 /// erasing, or using the laser pointer, so marks appear immediately without waiting for a snapshot.
 struct LiveOverlayState {
@@ -96,6 +104,7 @@ struct LiveOverlayState {
     var laserCorePath: CGPath?
     var laserColor: CGColor?
     var laserOpacity: Float = 1
+    var geometryAid: ProjectedGeometryAid = .none
 
     static let empty = LiveOverlayState()
 }
@@ -298,11 +307,21 @@ final class PresentationCenter: ObservableObject {
         }
     }
 
+    /// On (default): mirrors the virtual Compass and Protractor (dial, rays & degree readout,
+    /// without iPad control buttons) onto the big screen so students can watch demonstrations live.
+    @Published var showGeometryToolsOnExternalDisplay: Bool {
+        didSet {
+            defaults.set(showGeometryToolsOnExternalDisplay, forKey: Self.showGeometryToolsKey)
+            updateOverlayVisibility()
+        }
+    }
+
     static let framesPerSecond: Float = 24
     static let idlePulseFramesPerSecond: Float = 6
     private static let contentOnlyKey = "presentation.contentOnly"
     private static let fillModeKey = "presentation.fillMode.v2"
     private static let smartPowerSavingKey = "presentation.smartPowerSaving.v1"
+    private static let showGeometryToolsKey = "presentation.showGeometryTools.v1"
 
     private let defaults: UserDefaults
     private var externalWindow: UIWindow?
@@ -320,6 +339,7 @@ final class PresentationCenter: ObservableObject {
     private var currentLoopMode: ProjectionRefreshDecision.Mode = .active
     private var lastActivityAt: CFAbsoluteTime = CFAbsoluteTimeGetCurrent()
     private var lastCaptureDispatchedAt: CFAbsoluteTime = 0
+    private var needsFrameCapture = false
     private var isCapturingFrame = false
     private var captureStartedAt: CFAbsoluteTime = 0
     private var observers: [NSObjectProtocol] = []
@@ -329,6 +349,7 @@ final class PresentationCenter: ObservableObject {
         self.defaults = defaults
         contentOnly = defaults.object(forKey: Self.contentOnlyKey) as? Bool ?? true
         smartPowerSaving = defaults.object(forKey: Self.smartPowerSavingKey) as? Bool ?? true
+        showGeometryToolsOnExternalDisplay = defaults.object(forKey: Self.showGeometryToolsKey) as? Bool ?? true
         if let raw = defaults.string(forKey: Self.fillModeKey), let saved = PresentationFillMode(rawValue: raw) {
             fillMode = saved
         } else {
@@ -367,6 +388,20 @@ final class PresentationCenter: ObservableObject {
         let extPixelWidth = Double(screen.bounds.width * screen.scale)
         let mainScale = Double(max(UIScreen.main.scale, 1))
         return min(max(extPixelWidth / mainScale, 640), 1280)
+    }
+
+    /// Optimal backing scale factor for PDF projection capture matching the external display's actual
+    /// pixel width (avoids rendering wasteful 15 MB 2x bitmaps for a 1080p classroom projector).
+    func preferredPDFCaptureScale(forCaptureWidth width: CGFloat, screenScale: CGFloat) -> CGFloat {
+        guard width > 0 else { return min(max(screenScale, 1), 2) }
+        let extPixelWidth: CGFloat
+        if let screen = externalScreen {
+            extPixelWidth = screen.bounds.width * screen.scale
+        } else {
+            extPixelWidth = 1920
+        }
+        let needed = extPixelWidth / width
+        return min(max(needed, 1.0), min(max(screenScale, 1.0), 2.0))
     }
 
     // MARK: Observation & Discovery
@@ -535,24 +570,36 @@ final class PresentationCenter: ObservableObject {
         scanDisplays()
         source.presentationViewportDidChange()
         updateOverlayVisibility()
-        requestFrameRefresh()
+        if !isFrozen {
+            presenter?.setStandbyVisible(false)
+            requestFrameRefresh()
+        }
     }
 
     func clearContentSource(_ source: PresentationContentSource) {
         guard contentSource === source else { return }
         contentSource = nil
         liveOverlay = .empty
-        if isFrozen {
-            isFrozen = false
-        }
         presenter?.updateLiveOverlay(.empty)
-        requestFrameRefresh()
+        // CRITICAL: Never auto-unfreeze when returning to the Library! Teachers freeze the big
+        // screen specifically so they can return to the Library to open answer keys or switch files.
+        guard !isFrozen else { return }
+        if contentOnly {
+            // Never leak the Library grid or private document titles onto the projector in content-only mode.
+            presenter?.setStandbyVisible(true)
+            if let link = displayLink {
+                applyLoopMode(.paused, to: link)
+            }
+        } else {
+            presenter?.setStandbyVisible(false)
+            requestFrameRefresh()
+        }
     }
 
     func updateLiveOverlay(_ state: LiveOverlayState) {
         liveOverlay = state
         guard isShowingContentOnly, !isFrozen else { return }
-        presenter?.updateLiveOverlay(state)
+        presenter?.updateLiveOverlay(filteredOverlay(state))
     }
 
     /// Wakes the projection loop immediately to full 24 fps when scrolling, zooming, flipping pages,
@@ -567,10 +614,19 @@ final class PresentationCenter: ObservableObject {
         }
     }
 
+    /// Coalesces refresh requests onto the next DisplayLink tick instead of triggering synchronous
+    /// `drawHierarchy` bursts on every single drag/ink event.
     func requestFrameRefresh() {
-        markContentActive()
         guard presenter != nil, !isFrozen else { return }
-        captureNextFrame(force: true)
+        needsFrameCapture = true
+        markContentActive()
+    }
+
+    private func filteredOverlay(_ state: LiveOverlayState) -> LiveOverlayState {
+        guard !showGeometryToolsOnExternalDisplay else { return state }
+        var filtered = state
+        filtered.geometryAid = .none
+        return filtered
     }
 
     private func notifyViewportChanged() {
@@ -578,28 +634,19 @@ final class PresentationCenter: ObservableObject {
     }
 
     private func updateOverlayVisibility() {
-        presenter?.updateLiveOverlay((isShowingContentOnly && !isFrozen) ? liveOverlay : .empty)
+        presenter?.updateLiveOverlay((isShowingContentOnly && !isFrozen) ? filteredOverlay(liveOverlay) : .empty)
     }
 
     private func updateSummary() {
-        let screens = UIScreen.screens
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let captured = UIScreen.main.isCaptured
-        let accessoryNote: String
-        if SceneAccessoryBridge.isSupportedByOS {
-            accessoryNote = accessoryTokens.isEmpty ? " · Accessory:未注册" : " · Accessory:已注册"
-        } else {
-            accessoryNote = ""
-        }
-
         let nextSummary: String
         if isExternalDisplayConnected, let screen = externalScreen {
             let w = Int(screen.bounds.width * screen.scale)
             let h = Int(screen.bounds.height * screen.scale)
-            nextSummary = "已连接外接屏 \(w)×\(h)（\(attachmentKind.rawValue)\(accessoryNote)）"
+            nextSummary = "已连接外接屏幕（\(w)×\(h)）"
+        } else if UIScreen.main.isCaptured {
+            nextSummary = "检测到系统镜像模式（如需「仅投内容」，请在支持扩展屏的 AirPlay 或有线连接下使用）"
         } else {
-            let mirrorText = captured ? "镜像中" : "未镜像"
-            nextSummary = "未检测到独立外接屏（屏幕 \(screens.count) · 场景 \(scenes.count) · \(mirrorText)\(accessoryNote)）"
+            nextSummary = "未连接独立外接屏 · 请在控制中心选择「屏幕镜像」或接入 HDMI 投屏"
         }
         if connectionSummary != nextSummary {
             connectionSummary = nextSummary
@@ -653,6 +700,7 @@ final class PresentationCenter: ObservableObject {
     private func displayLinkTick() {
         guard let link = displayLink else { return }
         let now = CFAbsoluteTimeGetCurrent()
+        let forceNeeded = needsFrameCapture
         let decision = ProjectionRefreshPolicy.decide(
             isFrozen: isFrozen,
             smartPowerSaving: smartPowerSaving,
@@ -660,8 +708,13 @@ final class PresentationCenter: ObservableObject {
             prefersContinuous: contentSource?.prefersContinuousProjectionRefresh ?? false,
             secondsSinceActivity: max(0, now - lastActivityAt)
         )
-        if decision.mode != currentLoopMode {
+        if decision.mode != currentLoopMode && !forceNeeded {
             applyLoopMode(decision.mode, to: link)
+        }
+        if forceNeeded {
+            needsFrameCapture = false
+            captureNextFrame(force: true)
+            return
         }
         switch decision.mode {
         case .paused:
@@ -680,12 +733,22 @@ final class PresentationCenter: ObservableObject {
         let now = CFAbsoluteTimeGetCurrent()
         if isCapturingFrame {
             if !force && now - captureStartedAt < 2.0 { return }
-            if force && now - captureStartedAt < 0.25 { return }
+            if force && now - captureStartedAt < 0.25 {
+                // Keep the forced request queued so the very next tick after this snapshot finishes captures it.
+                needsFrameCapture = true
+                return
+            }
             isCapturingFrame = false
         }
         lastCaptureDispatchedAt = now
 
-        if contentOnly, let source = contentSource, source.presentationView.window != nil {
+        if contentOnly {
+            guard let source = contentSource, source.presentationView.window != nil else {
+                // Content-only privacy guard: never fall back to mirroring the Library window.
+                presenter.setStandbyVisible(true)
+                return
+            }
+            presenter.setStandbyVisible(false)
             isCapturingFrame = true
             captureStartedAt = now
             source.capturePresentationFrame { [weak self] image, size in
@@ -699,7 +762,8 @@ final class PresentationCenter: ObservableObject {
             return
         }
 
-        // Full-mirror fallback (when contentOnly is off or back in the Library).
+        presenter.setStandbyVisible(false)
+        // Explicit full-mirror mode (when contentOnly is off).
         guard let mainWindow = Self.mainWindow(),
               mainWindow.bounds.width > 0, mainWindow.bounds.height > 0 else { return }
         if let source = contentSource, source.presentationView.window === mainWindow {
@@ -761,6 +825,8 @@ final class PresentationViewController: UIViewController {
 
     private let imageView = UIImageView()
     private let overlayContainer = CALayer()
+    private let geometryOverlayView = ProjectedGeometryOverlayView()
+    private let standbyView = UIView()
     private let pendingFillContainer = CALayer()
     private let pendingContainer = CALayer()
     private var pendingFillLayers: [CAShapeLayer] = []
@@ -787,6 +853,14 @@ final class PresentationViewController: UIViewController {
         overlayContainer.masksToBounds = true
         view.layer.addSublayer(overlayContainer)
 
+        geometryOverlayView.backgroundColor = .clear
+        geometryOverlayView.isOpaque = false
+        geometryOverlayView.isHidden = true
+        geometryOverlayView.clipsToBounds = true
+        view.addSubview(geometryOverlayView)
+
+        setupStandbyView()
+
         liveFillLayer.fillRule = .nonZero
         liveFillLayer.opacity = 0.18
         liveStrokeLayer.fillRule = .nonZero
@@ -808,6 +882,55 @@ final class PresentationViewController: UIViewController {
         overlayContainer.addSublayer(eraserCursorLayer)
         overlayContainer.addSublayer(laserGlowLayer)
         overlayContainer.addSublayer(laserCoreLayer)
+    }
+
+    private func setupStandbyView() {
+        standbyView.backgroundColor = UIColor(red: 0.08, green: 0.09, blue: 0.11, alpha: 1)
+        standbyView.isHidden = true
+        standbyView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(standbyView)
+
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let icon = UIImageView(image: UIImage(systemName: "doc.richtext"))
+        icon.tintColor = UIColor.white.withAlphaComponent(0.65)
+        icon.preferredSymbolConfiguration = UIImage.SymbolConfiguration(pointSize: 44, weight: .light)
+
+        let title = UILabel()
+        title.text = "羽签 · 课堂投屏"
+        title.font = .systemFont(ofSize: 28, weight: .semibold)
+        title.textColor = UIColor.white.withAlphaComponent(0.92)
+
+        let subtitle = UILabel()
+        subtitle.text = "老师正在准备或切换课件，请稍候…"
+        subtitle.font = .systemFont(ofSize: 17, weight: .regular)
+        subtitle.textColor = UIColor.white.withAlphaComponent(0.60)
+
+        stack.addArrangedSubview(icon)
+        stack.addArrangedSubview(title)
+        stack.addArrangedSubview(subtitle)
+        standbyView.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            standbyView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            standbyView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            standbyView.topAnchor.constraint(equalTo: view.topAnchor),
+            standbyView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            stack.centerXAnchor.constraint(equalTo: standbyView.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: standbyView.centerYAnchor),
+        ])
+    }
+
+    func setStandbyVisible(_ visible: Bool) {
+        standbyView.isHidden = !visible
+        if visible {
+            geometryOverlayView.isHidden = true
+            view.bringSubviewToFront(standbyView)
+        }
     }
 
     override func viewDidLayoutSubviews() {
@@ -838,6 +961,7 @@ final class PresentationViewController: UIViewController {
         CATransaction.setDisableActions(true)
         imageView.frame = target
         overlayContainer.frame = target
+        geometryOverlayView.frame = target
         pendingFillContainer.frame = overlayContainer.bounds
         pendingContainer.frame = overlayContainer.bounds
         for layer in pendingFillLayers { layer.frame = pendingFillContainer.bounds }
@@ -860,9 +984,11 @@ final class PresentationViewController: UIViewController {
             liveStrokeLayer.path = nil
             eraserCursorLayer.path = nil
             laserGlowLayer.path = nil
+            laserGlowLayer.shadowPath = nil
             laserCoreLayer.path = nil
             for layer in pendingFillLayers { layer.path = nil }
             for layer in pendingLayers { layer.path = nil }
+            geometryOverlayView.update(aid: .none, scale: 1, captureOriginY: 0, sourceSize: .zero)
             CATransaction.commit()
             return
         }
@@ -913,16 +1039,26 @@ final class PresentationViewController: UIViewController {
         }
 
         if let glowPath = lastOverlay.laserGlowPath {
+            let scaledGlow = glowPath.copy(using: &transform)
             laserGlowLayer.fillColor = lastOverlay.laserColor
             laserGlowLayer.shadowColor = lastOverlay.laserColor
             laserGlowLayer.opacity = lastOverlay.laserOpacity
-            laserGlowLayer.path = glowPath.copy(using: &transform)
+            laserGlowLayer.path = scaledGlow
+            laserGlowLayer.shadowPath = scaledGlow
             laserCoreLayer.opacity = lastOverlay.laserOpacity
             laserCoreLayer.path = lastOverlay.laserCorePath?.copy(using: &transform)
         } else {
             laserGlowLayer.path = nil
+            laserGlowLayer.shadowPath = nil
             laserCoreLayer.path = nil
         }
+
+        geometryOverlayView.update(
+            aid: lastOverlay.geometryAid,
+            scale: scale,
+            captureOriginY: lastOverlay.captureOriginY,
+            sourceSize: refSize
+        )
         CATransaction.commit()
     }
 
@@ -936,6 +1072,59 @@ final class PresentationViewController: UIViewController {
         layer.opacity = opacity
         layer.compositingFilter = isHighlighter ? "multiplyBlendMode" : nil
         layer.path = path.copy(using: &transform)
+    }
+}
+
+/// Renders a crisp, chrome-free Compass or Smart Protractor on the external classroom display
+/// (scaled cleanly from iPad coordinates, hiding all iPad floating control bars & resize knobs).
+private final class ProjectedGeometryOverlayView: UIView {
+    private var aid: ProjectedGeometryAid = .none
+    private var scale: CGFloat = 1
+    private var captureOriginY: CGFloat = 0
+    private var sourceSize: CGSize = .zero
+
+    func update(aid: ProjectedGeometryAid, scale: CGFloat, captureOriginY: CGFloat, sourceSize: CGSize) {
+        self.aid = aid
+        self.scale = scale
+        self.captureOriginY = captureOriginY
+        self.sourceSize = sourceSize
+        switch aid {
+        case .none:
+            if !isHidden { isHidden = true }
+        case .compass, .protractor:
+            if isHidden { isHidden = false }
+            setNeedsDisplay()
+        }
+    }
+
+    override func draw(_ rect: CGRect) {
+        guard let ctx = UIGraphicsGetCurrentContext() else { return }
+        ctx.saveGState()
+        ctx.scaleBy(x: scale, y: scale)
+        ctx.translateBy(x: 0, y: -captureOriginY)
+        let virtualBounds = CGRect(x: 0, y: captureOriginY, width: sourceSize.width, height: sourceSize.height)
+        switch aid {
+        case .none:
+            break
+        case let .compass(compass, sweep, strokeColor):
+            GeometryToolOverlayView.drawCompassBody(
+                compass,
+                sweep: sweep,
+                isResizing: false,
+                activeStrokeColor: UIColor(cgColor: strokeColor),
+                in: virtualBounds,
+                ctx: ctx,
+                includeControls: false
+            )
+        case let .protractor(protractor):
+            GeometryToolOverlayView.drawProtractorBody(
+                protractor,
+                in: virtualBounds,
+                ctx: ctx,
+                includeControls: false
+            )
+        }
+        ctx.restoreGState()
     }
 }
 

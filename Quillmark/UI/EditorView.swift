@@ -13,6 +13,7 @@ struct WorkspaceView: View {
     @State private var exportTargetMeta: DocumentMeta?
     @State private var isFocusMode = false
     @State private var undoToastText: String?
+    @State private var undoToastCanUndo = false
     @State private var undoToastDismissWork: DispatchWorkItem?
 
     let onCreateNotebook: () -> Void
@@ -31,6 +32,9 @@ struct WorkspaceView: View {
                             .padding(.horizontal)
                             .padding(.vertical, 6)
                     }
+                }
+                if let activeTab = tabManager.activeTab {
+                    SessionSafetyBanner(session: activeTab.session)
                 }
                 if presentation.isFrozen {
                     Button {
@@ -71,32 +75,51 @@ struct WorkspaceView: View {
             }
 
             if let toast = undoToastText {
-                Text(toast)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .background(Color.black.opacity(0.76), in: Capsule())
-                    .padding(.top, isFocusMode ? 16 : 108)
-                    .allowsHitTesting(false)
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                HStack(spacing: 10) {
+                    Text(toast)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                    if undoToastCanUndo, let activeSession = tabManager.activeTab?.session, activeSession.canUndo {
+                        Button("撤销") {
+                            activeSession.undo()
+                            undoToastDismissWork?.cancel()
+                            withAnimation(.easeIn(duration: 0.15)) {
+                                undoToastText = nil
+                                undoToastCanUndo = false
+                            }
+                        }
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(.yellow)
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(Color.black.opacity(0.80), in: Capsule())
+                .padding(.top, isFocusMode ? 16 : 108)
+                .allowsHitTesting(undoToastCanUndo)
+                .transition(.opacity.combined(with: .scale(scale: 0.92)))
             }
         }
         .background(Color(.systemBackground))
         .ignoresSafeArea(edges: .bottom)
         .onReceive(NotificationCenter.default.publisher(for: .quillmarkUndoRedoFeedback)) { note in
             guard let msg = note.userInfo?["message"] as? String else { return }
+            let showUndo = (note.userInfo?["showUndo"] as? Bool) ?? false
+            let duration: TimeInterval = showUndo ? 2.8 : (msg.count > 10 ? 2.0 : 0.95)
             undoToastDismissWork?.cancel()
             withAnimation(.easeOut(duration: 0.15)) {
                 undoToastText = msg
+                undoToastCanUndo = showUndo
             }
             let work = DispatchWorkItem {
                 withAnimation(.easeIn(duration: 0.2)) {
                     undoToastText = nil
+                    undoToastCanUndo = false
                 }
             }
             undoToastDismissWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.85, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
         }
         .sheet(item: $exportTargetMeta) { meta in
             ExportDocumentSheet(
@@ -322,6 +345,7 @@ private struct ActiveTabTrailingControls: View {
 
     @State private var showPageNavigator = false
     @State private var showLayersPopover = false
+    @State private var pendingClearAllKeepTapes: Bool?
 
     var body: some View {
         HStack(spacing: 6) {
@@ -395,12 +419,12 @@ private struct ActiveTabTrailingControls: View {
         Menu {
             if session.meta.layout == .live {
                 Button {
-                    session.clearAllDocumentHandwriting(keepTapes: true)
+                    pendingClearAllKeepTapes = true
                 } label: {
                     Label("清空手写（保留胶带）", systemImage: "eraser.line.dashed")
                 }
                 Button(role: .destructive) {
-                    session.clearAllDocumentHandwriting(keepTapes: false)
+                    pendingClearAllKeepTapes = false
                 } label: {
                     Label("清空全部批注（含胶带）", systemImage: "trash")
                 }
@@ -408,24 +432,29 @@ private struct ActiveTabTrailingControls: View {
                 if session.pdfPageCount > 1 {
                     Button {
                         session.clearHandwriting(onPage: session.activeDocumentPageIndex, keepTapes: true)
+                        NotificationCenter.default.post(
+                            name: .quillmarkUndoRedoFeedback,
+                            object: nil,
+                            userInfo: ["message": "已清空第 \(session.activeDocumentPageIndex + 1) 页手写", "showUndo": true]
+                        )
                     } label: {
                         Label("清空第 \(session.activeDocumentPageIndex + 1) 页手写（保留胶带）",
                               systemImage: "eraser.line.dashed")
                     }
-                    Button {
-                        session.clearAllDocumentHandwriting(keepTapes: true)
+                    Button(role: .destructive) {
+                        pendingClearAllKeepTapes = true
                     } label: {
                         Label("清空整份 PDF 手写（保留胶带）", systemImage: "doc.on.doc")
                     }
                 } else {
                     Button {
-                        session.clearAllDocumentHandwriting(keepTapes: true)
+                        pendingClearAllKeepTapes = true
                     } label: {
                         Label("清空手写（保留胶带）", systemImage: "eraser.line.dashed")
                     }
                 }
                 Button(role: .destructive) {
-                    session.clearAllDocumentHandwriting(keepTapes: false)
+                    pendingClearAllKeepTapes = false
                 } label: {
                     Label("清空全部批注（含胶带）", systemImage: "trash")
                 }
@@ -434,6 +463,11 @@ private struct ActiveTabTrailingControls: View {
                 Divider()
                 Button {
                     session.clearCurrentScratchpadPage()
+                    NotificationCenter.default.post(
+                        name: .quillmarkUndoRedoFeedback,
+                        object: nil,
+                        userInfo: ["message": "已清空当前便签页", "showUndo": true]
+                    )
                 } label: {
                     Label("清空当前便签页", systemImage: "note.text")
                 }
@@ -449,6 +483,33 @@ private struct ActiveTabTrailingControls: View {
             .background(Color.secondary.opacity(0.14), in: Capsule())
         }
         .accessibilityLabel("清空手写")
+        .confirmationDialog(
+            pendingClearAllKeepTapes == false ? "清空整份文档的全部批注（含胶带）？" : "清空整份文档的手写（保留胶带）？",
+            isPresented: Binding(
+                get: { pendingClearAllKeepTapes != nil },
+                set: { if !$0 { pendingClearAllKeepTapes = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(pendingClearAllKeepTapes == false ? "清空全部批注" : "清空手写（保留胶带）", role: .destructive) {
+                if let keepTapes = pendingClearAllKeepTapes {
+                    session.clearAllDocumentHandwriting(keepTapes: keepTapes)
+                    pendingClearAllKeepTapes = nil
+                    NotificationCenter.default.post(
+                        name: .quillmarkUndoRedoFeedback,
+                        object: nil,
+                        userInfo: ["message": keepTapes ? "已清空整份手写（保留胶带）" : "已清空全部批注", "showUndo": true]
+                    )
+                }
+            }
+            Button("取消", role: .cancel) {
+                pendingClearAllKeepTapes = nil
+            }
+        } message: {
+            Text(pendingClearAllKeepTapes == false
+                 ? "将清空当前图层的所有手写、图形与遮盖胶带（清空后仍可立即点击撤销）。"
+                 : "将清空当前图层的所有手写与图形，已贴好的遮盖胶带会保留并恢复为遮盖状态。")
+        }
     }
 }
 
@@ -588,9 +649,9 @@ private struct PresentationPopover: View {
             Text("投屏模式")
                 .font(.headline)
 
-            Toggle("投屏仅显示内容", isOn: $presentation.contentOnly)
+            Toggle("仅投内容", isOn: $presentation.contentOnly)
 
-            Text("开启后，外接屏幕（如 OfflineMirror / AirPlay）只显示工具栏下方的文档与批注内容，标签栏与工具栏仅在 iPad 上显示。")
+            Text("开启后，教室外接大屏（AirPlay 或有线 HDMI）只显示文档与批注内容；标签栏、工具栏与文档库列表仅在 iPad 上显示。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -602,11 +663,17 @@ private struct PresentationPopover: View {
                     }
                 }
                 .pickerStyle(.segmented)
+
+                Toggle("大屏显示尺规（圆规 / 量角器）", isOn: $presentation.showGeometryToolsOnExternalDisplay)
+                Text("开启后，在 iPad 上使用圆规作图或量角器测角时，学生大屏会实时同步显示圆规臂、量角器刻度盘与数字角度读数（自动隐藏操作按钮）。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if presentation.isExternalDisplayConnected {
                 Toggle("冻结大屏画面", isOn: $presentation.isFrozen)
-                Text("冻结后学生端大屏保持当前题目不变，你可以在 iPad 上自由切换标签页或翻页看答案，关闭后立即恢复同步。")
+                Text("冻结后学生端大屏保持当前画面不变，即使返回文档库或切换标签页看答案也不会泄露给学生，关闭冻结后立即恢复同步。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -680,6 +747,62 @@ private struct TabDeckRepresentable: UIViewControllerRepresentable {
 
 /// Compact floating capsule shown in the top-trailing corner during Focus Writing Mode
 /// (strictly on the iPad SwiftUI overlay, never projected onto the external display).
+private struct SessionSafetyBanner: View {
+    @ObservedObject var session: DocumentSession
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let loadError = session.loadErrorMessage {
+                HStack(spacing: 10) {
+                    Image(systemName: "exclamationmark.shield.fill")
+                        .foregroundStyle(.white)
+                    Text(loadError)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button("解除只读") {
+                        session.acknowledgeCorruptedLoadAndEnableSaving()
+                    }
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.red)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.white, in: Capsule())
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.red.opacity(0.92))
+            }
+
+            if let saveError = session.saveErrorMessage {
+                HStack(spacing: 10) {
+                    Image(systemName: "externaldrive.badge.exclamationmark")
+                        .foregroundStyle(.white)
+                    Text(saveError)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.white)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button("重试保存") {
+                        session.retrySaveNow()
+                    }
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(Color.white, in: Capsule())
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.orange.opacity(0.95))
+            }
+        }
+    }
+}
+
 private struct FocusModeFloatingBar: View {
     @ObservedObject var session: DocumentSession
     @ObservedObject var presentation: PresentationCenter
@@ -693,12 +816,27 @@ private struct FocusModeFloatingBar: View {
                 Image(systemName: "pencil")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(session.tool.kind == .pen ? Color.accentColor : Color.primary)
-                    .frame(width: 28, height: 28)
+                    .frame(width: 34, height: 34)
                     .background(session.tool.kind == .pen ? Color.accentColor.opacity(0.18) : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 7))
+                                in: RoundedRectangle(cornerRadius: 8))
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("切换画笔")
+
+            Button {
+                session.selectToolManually(.laser)
+            } label: {
+                Image(systemName: "laser.burst")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(session.tool.kind == .laser ? Color.accentColor : Color.primary)
+                    .frame(width: 34, height: 34)
+                    .background(session.tool.kind == .laser ? Color.accentColor.opacity(0.18) : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 8))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("切换激光笔")
 
             Button {
                 session.selectToolManually(.eraser)
@@ -706,9 +844,10 @@ private struct FocusModeFloatingBar: View {
                 Image(systemName: "eraser")
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(session.tool.kind == .eraser ? Color.accentColor : Color.primary)
-                    .frame(width: 28, height: 28)
+                    .frame(width: 34, height: 34)
                     .background(session.tool.kind == .eraser ? Color.accentColor.opacity(0.18) : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 7))
+                                in: RoundedRectangle(cornerRadius: 8))
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("切换橡皮")
@@ -718,11 +857,24 @@ private struct FocusModeFloatingBar: View {
             } label: {
                 Image(systemName: "arrow.uturn.backward")
                     .font(.subheadline.weight(.medium))
-                    .frame(width: 28, height: 28)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(!session.canUndo)
             .accessibilityLabel("撤销")
+
+            Button {
+                session.redo()
+            } label: {
+                Image(systemName: "arrow.uturn.forward")
+                    .font(.subheadline.weight(.medium))
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!session.canRedo)
+            .accessibilityLabel("重做")
 
             if presentation.isExternalDisplayConnected {
                 Button {

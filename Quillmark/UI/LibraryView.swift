@@ -66,6 +66,9 @@ struct LibraryView: View {
     @State private var errorMessage: String?
     @State private var infoMessage: String?
     @State private var pendingClear: PendingClear?
+    @State private var pendingDeleteDocument: DocumentMeta?
+    @State private var pendingRestoreURL: URL?
+    @State private var backupReminderDismissed = false
 
     // Folder & document organization alerts
     @State private var showNewFolderPrompt = false
@@ -125,38 +128,46 @@ struct LibraryView: View {
 
     var body: some View {
         ZStack {
-            NavigationStack {
-                VStack(spacing: 0) {
-                    if !library.documents.isEmpty || !library.folders.isEmpty {
-                        folderFilterBar
-                        Divider()
+            // Unmount the Library grid while the document workspace covers the screen so 1-second
+            // autosaves never trigger hidden list re-sorts or background PDF thumbnail rasterization.
+            if !tabManager.isWorkspaceVisible {
+                NavigationStack {
+                    VStack(spacing: 0) {
+                        if !library.documents.isEmpty || !library.folders.isEmpty {
+                            folderFilterBar
+                            Divider()
+                        }
+                        if library.needsBackupReminder && !backupReminderDismissed {
+                            backupReminderBanner
+                            Divider()
+                        }
+                        content
                     }
-                    content
-                }
-                .navigationTitle("羽签")
-                .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic),
-                            prompt: "搜索试卷、讲义或文件夹")
-                .toolbar {
-                    ToolbarItem(placement: .primaryAction) {
-                        HStack(spacing: 10) {
-                            if !tabManager.tabs.isEmpty {
-                                Button {
-                                    tabManager.showWorkspace()
-                                } label: {
-                                    HStack(spacing: 5) {
-                                        Image(systemName: "rectangle.stack")
-                                        Text("返回文档 (\(tabManager.tabs.count))")
-                                            .font(.subheadline.weight(.medium))
+                    .navigationTitle("羽签")
+                    .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic),
+                                prompt: "搜索试卷、讲义或文件夹")
+                    .toolbar {
+                        ToolbarItem(placement: .primaryAction) {
+                            HStack(spacing: 10) {
+                                if !tabManager.tabs.isEmpty {
+                                    Button {
+                                        tabManager.showWorkspace()
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            Image(systemName: "rectangle.stack")
+                                            Text("返回文档 (\(tabManager.tabs.count))")
+                                                .font(.subheadline.weight(.medium))
+                                        }
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Color.accentColor.opacity(0.16), in: Capsule())
                                     }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(Color.accentColor.opacity(0.16), in: Capsule())
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("返回已打开的文档标签页")
                                 }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("返回已打开的文档标签页")
+                                moreMenu
+                                importMenu
                             }
-                            moreMenu
-                            importMenu
                         }
                     }
                 }
@@ -288,6 +299,67 @@ struct LibraryView: View {
             }
         } message: {
             Text(clearAlertMessage)
+        }
+        .confirmationDialog(
+            pendingDeleteDocument.map { "永久删除《\($0.title)》？" } ?? "删除文档？",
+            isPresented: Binding(
+                get: { pendingDeleteDocument != nil },
+                set: { if !$0 { pendingDeleteDocument = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("永久删除", role: .destructive) {
+                if let target = pendingDeleteDocument {
+                    tabManager.closeTab(id: target.id)
+                    library.delete(target.id)
+                    pendingDeleteDocument = nil
+                }
+            }
+            Button("取消", role: .cancel) {
+                pendingDeleteDocument = nil
+            }
+        } message: {
+            Text("该文档及其全部手写批注、班级图层与便签将被永久删除，无法撤销。")
+        }
+        .confirmationDialog(
+            "选择备份恢复方式",
+            isPresented: Binding(
+                get: { pendingRestoreURL != nil },
+                set: { if !$0 { pendingRestoreURL = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("跳过已存在文档（默认）") {
+                if let url = pendingRestoreURL {
+                    pendingRestoreURL = nil
+                    restoreBackup(from: url, policy: .automatic)
+                }
+            }
+            Button("覆盖同名原文档（修复或回滚）", role: .destructive) {
+                if let url = pendingRestoreURL {
+                    pendingRestoreURL = nil
+                    restoreBackup(from: url, policy: .replaceExisting)
+                }
+            }
+            Button("保留为独立副本") {
+                if let url = pendingRestoreURL {
+                    pendingRestoreURL = nil
+                    restoreBackup(from: url, policy: .importAsCopy)
+                }
+            }
+            Button("取消", role: .cancel) {
+                pendingRestoreURL = nil
+            }
+        } message: {
+            Text("若书库中已有同 ID 文档，可选择跳过、用备份覆盖修复，或作为新副本导入。")
+        }
+        .alert("数据安全提示", isPresented: Binding(
+            get: { library.lastDataWarning != nil },
+            set: { if !$0 { library.lastDataWarning = nil } }
+        )) {
+            Button("知道了", role: .cancel) { library.lastDataWarning = nil }
+        } message: {
+            Text(library.lastDataWarning ?? "")
         }
         .overlay {
             if isImporting { ImportProgressView(text: importStatusText) }
@@ -524,8 +596,7 @@ struct LibraryView: View {
                             }
                             Divider()
                             Button(role: .destructive) {
-                                tabManager.closeTab(id: meta.id)
-                                library.delete(meta.id)
+                                pendingDeleteDocument = meta
                             } label: {
                                 Label("删除", systemImage: "trash")
                             }
@@ -535,6 +606,55 @@ struct LibraryView: View {
                 .padding(24)
             }
         }
+    }
+
+    // MARK: Backup Safety Reminder Banner
+
+    private var backupReminderBanner: some View {
+        let statusText: String
+        if let days = library.daysSinceLastBackup {
+            statusText = "已 \(days) 天未备份（免费签名每 7 天需续签，建议定期保存备份防丢笔记）"
+        } else {
+            statusText = "尚未备份文档库（免费签名重装易丢本地数据，建议一键备份到「文件」App 或网盘）"
+        }
+        return HStack(spacing: 10) {
+            Image(systemName: "externaldrive.badge.timemachine")
+                .foregroundStyle(.orange)
+            Text(statusText)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button("本地备份") {
+                saveLocalRotatingBackup()
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .controlSize(.small)
+
+            Button("分享导出") {
+                exportFullLibraryBackup()
+            }
+            .font(.caption.weight(.medium))
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            Button {
+                backupReminderDismissed = true
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("暂时关闭备份提醒")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.10))
     }
 
     // MARK: Toolbar Menus
@@ -552,9 +672,16 @@ struct LibraryView: View {
             }
             Section("备份与迁移") {
                 Button {
+                    saveLocalRotatingBackup()
+                } label: {
+                    Label("保存到「文件」App 本地备份", systemImage: "externaldrive.badge.checkmark")
+                }
+                .disabled(library.documents.isEmpty)
+
+                Button {
                     exportFullLibraryBackup()
                 } label: {
-                    Label("全库打包备份 (.qmbackup)", systemImage: "externaldrive.badge.plus")
+                    Label("全库打包导出分享 (.qmbackup)", systemImage: "externaldrive.badge.plus")
                 }
                 .disabled(library.documents.isEmpty)
 
@@ -684,6 +811,7 @@ struct LibraryView: View {
     }
 
     private func duplicateDocument(_ meta: DocumentMeta) {
+        tabManager.saveAllTabs()
         do {
             _ = try library.duplicate(meta.id)
         } catch {
@@ -740,21 +868,33 @@ struct LibraryView: View {
 
     private func handleIncomingFileURL(_ url: URL) {
         if BackupArchiveService.isBackupFile(url) {
-            restoreBackup(from: url)
+            if library.documents.isEmpty {
+                restoreBackup(from: url, policy: .automatic)
+            } else {
+                pendingRestoreURL = url
+            }
         } else {
             startImport(.file(url))
         }
     }
 
-    private func restoreBackup(from url: URL) {
+    private func restoreBackup(from url: URL, policy: BackupArchiveService.DuplicatePolicy = .automatic) {
         guard !isImporting else { return }
-        importStatusText = "正在恢复备份包…"
+        importStatusText = "正在流式恢复备份包…"
         isImporting = true
         Task { @MainActor in
             defer { isImporting = false }
             do {
-                let summary = try BackupArchiveService.importBackup(from: url, into: library)
+                let summary = try await BackupArchiveService.importBackupAsync(
+                    from: url,
+                    into: library,
+                    duplicatePolicy: policy
+                )
+                if summary.replacedExistingDocuments > 0 {
+                    tabManager.reloadAllFromDisk()
+                }
                 if summary.importedDocuments == 1,
+                   summary.replacedExistingDocuments == 0,
                    let id = summary.firstImportedID,
                    let restored = library.documents.first(where: { $0.id == id }) {
                     tabManager.open(restored, library: library)
@@ -768,22 +908,50 @@ struct LibraryView: View {
     }
 
     private func exportSingleBackup(_ meta: DocumentMeta) {
+        guard !isImporting else { return }
         tabManager.saveAllTabs()
-        do {
-            let url = try BackupArchiveService.exportDocument(meta.id, from: library)
-            ShareSheetPresenter.present(fileURL: url)
-        } catch {
-            errorMessage = error.localizedDescription
+        importStatusText = "正在打包文档备份…"
+        isImporting = true
+        Task { @MainActor in
+            defer { isImporting = false }
+            do {
+                let url = try await BackupArchiveService.exportDocumentAsync(meta.id, from: library)
+                ShareSheetPresenter.present(fileURL: url)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
     private func exportFullLibraryBackup() {
+        guard !isImporting else { return }
         tabManager.saveAllTabs()
-        do {
-            let url = try BackupArchiveService.exportFullLibrary(from: library)
-            ShareSheetPresenter.present(fileURL: url)
-        } catch {
-            errorMessage = error.localizedDescription
+        importStatusText = "正在流式打包全库备份…"
+        isImporting = true
+        Task { @MainActor in
+            defer { isImporting = false }
+            do {
+                let url = try await BackupArchiveService.exportFullLibraryAsync(from: library, saveToLocalBackups: false)
+                ShareSheetPresenter.present(fileURL: url)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func saveLocalRotatingBackup() {
+        guard !isImporting else { return }
+        tabManager.saveAllTabs()
+        importStatusText = "正在保存到本地备份目录…"
+        isImporting = true
+        Task { @MainActor in
+            defer { isImporting = false }
+            do {
+                let url = try await BackupArchiveService.exportFullLibraryAsync(from: library, saveToLocalBackups: true)
+                infoMessage = "已保存本地备份：\(url.lastPathComponent)\n可在 iPad「文件」App → 我的 iPad → Quillmark → Backups 中查看或拷贝到网盘（自动保留最近 3 份）。"
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -797,6 +965,9 @@ struct LibraryView: View {
             do {
                 let meta = try await HTMLImportService.importDocument(from: source, into: library,
                                                                       folderID: targetFolder)
+                if case let .file(url) = source {
+                    library.cleanupInboxFileIfNeeded(url)
+                }
                 tabManager.open(meta, library: library)
             } catch {
                 errorMessage = error.localizedDescription
@@ -874,12 +1045,21 @@ private struct DocumentCard: View {
             }
         }
         .task(id: meta.modifiedAt) {
-            // Give the editor a moment to write the snapshot taken when it closes.
-            try? await Task.sleep(nanoseconds: 300_000_000)
-            if let image = UIImage(contentsOfFile: thumbnailURL.path) {
-                thumbnail = image
-            } else {
-                thumbnail = PDFDocument(url: pdfURL)?.page(at: 0)?.thumbnail(of: CGSize(width: 400, height: 540), for: .cropBox)
+            let thumbURL = thumbnailURL
+            let sourcePDFURL = pdfURL
+            let loaded = await Task.detached(priority: .utility) { () -> UIImage? in
+                if let cached = UIImage(contentsOfFile: thumbURL.path) {
+                    return cached
+                }
+                guard let page = PDFDocument(url: sourcePDFURL)?.page(at: 0) else { return nil }
+                let rendered = page.thumbnail(of: CGSize(width: 400, height: 540), for: .cropBox)
+                if let png = rendered.pngData() {
+                    try? png.write(to: thumbURL, options: .atomic)
+                }
+                return rendered
+            }.value
+            if !Task.isCancelled, let loaded {
+                thumbnail = loaded
             }
         }
     }

@@ -367,14 +367,17 @@ final class EfficiencyAndStabilityTests: XCTestCase {
     func testViewingScrollingAndTapeToggleDoNotBumpModifiedAtUntilInkIsDrawn() throws {
         let olderDoc = try library.createDocument(title: "旧试卷", pdfData: makePDFData(pageCount: 3),
                                                   layout: .pdf, sourceKind: .pdfFile, sourceURL: "old.pdf", stagedSource: nil)
-        Thread.sleep(forTimeInterval: 0.05)
+        // ISO8601 dates serialize at whole-second precision; backdate `olderDoc` by 10s so ordering is deterministic.
+        var backdated = olderDoc
+        backdated.modifiedAt = Date().addingTimeInterval(-10)
+        try LibraryStore.encoder.encode(backdated).write(to: library.metaURL(for: olderDoc.id), options: .atomic)
         let newerDoc = try library.createDocument(title: "新讲义", pdfData: makePDFData(pageCount: 2),
                                                   layout: .pdf, sourceKind: .pdfFile, sourceURL: "new.pdf", stagedSource: nil)
         XCTAssertEqual(library.documents.first?.id, newerDoc.id)
         let originalOlderModifiedAt = try XCTUnwrap(library.documents.first(where: { $0.id == olderDoc.id })?.modifiedAt)
 
         // Open olderDoc and ONLY view it: scroll viewport, resize sticky note, switch paper style, save.
-        let session = DocumentSession(meta: olderDoc, library: library, tool: ToolSettings())
+        let session = DocumentSession(meta: backdated, library: library, tool: ToolSettings())
         session.updateViewport(ViewportState(offsetX: 0, offsetY: 650, zoomScale: 1.25, pageIndex: 2))
         session.setScratchpadFrame(CGRect(x: 40, y: 60, width: 320, height: 260))
         session.scratchpadPaper = .dot
@@ -387,8 +390,8 @@ final class EfficiencyAndStabilityTests: XCTestCase {
         let afterViewingModifiedAt = try XCTUnwrap(library.documents.first(where: { $0.id == olderDoc.id })?.modifiedAt)
         XCTAssertEqual(afterViewingModifiedAt, originalOlderModifiedAt)
 
-        // Now actually draw an ink stroke on olderDoc -> `modifiedAt` updates and olderDoc becomes latest!
-        Thread.sleep(forTimeInterval: 0.05)
+        // Now actually draw an ink stroke on olderDoc -> `modifiedAt` updates beyond newerDoc's timestamp!
+        Thread.sleep(forTimeInterval: 1.1)
         session.addStroke(makeStroke(y: 120), page: 0)
         session.saveNow()
 
@@ -464,5 +467,166 @@ final class EfficiencyAndStabilityTests: XCTestCase {
 
         reloaded.resetQuickColorsToDefault()
         XCTAssertEqual(reloaded.resolvedQuickColors, ToolSettings.defaultQuickColors)
+    }
+
+    // MARK: 10. P1 Classroom Projection Privacy, Geometry Mirror Toggle & Capture Scale
+
+    func testPresentationFreezeSafeClearContentSourceGeometryToggleAndCaptureScale() throws {
+        let suite = "presentation-p1-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        final class MockSource: PresentationContentSource {
+            let presentationView = UIView(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+            func presentationViewportDidChange() {}
+            func capturePresentationFrame(completion: @escaping (UIImage?, CGSize) -> Void) {
+                completion(nil, .zero)
+            }
+        }
+
+        let center = PresentationCenter(defaults: defaults)
+        XCTAssertTrue(center.showGeometryToolsOnExternalDisplay, "geometry tools should mirror to big screen by default")
+
+        center.showGeometryToolsOnExternalDisplay = false
+        let reloadedCenter = PresentationCenter(defaults: defaults)
+        XCTAssertFalse(reloadedCenter.showGeometryToolsOnExternalDisplay)
+
+        // Freezing and then returning to the Library (`clearContentSource`) MUST preserve `isFrozen = true`
+        // so the teacher can open answer keys in the Library without exposing them to students.
+        let source = MockSource()
+        center.setContentSource(source)
+        center.isFrozen = true
+        center.clearContentSource(source)
+        XCTAssertTrue(center.isFrozen, "returning to Library while frozen must never auto-unfreeze the projector")
+
+        // Adaptive PDF capture scale stays strictly bounded inside [1.0, 2.0].
+        let scaleFor1000pt = center.preferredPDFCaptureScale(forCaptureWidth: 1000, screenScale: 2.0)
+        XCTAssertGreaterThanOrEqual(scaleFor1000pt, 1.0)
+        XCTAssertLessThanOrEqual(scaleFor1000pt, 2.0)
+        XCTAssertEqual(scaleFor1000pt, 1.92, accuracy: 0.02)
+
+        let scaleForWide = center.preferredPDFCaptureScale(forCaptureWidth: 2400, screenScale: 2.0)
+        XCTAssertEqual(scaleForWide, 1.0, accuracy: 0.001)
+
+        let scaleForNarrow = center.preferredPDFCaptureScale(forCaptureWidth: 500, screenScale: 2.0)
+        XCTAssertEqual(scaleForNarrow, 2.0, accuracy: 0.001)
+    }
+
+    // MARK: 11. Independent Pen vs Shape Styles & Bold Width Preset
+
+    func testIndependentPenAndShapeStylesAndQuickColorIsolation() throws {
+        let suite = "pen-vs-shape-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertEqual(ToolSettings.widthPresets.count, 4)
+        XCTAssertTrue(ToolSettings.widthPresets.contains(4.6))
+
+        var tool = ToolSettings()
+        let red = RGBAColor(0.80, 0.16, 0.16)
+        let blue = RGBAColor(0.10, 0.27, 0.66)
+
+        // Configure Pen to classic black 1.8pt solid.
+        tool.kind = .pen
+        tool.color = .ink
+        tool.width = 1.8
+        tool.lineStyle = .solid
+
+        // Switch to Shape and customize to dashed 4.6pt red auxiliary lines.
+        tool.select(.shape)
+        tool.resolvedShapeColor = red
+        tool.resolvedShapeWidth = 4.6
+        tool.resolvedShapeLineStyle = .dashed
+
+        XCTAssertEqual(tool.activeStrokeColor, red)
+        XCTAssertEqual(tool.activeStrokeWidth, 4.6)
+        XCTAssertEqual(tool.activeLineStyle, .dashed)
+
+        // Pinning a quick color while in Shape mode (`applyToPen: false`) must NOT alter Pen's color.
+        tool.setQuickColor(blue, at: 2, applyToPen: false)
+        XCTAssertEqual(tool.resolvedQuickColors[2], blue)
+        XCTAssertEqual(tool.color, .ink)
+
+        // Switching back to Pen restores untouched handwriting settings.
+        tool.select(.pen)
+        XCTAssertEqual(tool.activeStrokeColor, .ink)
+        XCTAssertEqual(tool.activeStrokeWidth, 1.8)
+        XCTAssertEqual(tool.activeLineStyle, .solid)
+
+        // Persistence round-trip preserves both Pen and Shape styles independently.
+        tool.save(to: defaults)
+        var reloaded = ToolSettings.load(from: defaults)
+        XCTAssertEqual(reloaded.color, .ink)
+        XCTAssertEqual(reloaded.width, 1.8)
+        XCTAssertEqual(reloaded.lineStyle, .solid)
+        reloaded.select(.shape)
+        XCTAssertEqual(reloaded.activeStrokeColor, red)
+        XCTAssertEqual(reloaded.activeStrokeWidth, 4.6)
+        XCTAssertEqual(reloaded.activeLineStyle, .dashed)
+    }
+
+    // MARK: 12. Pencil Color-Palette Action & O(1) Refine-Stroke Undo Patching
+
+    func testPencilDoubleTapShowColorPaletteAndRefineStrokeUndoPatch() throws {
+        let meta = try library.createDocument(title: "refine-palette", pdfData: makePDFData(),
+                                              layout: .pdf, sourceKind: .pdfFile, sourceURL: "rp.pdf", stagedSource: nil)
+        let session = DocumentSession(meta: meta, library: library, tool: ToolSettings())
+        let initialReq = session.colorPaletteRequestID
+
+        session.handlePencilDoubleTap(.showColorPalette)
+        XCTAssertEqual(session.colorPaletteRequestID, initialReq &+ 1)
+        XCTAssertEqual(session.tool.kind, .pen, "showColorPalette must not switch away from pen")
+
+        session.handlePencilDoubleTap(.showInkAttributes)
+        XCTAssertEqual(session.colorPaletteRequestID, initialReq &+ 2)
+
+        // Add a stroke and refine its points with updated Pencil force values.
+        let original = makeStroke(y: 100)
+        session.addStroke(original, page: 0)
+        var refinedPoints = original.points
+        refinedPoints[0].force = 0.92
+        refinedPoints[1].force = 0.88
+        session.refineStroke(id: original.id, page: 0, points: refinedPoints)
+
+        XCTAssertEqual(session.strokes(onPage: 0).first?.points[0].force ?? 0, 0.92, accuracy: 0.001)
+
+        // Undo removes the stroke; Redo must restore the REFINED force points from the patched undo entry.
+        session.undo()
+        XCTAssertTrue(session.strokes(onPage: 0).isEmpty)
+        session.redo()
+        XCTAssertEqual(session.strokes(onPage: 0).first?.points[0].force ?? 0, 0.92, accuracy: 0.001)
+    }
+
+    // MARK: 13. Scratchpad Live Overlay Translates Projected Compass & Protractor
+
+    func testScratchpadLiveOverlayTranslatesProjectedCompassAndProtractor() {
+        var compass = CompassState()
+        compass.center = CGPoint(x: 120, y: 150)
+        compass.radius = 80
+        var compassOverlay = ScratchpadLiveOverlay()
+        compassOverlay.geometryAid = .compass(compass, sweep: nil, strokeColor: RGBAColor.ink.cgColor)
+        XCTAssertFalse(compassOverlay.isEmpty)
+
+        let shiftedCompass = compassOverlay.translated(by: CGPoint(x: 40, y: 65))
+        if case let .compass(moved, _, _) = shiftedCompass.geometryAid {
+            XCTAssertEqual(moved.center.x, 160, accuracy: 0.001)
+            XCTAssertEqual(moved.center.y, 215, accuracy: 0.001)
+        } else {
+            XCTFail("Expected translated compass geometry aid")
+        }
+
+        var protractor = ProtractorState()
+        protractor.center = CGPoint(x: 200, y: 240)
+        var protractorOverlay = ScratchpadLiveOverlay()
+        protractorOverlay.geometryAid = .protractor(protractor)
+        XCTAssertFalse(protractorOverlay.isEmpty)
+
+        let shiftedProtractor = protractorOverlay.translated(by: CGPoint(x: -30, y: 50))
+        if case let .protractor(moved) = shiftedProtractor.geometryAid {
+            XCTAssertEqual(moved.center.x, 170, accuracy: 0.001)
+            XCTAssertEqual(moved.center.y, 290, accuracy: 0.001)
+        } else {
+            XCTFail("Expected translated protractor geometry aid")
+        }
     }
 }

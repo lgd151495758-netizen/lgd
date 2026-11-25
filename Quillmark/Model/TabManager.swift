@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import UIKit
 
 /// One open document tab inside the tabbed workspace.
 final class DocumentTab: Identifiable, ObservableObject {
@@ -28,6 +29,26 @@ final class TabManager: ObservableObject {
     var onFlushTabState: (@MainActor (UUID) -> Void)?
     /// Resolves the live `WebInkBridge` for an open HTML tab so exports preserve live DOM state.
     var onResolveLiveBridge: (@MainActor (UUID) -> WebInkBridge?)?
+
+    private var backgroundObserver: NSObjectProtocol?
+
+    init() {
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.saveAllTabsInBackgroundTask()
+            }
+        }
+    }
+
+    deinit {
+        if let backgroundObserver {
+            NotificationCenter.default.removeObserver(backgroundObserver)
+        }
+    }
 
     func liveWebBridge(for id: UUID) -> WebInkBridge? {
         onResolveLiveBridge?(id)
@@ -133,7 +154,7 @@ final class TabManager: ObservableObject {
 
     /// Refreshes metadata titles/timestamps from the library for any open tabs.
     func syncMetadata(from documents: [DocumentMeta]) {
-        let byID = Dictionary(uniqueKeysWithValues: documents.map { ($0.id, $0) })
+        let byID = Dictionary(documents.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         for tab in tabs {
             if let updated = byID[tab.id], tab.meta != updated {
                 tab.meta = updated
@@ -147,10 +168,36 @@ final class TabManager: ObservableObject {
         tab.session.reloadAnnotationsFromDisk()
     }
 
+    /// Reloads annotations from disk for every open tab (e.g. after a replace-mode backup restore).
+    func reloadAllFromDisk() {
+        for tab in tabs {
+            tab.session.reloadAnnotationsFromDisk()
+        }
+    }
+
     func saveAllTabs() {
         for tab in tabs {
             onFlushTabState?(tab.id)
             tab.session.saveNow()
+        }
+    }
+
+    /// Flushes all open tabs and pending background IO inside an iOS background task so edits made
+    /// moments before switching apps or locking the iPad are never truncated on suspension.
+    private func saveAllTabsInBackgroundTask() {
+        let app = UIApplication.shared
+        var taskID: UIBackgroundTaskIdentifier = .invalid
+        taskID = app.beginBackgroundTask(withName: "QuillmarkBackgroundSave") {
+            if taskID != .invalid {
+                app.endBackgroundTask(taskID)
+                taskID = .invalid
+            }
+        }
+        saveAllTabs()
+        LibraryStore.shared.flushPendingWrites()
+        if taskID != .invalid {
+            app.endBackgroundTask(taskID)
+            taskID = .invalid
         }
     }
 }

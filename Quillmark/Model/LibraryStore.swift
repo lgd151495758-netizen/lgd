@@ -10,6 +10,12 @@ enum PageLayoutMode: String, Codable, CaseIterable, Identifiable {
     case pagedA4
     case longPage
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        self = PageLayoutMode(rawValue: raw) ?? .pdf
+    }
+
     var id: String { rawValue }
 
     var displayName: String {
@@ -41,6 +47,12 @@ struct DocumentMeta: Codable, Identifiable, Hashable {
         case pdfFile
         case blankNotebook
         case imageSet
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            let raw = (try? container.decode(String.self)) ?? ""
+            self = SourceKind(rawValue: raw) ?? .pdfFile
+        }
     }
 
     var id: UUID
@@ -82,6 +94,23 @@ struct DocumentMeta: Codable, Identifiable, Hashable {
     }
 }
 
+/// Result of reading a document's `annotations.json` so decode failures or newer-version files are
+/// NEVER confused with genuinely empty documents or silently overwritten.
+enum AnnotationsLoadResult {
+    case loaded(DocumentAnnotations)
+    case missing
+    case unsupportedVersion(version: Int, quarantinedURL: URL?)
+    case corrupted(message: String, quarantinedURL: URL?)
+}
+
+private struct AnnotationsVersionProbe: Decodable {
+    let version: Int?
+}
+
+private struct BackupStateRecord: Codable {
+    var lastBackupAt: Date?
+}
+
 /// Owns the on-disk library. Each document is a `<uuid>.qmark` folder:
 /// `meta.json`, `render.pdf`, `annotations.json` and an optional `source/` copy of the HTML.
 final class LibraryStore: ObservableObject {
@@ -89,6 +118,10 @@ final class LibraryStore: ObservableObject {
 
     @Published private(set) var documents: [DocumentMeta] = []
     @Published private(set) var folders: [LibraryFolder] = []
+    /// Last successful backup timestamp persisted inside `Library/backup-state.json`.
+    @Published private(set) var lastBackupDate: Date?
+    /// Non-nil when a corrupted `folders.json` or `meta.json` was quarantined on reload.
+    @Published var lastDataWarning: String?
     /// File URL opened from the Files app (forwarded by `MainSceneDelegate`).
     @Published var pendingImportURL: URL?
     let root: URL
@@ -122,6 +155,42 @@ final class LibraryStore: ObservableObject {
     }
 
     var foldersURL: URL { root.appendingPathComponent("folders.json") }
+    var backupStateURL: URL { root.appendingPathComponent("backup-state.json") }
+    /// Local backup folder sitting alongside `Library/` (visible inside the iPadOS Files app).
+    var localBackupsDirectory: URL {
+        root.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
+    }
+
+    var daysSinceLastBackup: Int? {
+        guard let lastBackupDate else { return nil }
+        return max(0, Calendar.current.dateComponents([.day], from: lastBackupDate, to: Date()).day ?? 0)
+    }
+
+    /// True when the library has documents and has never been backed up or hasn't been backed up in `>= 5` days.
+    var needsBackupReminder: Bool {
+        guard !documents.isEmpty else { return false }
+        guard let days = daysSinceLastBackup else { return true }
+        return days >= 5
+    }
+
+    func recordBackupCompleted(at date: Date = Date()) {
+        lastBackupDate = date
+        let record = BackupStateRecord(lastBackupAt: date)
+        if let data = try? Self.encoder.encode(record) {
+            try? data.write(to: backupStateURL, options: .atomic)
+        }
+    }
+
+    /// Removes temporary copies iOS placed in `Documents/Inbox/` after importing so PDFs aren't stored twice.
+    func cleanupInboxFileIfNeeded(_ url: URL) {
+        let docsDir = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0].standardizedFileURL
+        let inboxDir = docsDir.appendingPathComponent("Inbox", isDirectory: true).standardizedFileURL
+        let candidate = url.standardizedFileURL
+        let inboxPrefix = inboxDir.path.hasSuffix("/") ? inboxDir.path : inboxDir.path + "/"
+        if candidate.path.hasPrefix(inboxPrefix) {
+            try? fileManager.removeItem(at: candidate)
+        }
+    }
 
     func folder(for id: UUID) -> URL {
         root.appendingPathComponent("\(id.uuidString).qmark", isDirectory: true)
@@ -139,21 +208,56 @@ final class LibraryStore: ObservableObject {
     }
 
     func reload() {
-        if let folderData = try? Data(contentsOf: foldersURL),
-           let loadedFolders = try? Self.decoder.decode([LibraryFolder].self, from: folderData) {
-            folders = loadedFolders.sorted { $0.createdAt < $1.createdAt }
+        var warnings: [String] = []
+
+        if let backupData = try? Data(contentsOf: backupStateURL),
+           let state = try? Self.decoder.decode(BackupStateRecord.self, from: backupData) {
+            lastBackupDate = state.lastBackupAt
+        } else {
+            lastBackupDate = nil
+        }
+
+        if fileManager.fileExists(atPath: foldersURL.path) {
+            if let folderData = try? Data(contentsOf: foldersURL),
+               let loadedFolders = try? Self.decoder.decode([LibraryFolder].self, from: folderData) {
+                folders = loadedFolders.sorted { $0.createdAt < $1.createdAt }
+            } else {
+                _ = Self.quarantineFileIfNeeded(at: foldersURL, prefix: "folders")
+                warnings.append("文件夹索引文件损坏，已自动备份副本")
+                folders = []
+            }
         } else {
             folders = []
         }
 
         let items = (try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
-        documents = items
-            .filter { $0.pathExtension == "qmark" }
-            .compactMap { folder -> DocumentMeta? in
-                guard let data = try? Data(contentsOf: folder.appendingPathComponent("meta.json")) else { return nil }
-                return try? Self.decoder.decode(DocumentMeta.self, from: data)
+        var loadedDocs: [DocumentMeta] = []
+        var seenIDs: Set<UUID> = []
+
+        for folder in items where folder.pathExtension == "qmark" {
+            let metaFile = folder.appendingPathComponent("meta.json")
+            guard fileManager.fileExists(atPath: metaFile.path) else { continue }
+            guard let data = try? Data(contentsOf: metaFile),
+                  var meta = try? Self.decoder.decode(DocumentMeta.self, from: data) else {
+                _ = Self.quarantineFileIfNeeded(at: metaFile, prefix: "meta")
+                warnings.append("有文档元数据损坏，已保留原文件副本")
+                continue
             }
-            .sorted { $0.modifiedAt > $1.modifiedAt }
+            // Repair folder-name vs meta.id mismatch (e.g. Finder folder copy or interrupted duplicate).
+            let folderStem = folder.deletingPathExtension().lastPathComponent
+            if let folderUUID = UUID(uuidString: folderStem), meta.id != folderUUID {
+                meta.id = folderUUID
+                try? Self.encoder.encode(meta).write(to: metaFile, options: .atomic)
+            }
+            guard !seenIDs.contains(meta.id) else { continue }
+            seenIDs.insert(meta.id)
+            loadedDocs.append(meta)
+        }
+
+        documents = loadedDocs.sorted { $0.modifiedAt > $1.modifiedAt }
+        if !warnings.isEmpty {
+            lastDataWarning = warnings.joined(separator: "；")
+        }
     }
 
     // MARK: Folders & Metadata Management
@@ -254,14 +358,19 @@ final class LibraryStore: ObservableObject {
                                 sourceEntry: sourceEntry, folderID: resolvedFolderID, isPinned: nil)
         let folder = folder(for: meta.id)
         try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
-        if let pdfData {
-            try pdfData.write(to: pdfURL(for: meta.id), options: .atomic)
+        do {
+            if let pdfData {
+                try pdfData.write(to: pdfURL(for: meta.id), options: .atomic)
+            }
+            if let stagedSource, fileManager.fileExists(atPath: stagedSource.path) {
+                try fileManager.moveItem(at: stagedSource, to: sourceFolder(for: meta.id))
+            }
+            try writeMeta(meta)
+            try Self.encoder.encode(DocumentAnnotations()).write(to: annotationsURL(for: meta.id), options: .atomic)
+        } catch {
+            try? fileManager.removeItem(at: folder)
+            throw error
         }
-        if let stagedSource, fileManager.fileExists(atPath: stagedSource.path) {
-            try? fileManager.moveItem(at: stagedSource, to: sourceFolder(for: meta.id))
-        }
-        try writeMeta(meta)
-        try Self.encoder.encode(DocumentAnnotations()).write(to: annotationsURL(for: meta.id), options: .atomic)
         reload()
         return meta
     }
@@ -319,7 +428,16 @@ final class LibraryStore: ObservableObject {
     /// Clears handwriting across all main pages of the active layer on disk. When `keepTapes` is `true`,
     /// Cover Tapes are preserved and reset to covered (`revealed = false`) for teaching another class.
     func clearInk(for id: UUID, keepTapes: Bool) {
-        var annotations = loadAnnotations(for: id)
+        var annotations: DocumentAnnotations
+        switch loadAnnotationsResult(for: id) {
+        case .loaded(let loaded):
+            annotations = loaded
+        case .missing:
+            annotations = DocumentAnnotations()
+        case .corrupted, .unsupportedVersion:
+            // Corrupt/newer file has already been safely quarantined on disk before replacing.
+            annotations = DocumentAnnotations()
+        }
         var updatedPages: [String: PageAnnotations] = [:]
         if keepTapes {
             for (key, page) in annotations.pages {
@@ -343,6 +461,7 @@ final class LibraryStore: ObservableObject {
     /// Creates an independent copy of a document (including source/PDF and annotations) for multi-class reuse.
     @discardableResult
     func duplicate(_ id: UUID) throws -> DocumentMeta {
+        flushPendingWrites()
         guard let original = documents.first(where: { $0.id == id }) else {
             throw ImportError.unreadable
         }
@@ -361,25 +480,64 @@ final class LibraryStore: ObservableObject {
         )
         let srcFolder = folder(for: original.id)
         let dstFolder = folder(for: copyMeta.id)
-        try fileManager.copyItem(at: srcFolder, to: dstFolder)
-        try writeMeta(copyMeta)
+        // Stage copy outside `root`, rewrite `meta.json` with the new UUID first, then move into `root`
+        // so an interrupted copy can never leave two folders sharing the same document UUID.
+        let stagingDir = fileManager.temporaryDirectory
+            .appendingPathComponent("dup-\(UUID().uuidString)", isDirectory: true)
+        let stagedDoc = stagingDir.appendingPathComponent("\(copyMeta.id.uuidString).qmark", isDirectory: true)
+        try fileManager.createDirectory(at: stagingDir, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: stagingDir) }
+
+        try fileManager.copyItem(at: srcFolder, to: stagedDoc)
+        let metaData = try Self.encoder.encode(copyMeta)
+        try metaData.write(to: stagedDoc.appendingPathComponent("meta.json"), options: .atomic)
+        try fileManager.moveItem(at: stagedDoc, to: dstFolder)
         reload()
         return copyMeta
     }
 
-    func loadAnnotations(for id: UUID) -> DocumentAnnotations {
+    /// Loads `annotations.json` while strictly separating missing files, newer schema versions,
+    /// and decode errors (automatically quarantining unreadable files so they are never overwritten).
+    func loadAnnotationsResult(for id: UUID) -> AnnotationsLoadResult {
         let url = annotationsURL(for: id)
         return ioQueue.sync {
-            guard let data = try? Data(contentsOf: url),
-                  let value = try? Self.makeDecoder().decode(DocumentAnnotations.self, from: data) else {
-                return DocumentAnnotations()
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                return .missing
             }
+            guard let data = try? Data(contentsOf: url) else {
+                let q = Self.quarantineFileIfNeeded(at: url, prefix: "annotations")
+                return .corrupted(message: "无法读取批注文件", quarantinedURL: q)
+            }
+            if let probe = try? Self.makeDecoder().decode(AnnotationsVersionProbe.self, from: data),
+               let v = probe.version, v > DocumentAnnotations.currentVersion {
+                let q = Self.quarantineFileIfNeeded(at: url, prefix: "annotations-v\(v)")
+                return .unsupportedVersion(version: v, quarantinedURL: q)
+            }
+            do {
+                let value = try Self.makeDecoder().decode(DocumentAnnotations.self, from: data)
+                if value.version > DocumentAnnotations.currentVersion {
+                    let q = Self.quarantineFileIfNeeded(at: url, prefix: "annotations-v\(value.version)")
+                    return .unsupportedVersion(version: value.version, quarantinedURL: q)
+                }
+                return .loaded(value)
+            } catch {
+                let q = Self.quarantineFileIfNeeded(at: url, prefix: "annotations")
+                return .corrupted(message: error.localizedDescription, quarantinedURL: q)
+            }
+        }
+    }
+
+    func loadAnnotations(for id: UUID) -> DocumentAnnotations {
+        switch loadAnnotationsResult(for: id) {
+        case .loaded(let value):
             return value
+        case .missing, .corrupted, .unsupportedVersion:
+            return DocumentAnnotations()
         }
     }
 
     func saveAnnotations(_ annotations: DocumentAnnotations, for id: UUID, markModified: Bool = true) throws {
-        var toSave = annotations
+        var toSave = annotations.sanitizedForEncoding()
         toSave.syncActiveLayerFromTopLevel()
         let url = annotationsURL(for: id)
         try ioQueue.sync {
@@ -396,7 +554,7 @@ final class LibraryStore: ObservableObject {
                               for id: UUID,
                               markModified: Bool = true,
                               completion: ((Error?) -> Void)? = nil) {
-        var snapshot = annotations
+        var snapshot = annotations.sanitizedForEncoding()
         snapshot.syncActiveLayerFromTopLevel()
         let docFolder = folder(for: id)
         let url = annotationsURL(for: id)
@@ -419,6 +577,31 @@ final class LibraryStore: ObservableObject {
                     completion?(error)
                 }
             }
+        }
+    }
+
+    /// Copies a corrupted or future-version JSON file to `<prefix>.corrupt-<timestamp>.json` alongside
+    /// the original (reusing an existing identical quarantine copy to avoid duplicate files).
+    @discardableResult
+    static func quarantineFileIfNeeded(at url: URL, prefix: String) -> URL? {
+        let fm = FileManager.default
+        guard let raw = try? Data(contentsOf: url), !raw.isEmpty else { return nil }
+        let dir = url.deletingLastPathComponent()
+        if let existing = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for candidate in existing where candidate.lastPathComponent.hasPrefix("\(prefix).corrupt-") {
+                if let existingBytes = try? Data(contentsOf: candidate), existingBytes == raw {
+                    return candidate
+                }
+            }
+        }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let dest = dir.appendingPathComponent("\(prefix).corrupt-\(formatter.string(from: Date())).json")
+        do {
+            try raw.write(to: dest, options: .atomic)
+            return dest
+        } catch {
+            return nil
         }
     }
 

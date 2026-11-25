@@ -6,30 +6,42 @@ import UIKit
 final class GeometryToolOverlayView: UIView {
     var aid: GeometryAid = .none {
         didSet {
+            guard aid != oldValue else { return }
             updateVisibility()
             setNeedsDisplay()
         }
     }
     var compass = CompassState() {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard compass != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     var protractor = ProtractorState() {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard protractor != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     /// Selected geometric shape for post-creation vertex editing & quick actions (iPad-only).
     var selectedShape: SelectedShapeOverlay? {
         didSet {
+            guard selectedShape != oldValue else { return }
             updateVisibility()
             setNeedsDisplay()
         }
     }
     /// Hides the floating mini-bar while actively dragging a vertex/shape for an unobstructed view.
     var isEditingSelectedShape = false {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard isEditingSelectedShape != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     /// Freehand lasso loop currently being drawn in view coordinates (iPad-only).
     var activeLassoPath: [CGPoint] = [] {
         didSet {
+            guard activeLassoPath != oldValue else { return }
             updateVisibility()
             setNeedsDisplay()
         }
@@ -37,34 +49,51 @@ final class GeometryToolOverlayView: UIView {
     /// Active lasso multi-stroke selection box, corner handles & quick-action bar (iPad-only).
     var lassoSelection: LassoSelectionOverlay? {
         didSet {
+            guard lassoSelection != oldValue else { return }
             updateVisibility()
             setNeedsDisplay()
         }
     }
     /// Hides the lasso floating bar while actively moving or scaling the selection.
     var isTransformingLasso = false {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard isTransformingLasso != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     /// Active sweep readout while drawing an arc with the compass.
     var activeCompassSweep: CompassSweep? {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard activeCompassSweep != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     /// Live radius readout while resizing the compass.
     var isResizingCompass = false {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard isResizingCompass != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     /// Currently snapped target in view coordinates (rendered as an emerald crosshair).
     var activeSnapPoint: CGPoint? {
         didSet {
+            guard activeSnapPoint != oldValue else { return }
             updateVisibility()
             setNeedsDisplay()
         }
     }
     var activeSnapKind: SnapKind? {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard activeSnapKind != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
     var activeStrokeColor: UIColor = .label {
-        didSet { setNeedsDisplay() }
+        didSet {
+            guard activeStrokeColor != oldValue else { return }
+            setNeedsDisplay()
+        }
     }
 
     private func updateVisibility() {
@@ -289,7 +318,7 @@ final class GeometryToolOverlayView: UIView {
                 ctx.move(to: CGPoint(x: rect.minX, y: bar.minY + 7))
                 ctx.addLine(to: CGPoint(x: rect.minX, y: bar.maxY - 7))
                 ctx.strokePath()
-                drawCenteredText("复制", in: rect, font: font, color: .label)
+                Self.drawCenteredText("复制", in: rect, font: font, color: .label)
 
             case .delete:
                 ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
@@ -297,7 +326,7 @@ final class GeometryToolOverlayView: UIView {
                 ctx.move(to: CGPoint(x: rect.minX, y: bar.minY + 7))
                 ctx.addLine(to: CGPoint(x: rect.minX, y: bar.maxY - 7))
                 ctx.strokePath()
-                drawCenteredText("删除", in: rect, font: font, color: .systemRed)
+                Self.drawCenteredText("删除", in: rect, font: font, color: .systemRed)
             }
         }
     }
@@ -365,7 +394,7 @@ final class GeometryToolOverlayView: UIView {
             switch action {
             case .cycleLineStyle:
                 let title = selected.lineStyle.displayName
-                drawCenteredText(title, in: rect, font: font, color: .label)
+                Self.drawCenteredText(title, in: rect, font: font, color: .label)
             case .toggleFillOrCenter:
                 let isActive = selected.supportsFill ? selected.isFilled : selected.showsCenterMark
                 if isActive {
@@ -373,17 +402,35 @@ final class GeometryToolOverlayView: UIView {
                     UIColor.systemBlue.withAlphaComponent(0.18).setFill()
                     pill.fill()
                 }
-                let title = selected.supportsFill ? "阴影" : "⊙圆心"
-                drawCenteredText(title, in: rect, font: font, color: isActive ? .systemBlue : .secondaryLabel)
+                let title = selected.supportsFill ? "填充" : "⊙圆心"
+                Self.drawCenteredText(title, in: rect, font: font, color: isActive ? .systemBlue : .secondaryLabel)
             case .duplicate:
-                drawCenteredText("复制", in: rect, font: font, color: .label)
+                Self.drawCenteredText("复制", in: rect, font: font, color: .label)
             case .delete:
-                drawCenteredText("删除", in: rect, font: font, color: .systemRed)
+                Self.drawCenteredText("删除", in: rect, font: font, color: .systemRed)
             }
         }
     }
 
     private func drawCompass(in ctx: CGContext) {
+        Self.drawCompassBody(
+            compass,
+            sweep: activeCompassSweep,
+            isResizing: isResizingCompass,
+            activeStrokeColor: activeStrokeColor,
+            in: bounds,
+            ctx: ctx,
+            includeControls: true
+        )
+    }
+
+    static func drawCompassBody(_ compass: CompassState,
+                                sweep activeCompassSweep: CompassSweep?,
+                                isResizing isResizingCompass: Bool,
+                                activeStrokeColor: UIColor,
+                                in bounds: CGRect,
+                                ctx: CGContext,
+                                includeControls: Bool) {
         let c = compass.center
         let r = compass.radius
         let foot = compass.penFoot
@@ -412,7 +459,6 @@ final class GeometryToolOverlayView: UIView {
         let dx = foot.x - c.x
         let dy = foot.y - c.y
         let len = max(1, hypot(dx, dy))
-        // Pick the perpendicular direction pointing more "upward" (smaller y) so the hinge stays naturally upright.
         var nx = -dy / len
         var ny = dx / len
         if ny > 0 {
@@ -427,15 +473,14 @@ final class GeometryToolOverlayView: UIView {
                       color: UIColor.black.withAlphaComponent(0.18).cgColor)
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
-        ctx.setStrokeColor(UIColor.label.withAlphaComponent(0.52).cgColor)
+        ctx.setStrokeColor(UIColor(white: 0.22, alpha: 0.65).cgColor)
         ctx.setLineWidth(4.0)
         ctx.move(to: c)
         ctx.addLine(to: hinge)
         ctx.addLine(to: foot)
         ctx.strokePath()
 
-        // Inner metallic highlight
-        ctx.setStrokeColor(UIColor.systemBackground.withAlphaComponent(0.82).cgColor)
+        ctx.setStrokeColor(UIColor(white: 0.96, alpha: 0.88).cgColor)
         ctx.setLineWidth(1.6)
         ctx.move(to: c)
         ctx.addLine(to: hinge)
@@ -445,9 +490,9 @@ final class GeometryToolOverlayView: UIView {
 
         // Hinge head dot
         let hingeRect = CGRect(x: hinge.x - 7, y: hinge.y - 7, width: 14, height: 14)
-        UIColor.systemBackground.withAlphaComponent(0.95).setFill()
+        UIColor(white: 0.98, alpha: 0.96).setFill()
         ctx.fillEllipse(in: hingeRect)
-        UIColor.label.withAlphaComponent(0.55).setStroke()
+        UIColor(white: 0.25, alpha: 0.6).setStroke()
         ctx.setLineWidth(1.5)
         ctx.strokeEllipse(in: hingeRect)
 
@@ -460,7 +505,6 @@ final class GeometryToolOverlayView: UIView {
         ctx.setLineWidth(1.6)
         ctx.strokeEllipse(in: needleRect)
 
-        // Center crosshair inside needle handle
         ctx.setStrokeColor(UIColor.systemBlue.cgColor)
         ctx.setLineWidth(1.2)
         ctx.move(to: CGPoint(x: c.x - 6, y: c.y))
@@ -479,8 +523,8 @@ final class GeometryToolOverlayView: UIView {
         ctx.setLineWidth(2)
         ctx.strokeEllipse(in: footRect)
 
-        // 6. Radius resize handle (↔) on the exact opposite point of the circle (hidden while sweeping)
-        if !sweeping {
+        // 6. Radius resize handle (↔) — iPad only
+        if includeControls && !sweeping {
             let h = compass.resizeHandleCenter
             let hr: CGFloat = 15
             let hRect = CGRect(x: h.x - hr, y: h.y - hr, width: hr * 2, height: hr * 2)
@@ -505,16 +549,18 @@ final class GeometryToolOverlayView: UIView {
         if let sweep = activeCompassSweep {
             let label = sweep.isFullCircle ? "360° 整圆" : "\(sweep.sweepDegrees)°"
             drawReadoutPill(label, centeredAt: CGPoint(x: c.x, y: c.y - 34), in: ctx)
-        } else if isResizingCompass {
+        } else if includeControls && isResizingCompass {
             let label = "r = \(Int(r.rounded()))"
             drawReadoutPill(label, centeredAt: CGPoint(x: c.x, y: c.y - 34), in: ctx)
         }
 
-        // 8. Compact floating action bar (🔒 锁半径 | ⊙ 圆心 | ○ 整圆)
-        drawCompassActionBar(in: ctx)
+        // 8. Compact floating action bar — iPad only
+        if includeControls {
+            drawCompassActionBar(compass, in: bounds, ctx: ctx)
+        }
     }
 
-    private func drawCompassActionBar(in ctx: CGContext) {
+    private static func drawCompassActionBar(_ compass: CompassState, in bounds: CGRect, ctx: CGContext) {
         let bar = compass.actionBarFrame(in: bounds)
         let buttons = compass.buttonFrames(in: bounds)
 
@@ -531,7 +577,6 @@ final class GeometryToolOverlayView: UIView {
         border.lineWidth = 0.8
         border.stroke()
 
-        // Active segment highlights
         if compass.isRadiusLocked {
             let pill = UIBezierPath(roundedRect: buttons.lock.insetBy(dx: 3, dy: 3), cornerRadius: 14)
             UIColor.systemBlue.withAlphaComponent(0.18).setFill()
@@ -543,7 +588,6 @@ final class GeometryToolOverlayView: UIView {
             pill.fill()
         }
 
-        // Dividers
         ctx.setStrokeColor(UIColor.separator.withAlphaComponent(0.45).cgColor)
         ctx.setLineWidth(0.8)
         for divX in [buttons.lock.maxX, buttons.centerMark.maxX] {
@@ -561,29 +605,34 @@ final class GeometryToolOverlayView: UIView {
     }
 
     private func drawProtractor(in ctx: CGContext) {
+        Self.drawProtractorBody(protractor, in: bounds, ctx: ctx, includeControls: true)
+    }
+
+    static func drawProtractorBody(_ protractor: ProtractorState,
+                                   in bounds: CGRect,
+                                   ctx: CGContext,
+                                   includeControls: Bool) {
         let c = protractor.center
         let r = protractor.radius
         let sweep = protractor.sweep
         let accent: UIColor = protractor.isRightAngle ? .systemGreen : .systemBlue
         let dialRect = CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
 
-        // 1. Translucent frosted circular dial so printed diagrams underneath remain clearly legible.
+        // 1. Always-light translucent frosted dial so dark mode never dims white exam pages underneath.
         ctx.saveGState()
         ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 10,
                       color: UIColor.black.withAlphaComponent(0.14).cgColor)
-        UIColor.systemBackground.withAlphaComponent(0.68).setFill()
+        UIColor(white: 0.98, alpha: 0.78).setFill()
         ctx.fillEllipse(in: dialRect)
         ctx.restoreGState()
 
-        // Outer dial ring border
         ctx.saveGState()
-        UIColor.label.withAlphaComponent(0.24).setStroke()
+        UIColor(white: 0.15, alpha: 0.28).setStroke()
         ctx.setLineWidth(1.2)
         ctx.strokeEllipse(in: dialRect)
 
-        // Inner ring guide
         let innerGuideR = r * 0.72
-        UIColor.label.withAlphaComponent(0.10).setStroke()
+        UIColor(white: 0.15, alpha: 0.12).setStroke()
         ctx.setLineWidth(0.8)
         ctx.strokeEllipse(in: CGRect(x: c.x - innerGuideR, y: c.y - innerGuideR,
                                      width: innerGuideR * 2, height: innerGuideR * 2))
@@ -597,19 +646,17 @@ final class GeometryToolOverlayView: UIView {
                          startAngle: sweep.startAngle, endAngle: sweep.endAngle,
                          clockwise: sweep.clockwise)
             wedge.close()
-            accent.withAlphaComponent(0.14).setFill()
+            accent.withAlphaComponent(0.15).setFill()
             wedge.fill()
 
-            // Crisp colored rim arc along the measured sweep
             let rimArc = UIBezierPath(arcCenter: c, radius: r,
                                       startAngle: sweep.startAngle, endAngle: sweep.endAngle,
                                       clockwise: sweep.clockwise)
-            accent.withAlphaComponent(0.88).setStroke()
+            accent.withAlphaComponent(0.90).setStroke()
             rimArc.lineWidth = 3.0
             rimArc.lineCapStyle = .round
             rimArc.stroke()
 
-            // Inner right-angle square `∟` or inner angle arc
             if protractor.isRightAngle {
                 let side: CGFloat = 24
                 let u1 = CGPoint(x: cos(protractor.ray1Angle), y: sin(protractor.ray1Angle))
@@ -648,8 +695,8 @@ final class GeometryToolOverlayView: UIView {
             let isMajor30 = (deg % 30 == 0)
             let isMajor10 = (deg % 10 == 0)
             let tickLen: CGFloat = isMajor30 ? 11 : (isMajor10 ? 7.5 : 4)
-            let alpha: CGFloat = isMajor30 ? 0.55 : (isMajor10 ? 0.35 : 0.20)
-            ctx.setStrokeColor(UIColor.label.withAlphaComponent(alpha).cgColor)
+            let alpha: CGFloat = isMajor30 ? 0.62 : (isMajor10 ? 0.38 : 0.22)
+            ctx.setStrokeColor(UIColor(white: 0.12, alpha: alpha).cgColor)
             ctx.setLineWidth(isMajor30 ? 1.3 : 0.8)
             ctx.move(to: CGPoint(x: c.x + (r - tickLen) * cosT, y: c.y + (r - tickLen) * sinT))
             ctx.addLine(to: CGPoint(x: c.x + r * cosT, y: c.y + r * sinT))
@@ -660,14 +707,16 @@ final class GeometryToolOverlayView: UIView {
                 let lp = CGPoint(x: c.x + labelR * cosT, y: c.y + labelR * sinT)
                 let rect = CGRect(x: lp.x - 16, y: lp.y - 7, width: 32, height: 14)
                 drawCenteredText("\(deg)°", in: rect, font: tickFont,
-                                 color: UIColor.secondaryLabel.withAlphaComponent(0.85))
+                                 color: UIColor(white: 0.20, alpha: 0.88))
             }
         }
         ctx.restoreGState()
 
         // 4. Extended laser sightlines + solid measuring arms (Ray 1 = Blue, Ray 2 = Orange).
-        drawProtractorRay(angle: protractor.ray1Angle, color: .systemBlue, handleCenter: protractor.ray1HandleCenter, in: ctx)
-        drawProtractorRay(angle: protractor.ray2Angle, color: .systemOrange, handleCenter: protractor.ray2HandleCenter, in: ctx)
+        drawProtractorRay(protractor: protractor, angle: protractor.ray1Angle, color: .systemBlue,
+                          handleCenter: protractor.ray1HandleCenter, showKnob: includeControls, in: ctx)
+        drawProtractorRay(protractor: protractor, angle: protractor.ray2Angle, color: .systemOrange,
+                          handleCenter: protractor.ray2HandleCenter, showKnob: includeControls, in: ctx)
 
         // 5. Precision vertex crosshair O (hollow center pinhole so exact printed corner remains visible).
         let centerR: CGFloat = 16
@@ -681,7 +730,6 @@ final class GeometryToolOverlayView: UIView {
         ctx.saveGState()
         ctx.setStrokeColor(UIColor.systemBlue.cgColor)
         ctx.setLineWidth(1.2)
-        // Broken crosshair leaving a clear 4px pinhole right over the vertex
         ctx.move(to: CGPoint(x: c.x - 10, y: c.y)); ctx.addLine(to: CGPoint(x: c.x - 3, y: c.y))
         ctx.move(to: CGPoint(x: c.x + 3, y: c.y)); ctx.addLine(to: CGPoint(x: c.x + 10, y: c.y))
         ctx.move(to: CGPoint(x: c.x, y: c.y - 10)); ctx.addLine(to: CGPoint(x: c.x, y: c.y - 3))
@@ -689,7 +737,7 @@ final class GeometryToolOverlayView: UIView {
         ctx.strokePath()
         ctx.restoreGState()
 
-        // 6. Giant high-contrast automatic digital degree readout badge (no squinting at ticks!).
+        // 6. Giant high-contrast automatic digital degree readout badge
         let bisector = sweep.bisectorAngle
         let badgeDist = r * 0.54
         let rawBadgeCenter = CGPoint(x: c.x + badgeDist * cos(bisector), y: c.y + badgeDist * sin(bisector))
@@ -701,18 +749,24 @@ final class GeometryToolOverlayView: UIView {
         let readoutText = "\(prefix)\(protractor.formattedDegrees)"
         drawLargeAngleReadoutPill(readoutText, centeredAt: badgeCenter, accent: accent, in: ctx)
 
-        // 7. Compact floating action bar (⚡识别 | ↻换角 | ∠标角 | ✕)
-        drawProtractorActionBar(in: ctx)
+        // 7. Compact floating action bar — iPad only
+        if includeControls {
+            drawProtractorActionBar(protractor, in: bounds, ctx: ctx)
+        }
     }
 
-    private func drawProtractorRay(angle: CGFloat, color: UIColor, handleCenter: CGPoint, in ctx: CGContext) {
+    private static func drawProtractorRay(protractor: ProtractorState,
+                                          angle: CGFloat,
+                                          color: UIColor,
+                                          handleCenter: CGPoint,
+                                          showKnob: Bool,
+                                          in ctx: CGContext) {
         let c = protractor.center
         let r = protractor.radius
         let cosA = cos(angle)
         let sinA = sin(angle)
         let extPoint = CGPoint(x: c.x + (r + 88) * cosA, y: c.y + (r + 88) * sinA)
 
-        // Extended dashed laser sightline beyond the dial rim for effortless printed-edge alignment.
         ctx.saveGState()
         ctx.setStrokeColor(color.withAlphaComponent(0.55).cgColor)
         ctx.setLineWidth(1.3)
@@ -722,7 +776,6 @@ final class GeometryToolOverlayView: UIView {
         ctx.strokePath()
         ctx.restoreGState()
 
-        // Crisp solid measuring ray from vertex O to handle
         ctx.saveGState()
         ctx.setStrokeColor(color.withAlphaComponent(0.92).cgColor)
         ctx.setLineWidth(2.2)
@@ -732,25 +785,26 @@ final class GeometryToolOverlayView: UIView {
         ctx.strokePath()
         ctx.restoreGState()
 
-        // Draggable handle knob
-        let hr: CGFloat = 13.5
-        let hRect = CGRect(x: handleCenter.x - hr, y: handleCenter.y - hr, width: hr * 2, height: hr * 2)
-        ctx.saveGState()
-        ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4,
-                      color: UIColor.black.withAlphaComponent(0.22).cgColor)
-        UIColor.systemBackground.withAlphaComponent(0.96).setFill()
-        ctx.fillEllipse(in: hRect)
-        ctx.restoreGState()
+        if showKnob {
+            let hr: CGFloat = 13.5
+            let hRect = CGRect(x: handleCenter.x - hr, y: handleCenter.y - hr, width: hr * 2, height: hr * 2)
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 0, height: 1), blur: 4,
+                          color: UIColor.black.withAlphaComponent(0.22).cgColor)
+            UIColor.systemBackground.withAlphaComponent(0.96).setFill()
+            ctx.fillEllipse(in: hRect)
+            ctx.restoreGState()
 
-        color.setStroke()
-        ctx.setLineWidth(2.4)
-        ctx.strokeEllipse(in: hRect)
+            color.setStroke()
+            ctx.setLineWidth(2.4)
+            ctx.strokeEllipse(in: hRect)
 
-        color.setFill()
-        ctx.fillEllipse(in: CGRect(x: handleCenter.x - 3.5, y: handleCenter.y - 3.5, width: 7, height: 7))
+            color.setFill()
+            ctx.fillEllipse(in: CGRect(x: handleCenter.x - 3.5, y: handleCenter.y - 3.5, width: 7, height: 7))
+        }
     }
 
-    private func drawLargeAngleReadoutPill(_ text: String, centeredAt center: CGPoint, accent: UIColor, in ctx: CGContext) {
+    private static func drawLargeAngleReadoutPill(_ text: String, centeredAt center: CGPoint, accent: UIColor, in ctx: CGContext) {
         let font = UIFont.monospacedDigitSystemFont(ofSize: 16, weight: .bold)
         let size = (text as NSString).size(withAttributes: [.font: font])
         let rect = CGRect(x: center.x - size.width / 2 - 12, y: center.y - size.height / 2 - 5,
@@ -771,7 +825,7 @@ final class GeometryToolOverlayView: UIView {
         drawCenteredText(text, in: rect, font: font, color: .white)
     }
 
-    private func drawProtractorActionBar(in ctx: CGContext) {
+    private static func drawProtractorActionBar(_ protractor: ProtractorState, in bounds: CGRect, ctx: CGContext) {
         let bar = protractor.actionBarFrame(in: bounds)
         let buttons = protractor.buttonFrames(in: bounds)
 
@@ -845,12 +899,12 @@ final class GeometryToolOverlayView: UIView {
         case .midpoint: label = "中点"
         case .endpoint, .none: label = "端点"
         }
-        drawReadoutPill(label, centeredAt: CGPoint(x: point.x, y: point.y - 24), in: ctx, accent: color)
+        Self.drawReadoutPill(label, centeredAt: CGPoint(x: point.x, y: point.y - 24), in: ctx, accent: color)
         ctx.restoreGState()
     }
 
-    private func drawReadoutPill(_ text: String, centeredAt center: CGPoint, in ctx: CGContext,
-                                 accent: UIColor = .systemBlue) {
+    private static func drawReadoutPill(_ text: String, centeredAt center: CGPoint, in ctx: CGContext,
+                                        accent: UIColor = .systemBlue) {
         let font = UIFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold)
         let size = (text as NSString).size(withAttributes: [.font: font])
         let rect = CGRect(x: center.x - size.width / 2 - 8, y: center.y - size.height / 2 - 3,
@@ -861,7 +915,7 @@ final class GeometryToolOverlayView: UIView {
         drawCenteredText(text, in: rect, font: font, color: .white)
     }
 
-    private func drawCenteredText(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {
+    private static func drawCenteredText(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {
         let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let size = (text as NSString).size(withAttributes: attrs)
         let drawPoint = CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2)

@@ -60,7 +60,6 @@ struct ExportDocumentSheet: View {
 
     private var currentAnnotations: DocumentAnnotations {
         if let activeSession {
-            activeSession.saveNow()
             var copy = activeSession.annotations
             copy.syncActiveLayerFromTopLevel()
             return copy
@@ -201,6 +200,7 @@ struct ExportDocumentSheet: View {
     private func runExport() {
         guard !isExporting else { return }
         errorMessage = nil
+        activeSession?.saveNow()
         isExporting = true
         let annotations = currentAnnotations
         Task { @MainActor in
@@ -225,12 +225,16 @@ struct ExportDocumentSheet: View {
         guard !isExporting else { return }
         errorMessage = nil
         activeSession?.saveNow()
-        do {
-            let url = try BackupArchiveService.exportDocument(meta.id, from: library)
-            backupURL = url
-            ShareSheetPresenter.present(fileURL: url)
-        } catch {
-            errorMessage = error.localizedDescription
+        isExporting = true
+        Task { @MainActor in
+            defer { isExporting = false }
+            do {
+                let url = try await BackupArchiveService.exportDocumentAsync(meta.id, from: library)
+                backupURL = url
+                ShareSheetPresenter.present(fileURL: url)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 }
@@ -321,6 +325,7 @@ struct ClassLayersPopover: View {
     @State private var newLayerName = ""
     @State private var renamingLayerID: UUID?
     @State private var renameText = ""
+    @State private var pendingDeleteLayer: InkLayer?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -398,12 +403,13 @@ struct ClassLayersPopover: View {
 
                                 if session.layers.count > 1 {
                                     Button(role: .destructive) {
-                                        session.deleteLayer(id: layer.id)
+                                        pendingDeleteLayer = layer
                                     } label: {
                                         Image(systemName: "trash")
                                             .font(.caption)
                                             .foregroundStyle(.red.opacity(0.85))
-                                            .frame(width: 26, height: 26)
+                                            .frame(width: 30, height: 30)
+                                            .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
                                     .accessibilityLabel("删除图层 \(layer.name)")
@@ -487,6 +493,28 @@ struct ClassLayersPopover: View {
         .frame(width: 330)
         .onAppear {
             session.refreshLayerSummaries()
+        }
+        .confirmationDialog(
+            pendingDeleteLayer.map { "删除「\($0.name)」图层？" } ?? "删除图层？",
+            isPresented: Binding(
+                get: { pendingDeleteLayer != nil },
+                set: { if !$0 { pendingDeleteLayer = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("永久删除图层", role: .destructive) {
+                if let target = pendingDeleteLayer {
+                    session.deleteLayer(id: target.id)
+                    pendingDeleteLayer = nil
+                }
+            }
+            Button("取消", role: .cancel) {
+                pendingDeleteLayer = nil
+            }
+        } message: {
+            if let target = pendingDeleteLayer {
+                Text("该图层包含 \(target.mainStrokeCount) 笔批注，删除后无法撤销。")
+            }
         }
     }
 
@@ -630,8 +658,14 @@ private struct PDFPageThumbCell: View {
                 .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
         }
         .task(id: "\(pdfDocument?.pageCount ?? 0)-\(pageIndex)") {
-            guard let page = pdfDocument?.page(at: pageIndex) else { return }
-            thumb = page.thumbnail(of: CGSize(width: 180, height: 240), for: .cropBox)
+            guard let doc = pdfDocument else { return }
+            let idx = pageIndex
+            let rendered = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+                doc.page(at: idx)?.thumbnail(of: CGSize(width: 180, height: 240), for: .cropBox)
+            }.value
+            if !Task.isCancelled {
+                thumb = rendered
+            }
         }
     }
 }

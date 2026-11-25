@@ -950,6 +950,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         if aid == .protractor {
             autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: false)
         }
+        pushPresentationOverlay()
     }
 
     private func clampGeometryAidsToBounds() {
@@ -969,13 +970,9 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     }
 
     private func syncGeometryOverlayAppearance() {
-        let color: RGBAColor
-        switch session.tool.kind {
-        case .tape: color = session.tool.tapeColor
-        case .laser: color = session.tool.laserColor
-        default: color = session.tool.color
-        }
+        let color = session.tool.activeStrokeColor
         geometryOverlay.activeStrokeColor = UIColor(cgColor: color.cgColor)
+        pushPresentationOverlay()
     }
 
     private func refreshViewSnapPoints(excludingStrokeID: UUID? = nil) {
@@ -1360,12 +1357,14 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             let snap = compassState.moveCenter(to: rawCenter, snapPoints: cachedViewSnapPoints)
             geometryOverlay.compass = compassState
             updateSnapFeedback(snap)
+            pushPresentationOverlay()
             return true
 
         case .compassResize:
             let snap = compassState.resize(withHandleAt: viewPoint, snapPoints: cachedViewSnapPoints)
             geometryOverlay.compass = compassState
             updateSnapFeedback(snap)
+            pushPresentationOverlay()
             return true
 
         case let .protractorCenter(grabOffset):
@@ -1379,18 +1378,21 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             }
             geometryOverlay.protractor = protractorState
             updateSnapFeedback(snap)
+            pushPresentationOverlay()
             return true
 
         case .protractorRay1:
             let snap = protractorState.aimRay1(to: viewPoint, snapPoints: cachedViewSnapPoints)
             geometryOverlay.protractor = protractorState
             updateSnapFeedback(snap)
+            pushPresentationOverlay()
             return true
 
         case .protractorRay2:
             let snap = protractorState.aimRay2(to: viewPoint, snapPoints: cachedViewSnapPoints)
             geometryOverlay.protractor = protractorState
             updateSnapFeedback(snap)
+            pushPresentationOverlay()
             return true
 
         case let .protractorRotate(lastAngle):
@@ -1399,6 +1401,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             protractorState.rotateBoth(by: delta)
             activeInteraction = .protractorRotate(lastAngle: currentAngle)
             geometryOverlay.protractor = protractorState
+            pushPresentationOverlay()
             return true
 
         case .compassButton, .protractorButton, .selectedAction:
@@ -1664,11 +1667,12 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     private func executeProtractorButton(_ button: ProtractorState.HitZone) {
         switch button {
         case .autoDetectButton:
-            autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: true)
+            autoDetectProtractorAngle(allowImageFallback: true, triggerHaptic: true, announceFailure: true)
         case .cycleAngleButton:
             protractorDetectGeneration &+= 1
             protractorState.cycleAngle()
             geometryOverlay.protractor = protractorState
+            pushPresentationOverlay()
             haptic.impactOccurred()
         case .stampAngleButton:
             liveTool = session.tool
@@ -1680,6 +1684,11 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                 let stroke = makeGeometricStroke(primitive)
                 commitPreparedStroke(stroke)
                 haptic.impactOccurred()
+                NotificationCenter.default.post(
+                    name: .quillmarkUndoRedoFeedback,
+                    object: nil,
+                    userInfo: ["message": "已标注 \(protractorState.formattedDegrees)"]
+                )
             }
         case .closeButton:
             protractorDetectGeneration &+= 1
@@ -1692,7 +1701,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
 
     /// Automatically measures the angle at `protractorState.center`: first inspects exact vector strokes
     /// on the HTML page, then falls back to an asynchronous local WKWebView patch scan for printed/Canvas/SVG figures.
-    private func autoDetectProtractorAngle(allowImageFallback: Bool, triggerHaptic: Bool) {
+    private func autoDetectProtractorAngle(allowImageFallback: Bool, triggerHaptic: Bool, announceFailure: Bool = false) {
         guard session.geometryAid == .protractor else { return }
         protractorDetectGeneration &+= 1
         let generation = protractorDetectGeneration
@@ -1708,11 +1717,21 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         )
         if protractorState.applyDetectedRays(vectorRays, source: .vector) {
             geometryOverlay.protractor = protractorState
+            pushPresentationOverlay()
             if triggerHaptic { haptic.impactOccurred(intensity: 0.7) }
             return
         }
 
-        guard allowImageFallback, webView.bounds.width > 48, webView.bounds.height > 48 else { return }
+        guard allowImageFallback, webView.bounds.width > 48, webView.bounds.height > 48 else {
+            if announceFailure {
+                NotificationCenter.default.post(
+                    name: .quillmarkUndoRedoFeedback,
+                    object: nil,
+                    userInfo: ["message": "未检测到明显角边，请将圆心对准顶点或手动拖射线"]
+                )
+            }
+            return
+        }
         let half: CGFloat = 72
         let ptInWeb = view.convert(protractorState.center, to: webView)
         let cropRect = CGRect(x: ptInWeb.x - half, y: ptInWeb.y - half, width: half * 2, height: half * 2)
@@ -1735,12 +1754,20 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                 y: (ptInWeb.y - cropRect.minY) * scaleY
             )
             guard let detected = ProtractorAngleDetector.detectImageRays(in: cgImage, center: centerInImage) else {
+                if announceFailure {
+                    NotificationCenter.default.post(
+                        name: .quillmarkUndoRedoFeedback,
+                        object: nil,
+                        userInfo: ["message": "未检测到明显角边，请将圆心对准顶点或手动拖射线"]
+                    )
+                }
                 return
             }
             self.protractorState.center.x += detected.vertexOffset.x / max(0.5, scaleX)
             self.protractorState.center.y += detected.vertexOffset.y / max(0.5, scaleY)
             if self.protractorState.applyDetectedRays(detected.rayAngles, source: .image) {
                 self.geometryOverlay.protractor = self.protractorState
+                self.pushPresentationOverlay()
                 if triggerHaptic { self.haptic.impactOccurred(intensity: 0.7) }
             }
         }
@@ -2208,10 +2235,11 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                              width: liveTool.tapeWidth, smoothing: 0, points: [],
                              tool: .tape, lineStyle: .solid, revealed: false, geometry: primitive)
         }
-        let fill = (allowFill && primitive.supportsFill) ? liveTool.color : nil
-        return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.color,
-                         width: liveTool.width, smoothing: 0, points: [],
-                         tool: .pen, lineStyle: liveTool.lineStyle, geometry: primitive, fillColor: fill)
+        let color = liveTool.activeStrokeColor
+        let fill = (allowFill && primitive.supportsFill) ? color : nil
+        return InkStroke(id: UUID(), pen: .ballpoint, color: color,
+                         width: liveTool.activeStrokeWidth, smoothing: 0, points: [],
+                         tool: .pen, lineStyle: liveTool.activeLineStyle, geometry: primitive, fillColor: fill)
     }
 
     // MARK: Drawing (Pen, Tape & Draw-and-Hold)
@@ -2228,7 +2256,7 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             liveLayer.lineWidth = 1
             liveLayer.lineDashPattern = [5, 3]
         } else {
-            liveLayer.fillColor = liveTool.color.cgColor
+            liveLayer.fillColor = liveTool.activeStrokeColor.cgColor
             liveLayer.opacity = 1
             liveLayer.compositingFilter = nil
             liveLayer.strokeColor = nil
@@ -2582,10 +2610,12 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             laserGlowLayer.shadowColor = frame.glowColor
             laserGlowLayer.opacity = frame.opacity
             laserGlowLayer.path = frame.glowPath
+            laserGlowLayer.shadowPath = frame.glowPath
             laserCoreLayer.opacity = frame.opacity
             laserCoreLayer.path = frame.corePath
         } else {
             laserGlowLayer.path = nil
+            laserGlowLayer.shadowPath = nil
             laserCoreLayer.path = nil
             stopLaserLoop()
         }
@@ -2707,7 +2737,8 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                     laserGlowPath: shifted.laserGlowPath,
                     laserCorePath: shifted.laserCorePath,
                     laserColor: shifted.laserColor,
-                    laserOpacity: shifted.laserOpacity
+                    laserOpacity: shifted.laserOpacity,
+                    geometryAid: shifted.geometryAid
                 )
                 PresentationCenter.shared.updateLiveOverlay(state)
                 return
@@ -2738,6 +2769,18 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
                 ))
             }
         }
+
+        let projectedAid: ProjectedGeometryAid
+        switch geometryOverlay.aid {
+        case .none:
+            projectedAid = .none
+        case .compass:
+            projectedAid = .compass(compassState, sweep: geometryOverlay.activeCompassSweep,
+                                    strokeColor: geometryOverlay.activeStrokeColor.cgColor)
+        case .protractor:
+            projectedAid = .protractor(protractorState)
+        }
+
         let state = LiveOverlayState(
             sourceSize: captureRect.size,
             captureOriginY: captureRect.minY,
@@ -2752,7 +2795,8 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
             laserGlowPath: laserFrame.glowPath,
             laserCorePath: laserFrame.corePath,
             laserColor: laserFrame.glowColor,
-            laserOpacity: laserFrame.opacity
+            laserOpacity: laserFrame.opacity,
+            geometryAid: projectedAid
         )
         PresentationCenter.shared.updateLiveOverlay(state)
     }

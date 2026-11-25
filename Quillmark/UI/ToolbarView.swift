@@ -1,19 +1,24 @@
 import SwiftUI
 import UIKit
 
-/// Floating editor toolbar: tool selector, options of the current tool, undo/redo, finger drawing.
+/// Floating editor toolbar with pinned left tool buttons, pinned right undo/redo/input controls,
+/// and a dedicated scrollable middle options strip so critical controls never scroll off-screen on 10.9" iPads.
 struct ToolbarView: View {
     @ObservedObject var session: DocumentSession
     @ObservedObject private var presentation = PresentationCenter.shared
+    @Environment(\.colorScheme) private var colorScheme
 
     @State private var showColorPalette = false
+    @State private var showShapePicker = false
     @State private var editingQuickSlotIndex: Int?
 
     private var tool: ToolSettings { session.tool }
+    private var isShapeMode: Bool { tool.kind == .shape }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+        HStack(spacing: 8) {
+            // Pinned left: primary tool switcher
+            HStack(spacing: 4) {
                 toolButton(title: "画笔", symbol: "pencil", selected: tool.kind == .pen) {
                     session.selectToolManually(.pen)
                 }
@@ -37,33 +42,65 @@ struct ToolbarView: View {
                 toolButton(title: "便签", symbol: "note.text", selected: session.isScratchpadOpen) {
                     session.toggleScratchpad()
                 }
-                divider
-                options
-                divider
+            }
+
+            divider
+
+            // Scrollable middle: per-tool options only (never pushes tools or undo/redo off-screen)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    options
+                }
+                .padding(.horizontal, 2)
+            }
+            .frame(maxWidth: .infinity)
+
+            divider
+
+            // Pinned right: undo/redo, finger drawing, and content-only projection toggle
+            HStack(spacing: 6) {
                 Button {
                     session.undo()
                 } label: {
                     Image(systemName: "arrow.uturn.backward")
+                        .frame(minWidth: 34, minHeight: 36)
+                        .contentShape(Rectangle())
                 }
                 .disabled(!session.canUndo)
                 .accessibilityLabel("撤销")
+                .contextMenu {
+                    Button {
+                        session.tool.multiFingerUndo = !session.tool.isMultiFingerUndoEnabled
+                    } label: {
+                        Label(
+                            session.tool.isMultiFingerUndoEnabled ? "关闭双指撤销 / 三指重做" : "开启双指撤销 / 三指重做",
+                            systemImage: session.tool.isMultiFingerUndoEnabled ? "hand.tap.fill" : "hand.tap"
+                        )
+                    }
+                }
+
                 Button {
                     session.redo()
                 } label: {
                     Image(systemName: "arrow.uturn.forward")
+                        .frame(minWidth: 34, minHeight: 36)
+                        .contentShape(Rectangle())
                 }
                 .disabled(!session.canRedo)
                 .accessibilityLabel("重做")
+
                 divider
+
                 Toggle(isOn: $session.tool.fingerDrawing) {
                     Image(systemName: "hand.draw")
                 }
                 .toggleStyle(.button)
                 .accessibilityLabel("手指书写")
+
                 if presentation.isExternalDisplayConnected {
                     divider
                     Toggle(isOn: $presentation.contentOnly) {
-                        Label("投屏仅内容", systemImage: "rectangle.on.rectangle")
+                        Label("仅投内容", systemImage: "rectangle.on.rectangle")
                             .labelStyle(.titleAndIcon)
                             .font(.callout)
                     }
@@ -71,25 +108,31 @@ struct ToolbarView: View {
                     .accessibilityHint("打开：投屏画面只显示文档内容，工具栏只在 iPad 上显示")
                 }
             }
-            .font(.title3)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
         }
+        .font(.title3)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
         .background(.regularMaterial, in: Capsule())
         .frame(maxWidth: .infinity)
+        .onChange(of: session.colorPaletteRequestID) { _, _ in
+            if tool.kind == .pen || tool.kind == .shape {
+                editingQuickSlotIndex = nil
+                showColorPalette = true
+            }
+        }
     }
 
     @ViewBuilder
     private var options: some View {
         switch tool.kind {
         case .pen:
-            quickColorStrip
+            quickColorStrip(
+                activeColor: tool.color,
+                setColor: { session.tool.color = $0 },
+                isForShape: false
+            )
             divider
-            ForEach(ToolSettings.widthPresets, id: \.self) { width in
-                sizeButton(diameter: CGFloat(width) * 3 + 2, selected: tool.width == width) {
-                    session.tool.width = width
-                }
-            }
+            widthStrip(selectedWidth: tool.width) { session.tool.width = $0 }
             divider
             Picker("线型", selection: $session.tool.lineStyle) {
                 ForEach(StrokeLineStyle.allCases) { style in
@@ -97,9 +140,9 @@ struct ToolbarView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 132)
+            .frame(minWidth: 126, maxWidth: 142)
             Toggle(isOn: $session.tool.drawAndHold) {
-                Label("成形", systemImage: "square.on.circle")
+                Label("按住成形", systemImage: "square.on.circle")
                     .labelStyle(.titleAndIcon)
                     .font(.callout)
             }
@@ -113,13 +156,17 @@ struct ToolbarView: View {
                 .padding(.horizontal, 4)
 
         case .tape:
-            ForEach(ToolSettings.tapePalette, id: \.self) { color in
-                colorButton(color, selected: tool.tapeColor == color) { session.tool.tapeColor = color }
+            ForEach(Array(ToolSettings.tapePalette.enumerated()), id: \.offset) { idx, color in
+                colorButton(color, selected: tool.tapeColor == color, label: "胶带颜色 \(idx + 1)") {
+                    session.tool.tapeColor = color
+                }
             }
             divider
-            ForEach(ToolSettings.tapeWidthPresets, id: \.self) { width in
-                sizeButton(diameter: CGFloat(width) * 0.45 + 6, selected: tool.tapeWidth == width,
-                           shape: AnyShape(RoundedRectangle(cornerRadius: 3))) {
+            ForEach(Array(ToolSettings.tapeWidthPresets.enumerated()), id: \.offset) { idx, width in
+                sizeButton(diameter: CGFloat(width) * 0.45 + 6,
+                           selected: tool.tapeWidth == width,
+                           shape: AnyShape(RoundedRectangle(cornerRadius: 3)),
+                           label: "胶带宽度 \(idx + 1)") {
                     session.tool.tapeWidth = width
                 }
             }
@@ -133,53 +180,78 @@ struct ToolbarView: View {
             Button {
                 session.setAllTapesRevealed(false)
             } label: {
-                Label("全盖", systemImage: "eye.slash")
+                Label("全部遮住", systemImage: "eye.slash")
                     .font(.callout)
             }
             .buttonStyle(.bordered)
             Button {
                 session.setAllTapesRevealed(true)
             } label: {
-                Label("全揭", systemImage: "eye")
+                Label("全部揭开", systemImage: "eye")
                     .font(.callout)
             }
             .buttonStyle(.bordered)
 
         case .shape:
-            ForEach(ShapePreset.allCases) { preset in
-                shapePresetButton(preset, selected: tool.shapePreset == preset) {
-                    session.tool.shapePreset = preset
+            // Compact shape picker button opening a crisp 4-column grid popover (prevents 14-button toolbar overflow).
+            Button {
+                showShapePicker = true
+            } label: {
+                HStack(spacing: 6) {
+                    ShapePresetIcon(preset: tool.shapePreset)
+                        .frame(width: 20, height: 16)
+                    Text(tool.shapePreset.displayName)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .opacity(0.65)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
+                .foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("选择图形：当前为\(tool.shapePreset.displayName)")
+            .popover(isPresented: $showShapePicker) {
+                ShapePresetGridPopover(selected: $session.tool.shapePreset) {
+                    showShapePicker = false
                 }
             }
+
             divider
-            quickColorStrip
+
+            quickColorStrip(
+                activeColor: tool.resolvedShapeColor,
+                setColor: { session.tool.resolvedShapeColor = $0 },
+                isForShape: true
+            )
             divider
-            ForEach(ToolSettings.widthPresets, id: \.self) { width in
-                sizeButton(diameter: CGFloat(width) * 3 + 2, selected: tool.width == width) {
-                    session.tool.width = width
-                }
-            }
+            widthStrip(selectedWidth: tool.resolvedShapeWidth) { session.tool.resolvedShapeWidth = $0 }
             divider
-            Picker("线型", selection: $session.tool.lineStyle) {
+            Picker("图形线型", selection: $session.tool.resolvedShapeLineStyle) {
                 ForEach(StrokeLineStyle.allCases) { style in
                     Text(style.displayName).tag(style)
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 132)
+            .frame(minWidth: 126, maxWidth: 142)
             if tool.shapePreset.supportsFill {
                 Toggle(isOn: $session.tool.shapeFilled) {
-                    Label("阴影", systemImage: "square.fill.on.square")
+                    Label("填充", systemImage: "square.fill.on.square")
                         .labelStyle(.titleAndIcon)
                         .font(.callout)
                 }
                 .toggleStyle(.button)
-                .accessibilityLabel("半透明阴影填充")
+                .accessibilityLabel("半透明填充")
             }
 
         case .laser:
-            ForEach(ToolSettings.laserPalette, id: \.self) { color in
-                colorButton(color, selected: tool.laserColor == color) { session.tool.laserColor = color }
+            ForEach(Array(ToolSettings.laserPalette.enumerated()), id: \.offset) { idx, color in
+                colorButton(color, selected: tool.laserColor == color, label: "激光笔颜色 \(idx + 1)") {
+                    session.tool.laserColor = color
+                }
             }
 
         case .eraser:
@@ -189,29 +261,44 @@ struct ToolbarView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: 180)
-            ForEach(ToolSettings.eraserRadiusPresets, id: \.self) { radius in
-                sizeButton(diameter: CGFloat(radius) + 6, selected: tool.eraserRadius == radius, filled: false) {
+            .frame(minWidth: 168, maxWidth: 190)
+            ForEach(Array(ToolSettings.eraserRadiusPresets.enumerated()), id: \.offset) { idx, radius in
+                sizeButton(diameter: CGFloat(radius) + 6,
+                           selected: tool.eraserRadius == radius,
+                           filled: false,
+                           label: "橡皮大小 \(idx + 1)") {
                     session.tool.eraserRadius = radius
                 }
             }
         }
     }
 
+    @ViewBuilder
+    private func widthStrip(selectedWidth: Float, onSelect: @escaping (Float) -> Void) -> some View {
+        let names = ["极细", "常规", "较粗", "醒目粗"]
+        ForEach(Array(ToolSettings.widthPresets.enumerated()), id: \.offset) { idx, width in
+            let name = idx < names.count ? names[idx] : "粗细 \(idx + 1)"
+            sizeButton(diameter: CGFloat(width) * 2.8 + 2.5,
+                       selected: abs(selectedWidth - width) < 0.05,
+                       label: "线条粗细 \(name)") {
+                onSelect(width)
+            }
+        }
+    }
+
     /// Shows only the 4 most-used colors on the toolbar + a compact rainbow color-palette trigger.
-    private var quickColorStrip: some View {
+    /// Tapping a quick dot strictly selects it (never surprises the teacher with an unexpected popover);
+    /// long-pressing a dot or tapping the rainbow palette opens the color palette for customization.
+    private func quickColorStrip(activeColor: RGBAColor,
+                                 setColor: @escaping (RGBAColor) -> Void,
+                                 isForShape: Bool) -> some View {
         let quickColors = tool.resolvedQuickColors
-        let isCustomActive = !quickColors.contains(tool.color)
-        return HStack(spacing: 10) {
+        let isCustomActive = !quickColors.contains(activeColor)
+        return HStack(spacing: 6) {
             ForEach(Array(quickColors.enumerated()), id: \.offset) { idx, color in
-                let isSelected = (tool.color == color)
-                colorButton(color, selected: isSelected) {
-                    if isSelected {
-                        editingQuickSlotIndex = idx
-                        showColorPalette = true
-                    } else {
-                        session.tool.color = color
-                    }
+                let isSelected = (activeColor == color)
+                colorButton(color, selected: isSelected, label: "常用颜色 \(idx + 1)") {
+                    setColor(color)
                 }
                 .contextMenu {
                     Button {
@@ -244,11 +331,11 @@ struct ToolbarView: View {
                         .frame(width: 26, height: 26)
                     if isCustomActive {
                         Circle()
-                            .fill(Color(cgColor: tool.color.cgColor))
+                            .fill(Color(cgColor: activeColor.cgColor))
                             .frame(width: 17, height: 17)
                             .overlay(
                                 Circle()
-                                    .stroke(Color.primary.opacity(tool.color.isVeryLight ? 0.35 : 0.12), lineWidth: 0.8)
+                                    .stroke(swatchBorderColor(for: activeColor), lineWidth: 0.9)
                             )
                     } else {
                         Image(systemName: "paintpalette.fill")
@@ -258,15 +345,18 @@ struct ToolbarView: View {
                 }
                 .overlay(
                     Circle()
-                        .stroke(Color.primary.opacity(isCustomActive ? 0.9 : 0), lineWidth: 2)
+                        .stroke(Color.accentColor.opacity(isCustomActive ? 0.95 : 0), lineWidth: 2.2)
                         .padding(-4)
                 )
+                .frame(minWidth: 34, minHeight: 36)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("打开调色盘选择更多颜色")
             .popover(isPresented: $showColorPalette) {
                 ColorPalettePopover(
                     session: session,
+                    isForShape: isForShape,
                     editingSlotIndex: $editingQuickSlotIndex,
                     dismiss: { showColorPalette = false }
                 )
@@ -322,11 +412,12 @@ struct ToolbarView: View {
                         .opacity(0.65)
                 }
             }
-            .frame(minWidth: 44)
+            .frame(minWidth: 42, minHeight: 36)
             .padding(.horizontal, 2)
             .padding(.vertical, 2)
             .background(isActive ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
             .foregroundStyle(isActive ? Color.accentColor : Color.primary)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("几何尺规工具（圆规与量角器）")
@@ -336,70 +427,129 @@ struct ToolbarView: View {
         Divider().frame(height: 26)
     }
 
-    private func shapePresetButton(_ preset: ShapePreset, selected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 2) {
-                ShapePresetIcon(preset: preset)
-                    .frame(width: 20, height: 16)
-                Text(preset.displayName).font(.caption2)
-            }
-            .frame(minWidth: 42)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
-            .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(selected ? Color.accentColor : Color.primary)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
     private func toolButton(title: String, symbol: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 2) {
                 Image(systemName: symbol)
                 Text(title).font(.caption2)
             }
-            .frame(minWidth: 42)
+            .frame(minWidth: 40, minHeight: 36)
             .padding(.vertical, 2)
             .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .foregroundStyle(selected ? Color.accentColor : Color.primary)
+        .accessibilityLabel(title)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
-    private func colorButton(_ color: RGBAColor, selected: Bool, action: @escaping () -> Void) -> some View {
+    private func swatchBorderColor(for color: RGBAColor) -> Color {
+        if color.isVeryLight {
+            return Color.primary.opacity(0.38)
+        }
+        let luma = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b
+        if colorScheme == .dark && luma < 0.25 {
+            return Color.white.opacity(0.45)
+        }
+        return Color.primary.opacity(0.16)
+    }
+
+    private func colorButton(_ color: RGBAColor, selected: Bool, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Circle()
                 .fill(Color(cgColor: color.cgColor))
                 .frame(width: 24, height: 24)
                 .overlay(
                     Circle()
-                        .stroke(Color.primary.opacity(color.isVeryLight ? 0.35 : 0.14), lineWidth: 0.9)
+                        .stroke(swatchBorderColor(for: color), lineWidth: 1.0)
                 )
                 .overlay(
                     Circle()
-                        .stroke(Color.primary.opacity(selected ? 0.9 : 0), lineWidth: 2)
+                        .stroke(Color.accentColor.opacity(selected ? 0.95 : 0), lineWidth: 2.2)
                         .padding(-4)
                 )
+                .frame(minWidth: 32, minHeight: 36)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private func sizeButton(diameter: CGFloat, selected: Bool, filled: Bool = true,
-                            shape: AnyShape = AnyShape(Circle()), action: @escaping () -> Void) -> some View {
+                            shape: AnyShape = AnyShape(Circle()), label: String,
+                            action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Group {
                 if filled {
-                    shape.fill(Color.primary).frame(width: min(diameter, 22), height: min(diameter, 22))
+                    shape.fill(Color.primary).frame(width: min(diameter, 20), height: min(diameter, 20))
                 } else {
-                    Circle().stroke(Color.primary, lineWidth: 1.5).frame(width: min(diameter, 24), height: min(diameter, 24))
+                    Circle().stroke(Color.primary, lineWidth: 1.5).frame(width: min(diameter, 22), height: min(diameter, 22))
                 }
             }
-            .frame(width: 30, height: 30)
+            .frame(width: 32, height: 36)
             .background(selected ? Color.accentColor.opacity(0.18) : Color.clear, in: Circle())
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// Compact 4-column math shape grid popover replacing the 14-button horizontal strip so toolbar controls stay visible.
+private struct ShapePresetGridPopover: View {
+    @Binding var selected: ShapePreset
+    let dismiss: () -> Void
+
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 8), count: 4)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("选择标准数学图形", systemImage: "square.on.circle")
+                    .font(.headline)
+                Spacer()
+                Button("完成") { dismiss() }
+                    .font(.subheadline.weight(.semibold))
+            }
+
+            LazyVGrid(columns: columns, spacing: 8) {
+                ForEach(ShapePreset.allCases) { preset in
+                    let isSelected = (selected == preset)
+                    Button {
+                        selected = preset
+                        dismiss()
+                    } label: {
+                        VStack(spacing: 5) {
+                            ShapePresetIcon(preset: preset)
+                                .frame(width: 26, height: 20)
+                            Text(preset.displayName)
+                                .font(.caption2.weight(isSelected ? .semibold : .regular))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 50)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 6)
+                        .background(
+                            isSelected ? Color.accentColor.opacity(0.18) : Color(.secondarySystemBackground),
+                            in: RoundedRectangle(cornerRadius: 10)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+                        )
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
+                }
+            }
+        }
+        .padding(14)
+        .frame(minWidth: 320, maxWidth: 360)
     }
 }
 
@@ -407,14 +557,27 @@ struct ToolbarView: View {
 /// and one-tap assignment into the 4 toolbar quick-color slots.
 private struct ColorPalettePopover: View {
     @ObservedObject var session: DocumentSession
+    let isForShape: Bool
     @Binding var editingSlotIndex: Int?
     let dismiss: () -> Void
 
     private let columns = Array(repeating: GridItem(.flexible(), spacing: 10), count: 4)
 
+    private var activeColor: RGBAColor {
+        isForShape ? session.tool.resolvedShapeColor : session.tool.color
+    }
+
+    private func setActiveColor(_ newColor: RGBAColor) {
+        if isForShape {
+            session.tool.resolvedShapeColor = newColor
+        } else {
+            session.tool.color = newColor
+        }
+    }
+
     private var colorBinding: Binding<Color> {
         Binding(
-            get: { Color(cgColor: session.tool.color.cgColor) },
+            get: { Color(cgColor: activeColor.cgColor) },
             set: { newColor in
                 let rgba = RGBAColor(swiftUIColor: newColor)
                 applyPickedColor(rgba)
@@ -425,7 +588,8 @@ private struct ColorPalettePopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label(editingSlotIndex.map { "自定义常用色 \($0 + 1)" } ?? "调色盘", systemImage: "paintpalette")
+                Label(editingSlotIndex.map { "自定义常用色 \($0 + 1)" } ?? (isForShape ? "图形调色盘" : "画笔调色盘"),
+                      systemImage: "paintpalette")
                     .font(.headline)
                 Spacer()
                 Button("完成") {
@@ -437,7 +601,7 @@ private struct ColorPalettePopover: View {
             // 16 curated teaching colors (light + dark courseware friendly)
             LazyVGrid(columns: columns, spacing: 12) {
                 ForEach(ToolSettings.extendedPalette, id: \.self) { color in
-                    let isSelected = (session.tool.color == color)
+                    let isSelected = (activeColor == color)
                     Button {
                         applyPickedColor(color)
                     } label: {
@@ -446,7 +610,7 @@ private struct ColorPalettePopover: View {
                             .frame(width: 34, height: 34)
                             .overlay(
                                 Circle()
-                                    .stroke(Color.primary.opacity(color.isVeryLight ? 0.35 : 0.12), lineWidth: 1)
+                                    .stroke(Color.primary.opacity(color.isVeryLight ? 0.35 : 0.14), lineWidth: 1)
                             )
                             .overlay(
                                 Circle()
@@ -469,7 +633,7 @@ private struct ColorPalettePopover: View {
             // One-tap bar to pin the current color into any of the 4 toolbar quick slots
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(editingSlotIndex == nil ? "点下方槽位，将当前色设为常用：" : "正在替换高亮槽位（点其他切换）：")
+                    Text(editingSlotIndex == nil ? "点下方槽位，将当前色固定到常用：" : "正在替换高亮槽位（点其他切换）：")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -489,9 +653,12 @@ private struct ColorPalettePopover: View {
                                 editingSlotIndex = nil
                             } else if editingSlotIndex != nil {
                                 editingSlotIndex = idx
-                                session.tool.color = slotColor
+                                setActiveColor(slotColor)
                             } else {
-                                session.tool.setQuickColor(session.tool.color, at: idx)
+                                session.tool.setQuickColor(activeColor, at: idx, applyToPen: !isForShape)
+                                if isForShape {
+                                    session.tool.resolvedShapeColor = activeColor
+                                }
                             }
                         } label: {
                             VStack(spacing: 3) {
@@ -500,7 +667,7 @@ private struct ColorPalettePopover: View {
                                     .frame(width: 28, height: 28)
                                     .overlay(
                                         Circle()
-                                            .stroke(Color.primary.opacity(slotColor.isVeryLight ? 0.35 : 0.14), lineWidth: 0.9)
+                                            .stroke(Color.primary.opacity(slotColor.isVeryLight ? 0.35 : 0.16), lineWidth: 0.9)
                                     )
                                     .overlay(
                                         Circle()
@@ -519,14 +686,17 @@ private struct ColorPalettePopover: View {
             }
         }
         .padding(16)
-        .frame(width: 280)
+        .frame(minWidth: 280, maxWidth: 310)
     }
 
     private func applyPickedColor(_ color: RGBAColor) {
         if let idx = editingSlotIndex {
-            session.tool.setQuickColor(color, at: idx)
+            session.tool.setQuickColor(color, at: idx, applyToPen: !isForShape)
+            if isForShape {
+                session.tool.resolvedShapeColor = color
+            }
         } else {
-            session.tool.color = color
+            setActiveColor(color)
         }
     }
 }

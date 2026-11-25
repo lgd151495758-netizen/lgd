@@ -14,16 +14,36 @@ struct ScratchpadLiveOverlay {
     var laserCorePath: CGPath?
     var laserColor: CGColor?
     var laserOpacity: Float = 1
+    var geometryAid: ProjectedGeometryAid = .none
 
     var isEmpty: Bool {
-        strokePath == nil && fillPath == nil && pendingStrokes.isEmpty
+        let hasGeometry: Bool
+        switch geometryAid {
+        case .none: hasGeometry = false
+        case .compass, .protractor: hasGeometry = true
+        }
+        return !hasGeometry
+            && strokePath == nil && fillPath == nil && pendingStrokes.isEmpty
             && cursorPath == nil && laserGlowPath == nil && laserCorePath == nil
     }
 
-    /// Translates every path by `offset` (used in Split Mode to place scratchpad ink below the HTML half).
+    /// Translates every path and projected geometry aid by `offset`.
     func translated(by offset: CGPoint) -> ScratchpadLiveOverlay {
         guard offset != .zero else { return self }
         var t = CGAffineTransform(translationX: offset.x, y: offset.y)
+        let shiftedAid: ProjectedGeometryAid
+        switch geometryAid {
+        case .none:
+            shiftedAid = .none
+        case let .compass(c, sweep, color):
+            var moved = c
+            moved.center = CGPoint(x: c.center.x + offset.x, y: c.center.y + offset.y)
+            shiftedAid = .compass(moved, sweep: sweep, strokeColor: color)
+        case let .protractor(p):
+            var moved = p
+            moved.center = CGPoint(x: p.center.x + offset.x, y: p.center.y + offset.y)
+            shiftedAid = .protractor(moved)
+        }
         return ScratchpadLiveOverlay(
             strokePath: strokePath?.copy(using: &t),
             strokeColor: strokeColor,
@@ -44,7 +64,8 @@ struct ScratchpadLiveOverlay {
             laserGlowPath: laserGlowPath?.copy(using: &t),
             laserCorePath: laserCorePath?.copy(using: &t),
             laserColor: laserColor,
-            laserOpacity: laserOpacity
+            laserOpacity: laserOpacity,
+            geometryAid: shiftedAid
         )
     }
 }
@@ -379,20 +400,49 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         ctx.restoreGState()
     }
 
+    private var renderRevision: UInt64 = 0
+    private var cachedCleanImage: (key: CleanImageKey, image: UIImage)?
+    private var activeErasePageID: Int?
+
+    private struct CleanImageKey: Equatable {
+        let pageID: Int
+        let revision: UInt64
+        let width: Int
+        let height: Int
+        let paper: ScratchpadPaperStyle
+    }
+
     /// Renders the clean scratchpad (paper background + committed strokes, excluding iPad-only
-    /// handles/compass/lasso chrome and any stroke currently being dragged live) for external display.
+    /// handles/bars and any stroke currently being dragged live) for external display.
+    /// Cached by `(pageID, renderRevision, size, paperStyle)` so 24fps/6fps projection never
+    /// re-smooths strokes from scratch while idle or dragging the sticky-note window.
     func renderCleanImage(size: CGSize) -> UIImage {
         let renderSize = CGSize(width: max(1, size.width), height: max(1, size.height))
+        let key = CleanImageKey(
+            pageID: pageID,
+            revision: renderRevision,
+            width: Int(renderSize.width.rounded()),
+            height: Int(renderSize.height.rounded()),
+            paper: paperStyle
+        )
+        if let cached = cachedCleanImage, cached.key == key {
+            return cached.image
+        }
         let format = UIGraphicsImageRendererFormat()
-        format.scale = min(max(UIScreen.main.scale, 1), 2)
+        format.scale = PresentationCenter.shared.preferredPDFCaptureScale(
+            forCaptureWidth: renderSize.width,
+            screenScale: UIScreen.main.scale
+        )
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: renderSize, format: format)
         let strokes = session.strokes(onPage: pageID).filter { !hiddenStrokeIDs.contains($0.id) }
-        return renderer.image { rendererCtx in
+        let image = renderer.image { rendererCtx in
             let ctx = rendererCtx.cgContext
             Self.drawPaperBackground(paperStyle, in: CGRect(origin: .zero, size: renderSize), ctx: ctx)
             Self.drawStrokes(strokes, in: ctx)
         }
+        cachedCleanImage = (key, image)
+        return image
     }
 
     static func drawStrokes(_ strokes: [InkStroke], in ctx: CGContext) {
@@ -443,12 +493,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         tapeTapRecognizer.isEnabled = !fingerDrawing
         geometryOverlay.isUserInteractionEnabled = !fingerDrawing
 
-        let color: RGBAColor
-        switch session.tool.kind {
-        case .tape: color = session.tool.tapeColor
-        case .laser: color = session.tool.laserColor
-        default: color = session.tool.color
-        }
+        let color = session.tool.activeStrokeColor
         geometryOverlay.activeStrokeColor = UIColor(cgColor: color.cgColor)
     }
 
@@ -481,12 +526,21 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         if aid == .protractor {
             autoDetectProtractorAngle(triggerHaptic: false)
         }
+        emitLiveOverlay()
     }
 
     func handlePageSwitch() {
         cancelActiveInteraction()
+        eraseOriginal = nil
+        activeErasePageID = nil
+        lastErasePoint = nil
+        livePoints.removeAll()
+        pendingEstimates.removeAll()
+        setLivePath(nil)
+        setEraserCursor(nil)
         clearSelectedShape()
         clearLassoSelection()
+        renderRevision &+= 1
         syncCommittedStrokes()
         onContentDidMutate?()
     }
@@ -498,9 +552,15 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         laserEngine.cancel()
         laserFrame = .empty
         cancelActiveInteraction()
+        eraseOriginal = nil
+        activeErasePageID = nil
+        lastErasePoint = nil
+        livePoints.removeAll()
+        pendingEstimates.removeAll()
         clearSelectedShape()
         clearLassoSelection()
         setLivePath(nil)
+        setEraserCursor(nil)
         onLiveOverlayChanged?(nil)
     }
 
@@ -512,6 +572,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
     }
 
     private func renderCommitted(_ strokes: [InkStroke]) {
+        renderRevision &+= 1
         let ids = Set(strokes.map(\.id))
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -830,12 +891,14 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             let snap = compassState.moveCenter(to: raw, snapPoints: cachedSnapPoints)
             geometryOverlay.compass = compassState
             updateSnapFeedback(snap)
+            emitLiveOverlay()
             return true
 
         case .compassResize:
             let snap = compassState.resize(withHandleAt: pt, snapPoints: cachedSnapPoints)
             geometryOverlay.compass = compassState
             updateSnapFeedback(snap)
+            emitLiveOverlay()
             return true
 
         case let .protractorCenter(grabOffset):
@@ -849,18 +912,21 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             }
             geometryOverlay.protractor = protractorState
             updateSnapFeedback(snap)
+            emitLiveOverlay()
             return true
 
         case .protractorRay1:
             let snap = protractorState.aimRay1(to: pt, snapPoints: cachedSnapPoints)
             geometryOverlay.protractor = protractorState
             updateSnapFeedback(snap)
+            emitLiveOverlay()
             return true
 
         case .protractorRay2:
             let snap = protractorState.aimRay2(to: pt, snapPoints: cachedSnapPoints)
             geometryOverlay.protractor = protractorState
             updateSnapFeedback(snap)
+            emitLiveOverlay()
             return true
 
         case let .protractorRotate(lastAngle):
@@ -869,6 +935,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             protractorState.rotateBoth(by: delta)
             activeInteraction = .protractorRotate(lastAngle: currentAngle)
             geometryOverlay.protractor = protractorState
+            emitLiveOverlay()
             return true
 
         case .compassButton, .protractorButton, .selectedAction, .lassoAction:
@@ -1107,10 +1174,11 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
     private func executeProtractorButton(_ button: ProtractorState.HitZone) {
         switch button {
         case .autoDetectButton:
-            autoDetectProtractorAngle(triggerHaptic: true)
+            autoDetectProtractorAngle(triggerHaptic: true, announceFailure: true)
         case .cycleAngleButton:
             protractorState.cycleAngle()
             geometryOverlay.protractor = protractorState
+            emitLiveOverlay()
             haptic.impactOccurred()
         case .stampAngleButton:
             liveTool = session.tool
@@ -1118,6 +1186,11 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             if let primitive = protractorState.stampPrimitive(center: protractorState.center, radius: arcRadius) {
                 commitPreparedStroke(makeGeometricStroke(primitive))
                 haptic.impactOccurred()
+                NotificationCenter.default.post(
+                    name: .quillmarkUndoRedoFeedback,
+                    object: nil,
+                    userInfo: ["message": "已标注 \(protractorState.formattedDegrees)"]
+                )
             }
         case .closeButton:
             session.geometryAid = .none
@@ -1127,7 +1200,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         }
     }
 
-    private func autoDetectProtractorAngle(triggerHaptic: Bool) {
+    private func autoDetectProtractorAngle(triggerHaptic: Bool, announceFailure: Bool = false) {
         guard session.geometryAid == .protractor else { return }
         let rays = ProtractorAngleDetector.detectVectorRays(
             at: protractorState.center,
@@ -1137,7 +1210,14 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
         )
         if protractorState.applyDetectedRays(rays, source: .vector) {
             geometryOverlay.protractor = protractorState
+            emitLiveOverlay()
             if triggerHaptic { haptic.impactOccurred(intensity: 0.7) }
+        } else if announceFailure {
+            NotificationCenter.default.post(
+                name: .quillmarkUndoRedoFeedback,
+                object: nil,
+                userInfo: ["message": "未检测到明显角边，请将圆心对准顶点或手动拖射线"]
+            )
         }
     }
 
@@ -1599,10 +1679,11 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
                              width: liveTool.tapeWidth, smoothing: 0, points: [],
                              tool: .tape, lineStyle: .solid, revealed: false, geometry: primitive)
         }
-        let fill = (allowFill && primitive.supportsFill) ? liveTool.color : nil
-        return InkStroke(id: UUID(), pen: .ballpoint, color: liveTool.color,
-                         width: liveTool.width, smoothing: 0, points: [],
-                         tool: .pen, lineStyle: liveTool.lineStyle, geometry: primitive, fillColor: fill)
+        let color = liveTool.activeStrokeColor
+        let fill = (allowFill && primitive.supportsFill) ? color : nil
+        return InkStroke(id: UUID(), pen: .ballpoint, color: color,
+                         width: liveTool.activeStrokeWidth, smoothing: 0, points: [],
+                         tool: .pen, lineStyle: liveTool.activeLineStyle, geometry: primitive, fillColor: fill)
     }
 
     private func configureLiveLayerForCurrentTool() {
@@ -1617,7 +1698,7 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             liveLayer.lineWidth = 1
             liveLayer.lineDashPattern = [5, 3]
         } else {
-            liveLayer.fillColor = liveTool.color.cgColor
+            liveLayer.fillColor = liveTool.activeStrokeColor.cgColor
             liveLayer.opacity = 1
             liveLayer.compositingFilter = nil
             liveLayer.strokeColor = nil
@@ -1906,10 +1987,12 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             laserGlowLayer.shadowColor = frame.glowColor
             laserGlowLayer.opacity = frame.opacity
             laserGlowLayer.path = frame.glowPath
+            laserGlowLayer.shadowPath = frame.glowPath
             laserCoreLayer.opacity = frame.opacity
             laserCoreLayer.path = frame.corePath
         } else {
             laserGlowLayer.path = nil
+            laserGlowLayer.shadowPath = nil
             laserCoreLayer.path = nil
             stopLaserLoop()
         }
@@ -1922,7 +2005,9 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
     private var eraserRadius: CGFloat { CGFloat(liveTool.eraserRadius) }
 
     private func eraseBegan(_ touch: UITouch) {
-        let original = session.strokes(onPage: pageID)
+        let targetPageID = pageID
+        activeErasePageID = targetPageID
+        let original = session.strokes(onPage: targetPageID)
         eraseOriginal = original
         eraseWorking = original
         let p = touch.preciseLocation(in: self)
@@ -1961,15 +2046,17 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
     }
 
     private func eraseEnded() {
+        let targetPageID = activeErasePageID ?? pageID
         defer {
             eraseOriginal = nil
+            activeErasePageID = nil
             lastErasePoint = nil
             setEraserCursor(nil)
             geometryCache.prune(keeping: Set(eraseWorking.map(\.id)))
         }
         guard let original = eraseOriginal else { return }
         if eraseWorking != original {
-            session.replaceStrokes(onPage: pageID, before: original, after: eraseWorking)
+            session.replaceStrokes(onPage: targetPageID, before: original, after: eraseWorking)
             onContentDidMutate?()
         } else {
             syncCommittedStrokes()
@@ -2016,6 +2103,16 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
                 ))
             }
         }
+        let projectedAid: ProjectedGeometryAid
+        switch geometryOverlay.aid {
+        case .none:
+            projectedAid = .none
+        case .compass:
+            projectedAid = .compass(compassState, sweep: geometryOverlay.activeCompassSweep,
+                                    strokeColor: geometryOverlay.activeStrokeColor.cgColor)
+        case .protractor:
+            projectedAid = .protractor(protractorState)
+        }
         let overlay = ScratchpadLiveOverlay(
             strokePath: liveLayer.path,
             strokeColor: liveLayer.fillColor,
@@ -2027,7 +2124,8 @@ final class ScratchpadCanvasView: UIView, InkInputDelegate, UIScribbleInteractio
             laserGlowPath: laserFrame.glowPath,
             laserCorePath: laserFrame.corePath,
             laserColor: laserFrame.glowColor,
-            laserOpacity: laserFrame.opacity
+            laserOpacity: laserFrame.opacity,
+            geometryAid: projectedAid
         )
         onLiveOverlayChanged?(overlay.isEmpty ? nil : overlay)
     }

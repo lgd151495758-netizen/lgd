@@ -523,18 +523,21 @@ enum ProtractorAngleDetector {
         guard maxContrast >= 40 else { return nil }
         let noiseFloor = UInt8(max(28, Int(Double(maxContrast) * 0.28)))
 
-        // 3. Micro-refine vertex center within ±8px onto pixels actually lying on an edge/corner.
+        // 3. Two-stage vertex micro-refinement within ±8px (2px coarse -> 1px fine) onto the true corner.
         let maxR = CGFloat(min(62, min(min(cx, width - 1 - cx), min(cy, height - 1 - cy)) - 2))
         guard maxR >= 26 else { return nil }
 
         let coarseSteps = 120 // every 3°
+        let fineSteps = 180   // every 2°
         let originScore = coarseVertexScore(contrast: contrast, width: width, height: height,
                                             cx: CGFloat(cx), cy: CGFloat(cy),
-                                            maxR: maxR, noiseFloor: noiseFloor, steps: coarseSteps)
+                                            maxR: maxR, noiseFloor: noiseFloor, steps: fineSteps)
 
         var bestCenterX = CGFloat(cx)
         var bestCenterY = CGFloat(cy)
-        var bestScore = originScore
+        var bestCoarseScore = coarseVertexScore(contrast: contrast, width: width, height: height,
+                                                cx: CGFloat(cx), cy: CGFloat(cy),
+                                                maxR: maxR, noiseFloor: noiseFloor, steps: coarseSteps)
 
         let searchRadius = 8
         for dy in stride(from: -searchRadius, through: searchRadius, by: 2) {
@@ -544,7 +547,6 @@ enum ProtractorAngleDetector {
                 let px = cx + dx
                 let py = cy + dy
                 guard px >= 12, px < width - 12, py >= 12, py < height - 12 else { continue }
-                // Only evaluate points sitting right on/next to visible ink.
                 if !hasInkNear(contrast: contrast, width: width, x: px, y: py, floor: noiseFloor) {
                     continue
                 }
@@ -553,16 +555,45 @@ enum ProtractorAngleDetector {
                 let score = coarseVertexScore(contrast: contrast, width: width, height: height,
                                               cx: CGFloat(px), cy: CGFloat(py),
                                               maxR: localMaxR, noiseFloor: noiseFloor, steps: coarseSteps)
-                if score > bestScore {
-                    bestScore = score
+                if score > bestCoarseScore {
+                    bestCoarseScore = score
                     bestCenterX = CGFloat(px)
                     bestCenterY = CGFloat(py)
                 }
             }
         }
 
-        // Only move the user's vertex if the refined corner is decisively sharper than the drop point.
-        if bestScore <= originScore * 1.15 {
+        // Fine 1px local pass around the coarse winner to pin the exact corner pixel.
+        let seedX = Int(bestCenterX)
+        let seedY = Int(bestCenterY)
+        var bestFineScore = coarseVertexScore(contrast: contrast, width: width, height: height,
+                                              cx: bestCenterX, cy: bestCenterY,
+                                              maxR: maxR, noiseFloor: noiseFloor, steps: fineSteps)
+        for dy in -2...2 {
+            for dx in -2...2 {
+                let px = seedX + dx
+                let py = seedY + dy
+                guard px >= 12, px < width - 12, py >= 12, py < height - 12 else { continue }
+                let distFromDropSq = (px - cx) * (px - cx) + (py - cy) * (py - cy)
+                guard distFromDropSq <= (searchRadius + 1) * (searchRadius + 1) else { continue }
+                if !hasInkNear(contrast: contrast, width: width, x: px, y: py, floor: noiseFloor) {
+                    continue
+                }
+                let localMaxR = CGFloat(min(62, min(min(px, width - 1 - px), min(py, height - 1 - py)) - 2))
+                guard localMaxR >= 26 else { continue }
+                let score = coarseVertexScore(contrast: contrast, width: width, height: height,
+                                              cx: CGFloat(px), cy: CGFloat(py),
+                                              maxR: localMaxR, noiseFloor: noiseFloor, steps: fineSteps)
+                if score > bestFineScore {
+                    bestFineScore = score
+                    bestCenterX = CGFloat(px)
+                    bestCenterY = CGFloat(py)
+                }
+            }
+        }
+
+        // Only move the user's vertex if the refined corner is sharper than the drop point.
+        if bestFineScore <= originScore * 1.05 {
             bestCenterX = CGFloat(cx)
             bestCenterY = CGFloat(cy)
         }
@@ -720,8 +751,8 @@ enum ProtractorAngleDetector {
         var top1 = 0.0
         var top1Bin = -1
         var top2 = 0.0
-        let rStart: CGFloat = 5
-        let rSamples = 14
+        let rStart: CGFloat = 3
+        let rSamples = 18
         let rStep = (maxR - rStart) / CGFloat(max(1, rSamples - 1))
 
         var binScores = [Double](repeating: 0, count: steps)
@@ -740,12 +771,13 @@ enum ProtractorAngleDetector {
                     let c = contrast[iy * width + ix]
                     if c >= noiseFloor {
                         hits += 1
+                        let weight = (s < 5) ? 1.35 : 1.0
                         if s < 5 { innerHits += 1 }
-                        sum += Double(min(c, 190))
+                        sum += Double(min(c, 190)) * weight
                     }
                 }
             }
-            if hits >= 6 && innerHits >= 2 {
+            if hits >= 7 && innerHits >= 3 {
                 let score = sum * (Double(hits) / Double(rSamples))
                 binScores[bin] = score
                 if score > top1 {

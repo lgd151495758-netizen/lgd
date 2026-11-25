@@ -29,6 +29,12 @@ enum PenKind: String, Codable, CaseIterable, Identifiable {
     case fountain
     case brush
 
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        self = PenKind(rawValue: raw) ?? .ballpoint
+    }
+
     var id: String { rawValue }
 
     var displayName: String {
@@ -104,15 +110,15 @@ enum ShapePreset: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .segment: return "线段"
         case .arrow: return "箭头"
-        case .rightTriangle: return "直角△"
-        case .isoscelesTriangle: return "等腰△"
-        case .equilateralTriangle: return "等边△"
+        case .rightTriangle: return "直角三角形"
+        case .isoscelesTriangle: return "等腰三角形"
+        case .equilateralTriangle: return "等边三角形"
         case .rectangle: return "矩形"
-        case .parallelogram: return "平行四边"
+        case .parallelogram: return "平行四边形"
         case .rhombus: return "菱形"
         case .trapezoid: return "梯形"
-        case .pentagon: return "正五边"
-        case .hexagon: return "正六边"
+        case .pentagon: return "正五边形"
+        case .hexagon: return "正六边形"
         case .circle: return "圆"
         case .parabola: return "抛物线"
         case .axes: return "坐标系"
@@ -131,6 +137,12 @@ enum StrokeLineStyle: String, Codable, CaseIterable, Identifiable {
     case solid
     case dashed
     case dotted
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        self = StrokeLineStyle(rawValue: raw) ?? .solid
+    }
 
     var id: String { rawValue }
 
@@ -164,6 +176,12 @@ enum InkTool: String, Codable {
     case pen
     case highlighter
     case tape
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        self = InkTool(rawValue: raw) ?? .pen
+    }
 }
 
 /// Where a stroke written on a live web page is attached. Points of an anchored stroke are
@@ -232,6 +250,12 @@ enum ScratchpadPaperStyle: String, Codable, CaseIterable, Identifiable {
     case grid
     case dot
     case graph
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
+        self = ScratchpadPaperStyle(rawValue: raw) ?? .grid
+    }
 
     var id: String { rawValue }
 
@@ -372,10 +396,11 @@ struct DocumentAnnotations: Codable, Equatable {
         case duplicateCurrent
     }
 
+    static let currentVersion = 1
     static let implicitDefaultLayerID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     static let defaultLayerName = "默认板书"
 
-    var version: Int = 1
+    var version: Int = DocumentAnnotations.currentVersion
     /// Keyed by zero-based page index as a string, so the JSON stays a plain object.
     var pages: [String: PageAnnotations] = [:]
     /// Per-document multi-page math sticky-note pages (optional for backward compatibility).
@@ -597,6 +622,94 @@ struct DocumentAnnotations: Codable, Equatable {
         }
     }
 
+    /// Returns a copy with all non-finite (`NaN`/`±Inf`) floats scrubbed so `JSONEncoder` can never
+    /// fail permanently on a single invalid coordinate or angle.
+    func sanitizedForEncoding() -> DocumentAnnotations {
+        func cleanF(_ v: Float, fallback: Float = 0) -> Float { v.isFinite ? v : fallback }
+        func cleanC(_ v: CGFloat, fallback: CGFloat = 0) -> CGFloat { v.isFinite ? v : fallback }
+        func cleanPt(_ p: CGPoint) -> CGPoint { CGPoint(x: cleanC(p.x), y: cleanC(p.y)) }
+        func cleanColor(_ c: RGBAColor) -> RGBAColor {
+            RGBAColor(
+                min(max(cleanF(c.r), 0), 1),
+                min(max(cleanF(c.g), 0), 1),
+                min(max(cleanF(c.b), 0), 1),
+                min(max(cleanF(c.a, fallback: 1), 0), 1)
+            )
+        }
+        func cleanGeom(_ g: GeometricPrimitive) -> GeometricPrimitive {
+            switch g {
+            case let .segment(a, b, s, e):
+                return .segment(a: cleanPt(a), b: cleanPt(b), startArrow: s, endArrow: e)
+            case let .circle(c, r, m):
+                return .circle(center: cleanPt(c), radius: max(1, cleanC(r, fallback: 10)), showCenterMark: m)
+            case let .arc(c, r, s, e, cw, m):
+                return .arc(center: cleanPt(c), radius: max(1, cleanC(r, fallback: 10)),
+                            startAngle: cleanC(s), endAngle: cleanC(e), clockwise: cw, showCenterMark: m)
+            case let .ellipse(c, rx, ry, rot):
+                return .ellipse(center: cleanPt(c), rx: max(1, cleanC(rx, fallback: 10)),
+                                ry: max(1, cleanC(ry, fallback: 10)), rotation: cleanC(rot))
+            case let .polygon(verts, closed):
+                return .polygon(vertices: verts.map(cleanPt), closed: closed)
+            case let .parabola(v, axis, hw, h):
+                return .parabola(vertex: cleanPt(v), axisAngle: cleanC(axis),
+                                 halfWidth: max(1, cleanC(hw, fallback: 20)), height: max(1, cleanC(h, fallback: 20)))
+            case let .axes(o, xMin, xMax, yMin, yMax, tick):
+                return .axes(origin: cleanPt(o),
+                             xMin: cleanC(xMin, fallback: -50), xMax: cleanC(xMax, fallback: 50),
+                             yMin: cleanC(yMin, fallback: -50), yMax: cleanC(yMax, fallback: 50),
+                             tickSpacing: max(4, cleanC(tick, fallback: 28)))
+            }
+        }
+        func cleanStroke(_ s: InkStroke) -> InkStroke {
+            var out = s
+            out.color = cleanColor(s.color)
+            out.width = max(0.5, cleanF(s.width, fallback: 2))
+            out.smoothing = min(max(cleanF(s.smoothing, fallback: 0.3), 0), 1)
+            out.points = s.points.map { p in
+                InkPoint(x: cleanF(p.x), y: cleanF(p.y),
+                         force: min(max(cleanF(p.force, fallback: 0.5), 0), 1),
+                         azimuth: cleanF(p.azimuth), altitude: cleanF(p.altitude, fallback: .pi / 2),
+                         t: max(0, cleanF(p.t)))
+            }
+            out.baked = s.baked?.map { b in
+                StrokeSample(point: cleanPt(b.point), radius: cleanC(b.radius))
+            }
+            out.geometry = s.geometry.map(cleanGeom)
+            out.fillColor = s.fillColor.map(cleanColor)
+            return out
+        }
+        func cleanPage(_ p: PageAnnotations) -> PageAnnotations {
+            PageAnnotations(strokes: p.strokes.map(cleanStroke))
+        }
+
+        var copy = self
+        copy.pages = pages.mapValues(cleanPage)
+        copy.scratchpadPages = scratchpadPages?.map(cleanPage)
+        if let frame = scratchpadFrame {
+            if frame.origin.x.isFinite && frame.origin.y.isFinite
+                && frame.size.width.isFinite && frame.size.height.isFinite {
+                copy.scratchpadFrame = frame
+            } else {
+                copy.scratchpadFrame = nil
+            }
+        }
+        if let vp = viewport, !vp.isValid {
+            copy.viewport = nil
+        }
+        if let list = layers {
+            copy.layers = list.map { layer in
+                InkLayer(
+                    id: layer.id,
+                    name: layer.name,
+                    createdAt: layer.createdAt,
+                    pages: layer.pages.mapValues(cleanPage),
+                    scratchpadPages: layer.scratchpadPages?.map(cleanPage)
+                )
+            }
+        }
+        return copy
+    }
+
     func page(_ index: Int) -> PageAnnotations {
         if index < 0 {
             let sIdx = -index - 1
@@ -670,9 +783,13 @@ struct ToolSettings: Codable, Equatable {
     var tapeWidth: Float = 26
     var tapeStraight: Bool = true
 
-    // Standard Geometric Shapes
+    // Standard Geometric Shapes (stored independently from Pen so dashed red auxiliary lines
+    // never pollute regular handwriting color, width, or line style!)
     var shapePreset: ShapePreset = .rightTriangle
     var shapeFilled: Bool = false
+    var shapeColor: RGBAColor?
+    var shapeWidth: Float?
+    var shapeLineStyle: StrokeLineStyle?
 
     // Laser Pointer
     var laserColor: RGBAColor = ToolSettings.laserPalette[0]
@@ -683,9 +800,52 @@ struct ToolSettings: Codable, Equatable {
 
     var fingerDrawing: Bool = false
 
-    static let widthPresets: [Float] = [1.0, 1.8, 3.0]
+    static let widthPresets: [Float] = [1.0, 1.8, 3.0, 4.6]
     static let tapeWidthPresets: [Float] = [18, 26, 42]
     static let eraserRadiusPresets: [Float] = [4, 8, 16]
+
+    var resolvedShapeColor: RGBAColor {
+        get { shapeColor ?? color }
+        set { shapeColor = newValue }
+    }
+
+    var resolvedShapeWidth: Float {
+        get { shapeWidth ?? 1.8 }
+        set { shapeWidth = newValue }
+    }
+
+    var resolvedShapeLineStyle: StrokeLineStyle {
+        get { shapeLineStyle ?? .solid }
+        set { shapeLineStyle = newValue }
+    }
+
+    /// Active stroke color for the currently selected drawing tool (`.shape` uses its own independent color).
+    var activeStrokeColor: RGBAColor {
+        switch kind {
+        case .tape: return tapeColor
+        case .laser: return laserColor
+        case .shape: return resolvedShapeColor
+        default: return color
+        }
+    }
+
+    /// Active stroke width for the currently selected drawing tool.
+    var activeStrokeWidth: Float {
+        switch kind {
+        case .tape: return tapeWidth
+        case .shape: return resolvedShapeWidth
+        default: return width
+        }
+    }
+
+    /// Active line style for the currently selected drawing tool.
+    var activeLineStyle: StrokeLineStyle {
+        switch kind {
+        case .shape: return resolvedShapeLineStyle
+        case .pen: return lineStyle
+        default: return .solid
+        }
+    }
 
     static let palette: [RGBAColor] = [
         .ink,
@@ -733,12 +893,14 @@ struct ToolSettings: Codable, Equatable {
         return Self.defaultQuickColors
     }
 
-    mutating func setQuickColor(_ newColor: RGBAColor, at index: Int) {
+    mutating func setQuickColor(_ newColor: RGBAColor, at index: Int, applyToPen: Bool = true) {
         var colors = resolvedQuickColors
         guard index >= 0, index < colors.count else { return }
         colors[index] = newColor
         quickColors = colors
-        color = newColor
+        if applyToPen {
+            color = newColor
+        }
     }
 
     mutating func resetQuickColorsToDefault() {

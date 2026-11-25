@@ -67,6 +67,15 @@ final class DocumentSession: ObservableObject {
     /// Multi-class annotation layers for teaching the same document across different classes.
     @Published private(set) var layers: [InkLayer] = []
     @Published private(set) var activeLayerID: UUID = DocumentAnnotations.implicitDefaultLayerID
+    /// Set to `true` when `annotations.json` could not be decoded or came from a newer app version;
+    /// blocks all disk writes until explicitly acknowledged so original notes are NEVER overwritten.
+    @Published private(set) var isWriteProtected = false
+    /// Non-nil banner message explaining why write protection was engaged on load.
+    @Published private(set) var loadErrorMessage: String?
+    /// Non-nil banner message when saving annotations to disk failed (e.g. storage full).
+    @Published var saveErrorMessage: String?
+    /// Incremented when Apple Pencil double-tap preference is `.showColorPalette`.
+    @Published var colorPaletteRequestID: Int = 0
 
     /// Called after the strokes of a single page changed (page index; negative values are scratchpad pages).
     var pageDidChange: ((Int) -> Void)?
@@ -95,6 +104,7 @@ final class DocumentSession: ObservableObject {
     private var redoStack: [Command] = []
     private let library: LibraryStore
     private var saveWork: DispatchWorkItem?
+    private var retrySaveWork: DispatchWorkItem?
     private var hasUnsavedChanges = false
     /// Only becomes `true` when real ink/annotation/page edits occur (pure viewing/scrolling/zoom
     /// never bumps `meta.modifiedAt` in the Library list).
@@ -109,7 +119,23 @@ final class DocumentSession: ObservableObject {
         self.meta = meta
         self.library = library
         self.tool = tool
-        let loaded = library.loadAnnotations(for: meta.id)
+        let loadResult = library.loadAnnotationsResult(for: meta.id)
+        let loaded: DocumentAnnotations
+        switch loadResult {
+        case .loaded(let value):
+            loaded = value
+        case .missing:
+            loaded = DocumentAnnotations()
+        case let .unsupportedVersion(version, _):
+            loaded = DocumentAnnotations()
+            self.isWriteProtected = true
+            self.loadErrorMessage = "此文档批注格式（v\(version)）高于当前羽签版本，已开启只读保护以防覆盖原笔记，请先更新羽签。"
+        case let .corrupted(_, quarantinedURL):
+            loaded = DocumentAnnotations()
+            self.isWriteProtected = true
+            let backupName = quarantinedURL?.lastPathComponent ?? "备份副本"
+            self.loadErrorMessage = "批注文件读取异常，原文件已备份为 \(backupName)，已暂停自动保存以防覆盖。可导入备份恢复，或点右侧按钮重新开始记录。"
+        }
         self.annotations = loaded
         self.scratchpadPageCount = loaded.resolvedScratchpadPageCount
         self.scratchpadPaper = loaded.scratchpadPaper ?? .grid
@@ -220,9 +246,31 @@ final class DocumentSession: ObservableObject {
     func reloadAnnotationsFromDisk() {
         saveWork?.cancel()
         saveWork = nil
+        retrySaveWork?.cancel()
+        retrySaveWork = nil
         hasUnsavedChanges = false
         hasPendingContentEdit = false
-        let loaded = library.loadAnnotations(for: meta.id)
+        saveErrorMessage = nil
+        let loaded: DocumentAnnotations
+        switch library.loadAnnotationsResult(for: meta.id) {
+        case .loaded(let value):
+            loaded = value
+            isWriteProtected = false
+            loadErrorMessage = nil
+        case .missing:
+            loaded = DocumentAnnotations()
+            isWriteProtected = false
+            loadErrorMessage = nil
+        case let .unsupportedVersion(version, _):
+            loaded = DocumentAnnotations()
+            isWriteProtected = true
+            loadErrorMessage = "此文档批注格式（v\(version)）高于当前羽签版本，已开启只读保护以防覆盖原笔记，请先更新羽签。"
+        case let .corrupted(_, quarantinedURL):
+            loaded = DocumentAnnotations()
+            isWriteProtected = true
+            let backupName = quarantinedURL?.lastPathComponent ?? "备份副本"
+            loadErrorMessage = "批注文件读取异常，原文件已备份为 \(backupName)，已暂停自动保存以防覆盖。可导入备份恢复，或点右侧按钮重新开始记录。"
+        }
         annotations = loaded
         scratchpadPageCount = loaded.resolvedScratchpadPageCount
         if scratchpadPageIndex >= scratchpadPageCount {
@@ -452,15 +500,32 @@ final class DocumentSession: ObservableObject {
         switch action {
         case .ignore:
             return
+        case .showColorPalette, .showInkAttributes:
+            colorPaletteRequestID &+= 1
+            return
         case .switchPrevious:
             tool.switchToPrevious()
-        default:
+        case .switchEraser:
             tool.toggleEraser()
+        @unknown default:
+            return
         }
         if tool.kind == .eraser && previousKind != .eraser {
             autoReturnToPenAfterErase = true
+            NotificationCenter.default.post(
+                name: .quillmarkUndoRedoFeedback,
+                object: nil,
+                userInfo: ["message": "已切换至橡皮（抬笔自动回画笔）"]
+            )
         } else {
             autoReturnToPenAfterErase = false
+            if tool.kind == .pen && previousKind == .eraser {
+                NotificationCenter.default.post(
+                    name: .quillmarkUndoRedoFeedback,
+                    object: nil,
+                    userInfo: ["message": "已切换回画笔"]
+                )
+            }
         }
     }
 
@@ -517,27 +582,47 @@ final class DocumentSession: ObservableObject {
     func refineStroke(id: UUID, page: Int, points: [InkPoint]) {
         var changed = false
         annotations.updatePage(page) { pageAnnotations in
-            if let index = pageAnnotations.strokes.firstIndex(where: { $0.id == id }) {
+            if let index = pageAnnotations.strokes.lastIndex(where: { $0.id == id }) {
                 pageAnnotations.strokes[index].points = points
                 changed = true
             }
         }
         guard changed else { return }
-        undoStack = undoStack.map { command in
-            if case let .insert(p, stroke, index) = command, stroke.id == id {
+        // Patch only the matching undo entry from the top of the stack (O(1) in normal writing).
+        for idx in undoStack.indices.reversed() {
+            if case let .insert(p, stroke, insertIdx) = undoStack[idx], stroke.id == id {
                 var refined = stroke
                 refined.points = points
-                return .insert(page: p, stroke: refined, index: index)
+                undoStack[idx] = .insert(page: p, stroke: refined, index: insertIdx)
+                break
             }
-            return command
         }
         pageDidChange?(page)
         scheduleSave(contentEdited: true)
     }
 
+    /// Explicitly lifts write protection after the user acknowledges a corrupted-file warning
+    /// (the unreadable original has already been preserved as a `.corrupt-*.json` backup).
+    func acknowledgeCorruptedLoadAndEnableSaving() {
+        isWriteProtected = false
+        loadErrorMessage = nil
+        if hasUnsavedChanges {
+            saveNow()
+        }
+    }
+
+    func retrySaveNow() {
+        retrySaveWork?.cancel()
+        retrySaveWork = nil
+        saveNow()
+    }
+
     func saveNow() {
         saveWork?.cancel()
         saveWork = nil
+        retrySaveWork?.cancel()
+        retrySaveWork = nil
+        guard !isWriteProtected else { return }
         guard hasUnsavedChanges else {
             library.flushPendingWrites()
             return
@@ -549,15 +634,17 @@ final class DocumentSession: ObservableObject {
             try library.saveAnnotations(annotations, for: meta.id, markModified: markModified)
             hasUnsavedChanges = false
             hasPendingContentEdit = false
+            saveErrorMessage = nil
         } catch {
             NSLog("Quillmark: failed to save annotations: \(error)")
+            saveErrorMessage = "批注保存失败（\(error.localizedDescription)），请检查存储空间或点重试。"
         }
     }
 
     /// Background autosave triggered after the 1-second debounce so 120Hz handwriting never stutters.
     private func saveInBackground() {
         saveWork = nil
-        guard hasUnsavedChanges else { return }
+        guard !isWriteProtected, hasUnsavedChanges else { return }
         saveGeneration &+= 1
         let targetGeneration = saveGeneration
         let markModified = hasPendingContentEdit
@@ -567,13 +654,25 @@ final class DocumentSession: ObservableObject {
             guard let self else { return }
             if let error {
                 NSLog("Quillmark: background save failed: \(error)")
+                self.saveErrorMessage = "自动保存失败（\(error.localizedDescription)），将自动重试，请检查存储空间。"
+                self.scheduleSaveRetry()
                 return
             }
             if self.saveGeneration == targetGeneration {
                 self.hasUnsavedChanges = false
                 self.hasPendingContentEdit = false
+                self.saveErrorMessage = nil
             }
         }
+    }
+
+    private func scheduleSaveRetry() {
+        retrySaveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.saveInBackground()
+        }
+        retrySaveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
     private func execute(_ command: Command) {
@@ -609,17 +708,24 @@ final class DocumentSession: ObservableObject {
     }
 
     private func updateFlags() {
-        canUndo = !undoStack.isEmpty
-        canRedo = !redoStack.isEmpty
+        let nextUndo = !undoStack.isEmpty
+        let nextRedo = !redoStack.isEmpty
+        if canUndo != nextUndo { canUndo = nextUndo }
+        if canRedo != nextRedo { canRedo = nextRedo }
     }
 
     private func scheduleSave(contentEdited: Bool) {
+        guard !isWriteProtected else { return }
         hasUnsavedChanges = true
         if contentEdited {
             hasPendingContentEdit = true
         }
         saveGeneration &+= 1
         saveWork?.cancel()
+        if UIApplication.shared.applicationState != .active {
+            saveNow()
+            return
+        }
         let work = DispatchWorkItem { [weak self] in self?.saveInBackground() }
         saveWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
