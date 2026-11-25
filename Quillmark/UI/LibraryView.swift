@@ -126,241 +126,33 @@ struct LibraryView: View {
         }
     }
 
-    var body: some View {
-        ZStack {
-            // Unmount the Library grid while the document workspace covers the screen so 1-second
-            // autosaves never trigger hidden list re-sorts or background PDF thumbnail rasterization.
-            if !tabManager.isWorkspaceVisible {
-                NavigationStack {
-                    VStack(spacing: 0) {
-                        if !library.documents.isEmpty || !library.folders.isEmpty {
-                            folderFilterBar
-                            Divider()
-                        }
-                        if library.needsBackupReminder && !backupReminderDismissed {
-                            backupReminderBanner
-                            Divider()
-                        }
-                        content
-                    }
-                    .navigationTitle("羽签")
-                    .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic),
-                                prompt: "搜索试卷、讲义或文件夹")
-                    .toolbar {
-                        ToolbarItem(placement: .primaryAction) {
-                            HStack(spacing: 10) {
-                                if !tabManager.tabs.isEmpty {
-                                    Button {
-                                        tabManager.showWorkspace()
-                                    } label: {
-                                        HStack(spacing: 5) {
-                                            Image(systemName: "rectangle.stack")
-                                            Text("返回文档 (\(tabManager.tabs.count))")
-                                                .font(.subheadline.weight(.medium))
-                                        }
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(Color.accentColor.opacity(0.16), in: Capsule())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .accessibilityLabel("返回已打开的文档标签页")
-                                }
-                                moreMenu
-                                importMenu
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !tabManager.tabs.isEmpty {
-                WorkspaceView(
-                    tabManager: tabManager,
-                    library: library,
-                    onCreateNotebook: { showNewNotebookSheet = true },
-                    onImportPDF: { triggerFileImport(.pdf) },
-                    onImportHTML: { triggerFileImport(.html) },
-                    onImportURL: {
-                        urlText = ""
-                        showURLPrompt = true
-                    }
-                )
-                .opacity(tabManager.isWorkspaceVisible ? 1 : 0)
-                .allowsHitTesting(tabManager.isWorkspaceVisible)
-            }
-        }
-        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: fileImportKind.allowedTypes) { result in
-            switch result {
-            case .success(let url):
-                handleIncomingFileURL(url)
-            case .failure(let error):
-                errorMessage = error.localizedDescription
-            }
-        }
-        .photosPicker(
-            isPresented: $showPhotoPicker,
-            selection: $selectedPhotoItems,
-            maxSelectionCount: 20,
-            selectionBehavior: .ordered,
-            matching: .images
+    private var deleteDocumentBinding: Binding<Bool> {
+        Binding(
+            get: { pendingDeleteDocument != nil },
+            set: { if !$0 { pendingDeleteDocument = nil } }
         )
-        .onChange(of: selectedPhotoItems) { _, newItems in
-            guard !newItems.isEmpty else { return }
-            let items = newItems
-            selectedPhotoItems = []
-            importSelectedPhotos(items)
-        }
-        .sheet(isPresented: $showNewNotebookSheet) {
-            NewBlankNotebookSheet(
-                folders: library.folders,
-                defaultFolderID: activeFolderIDForCreation
-            ) { title, paper, orientation, pageCount, folderID in
-                createBlankNotebook(title: title, paper: paper, orientation: orientation,
-                                    pageCount: pageCount, folderID: folderID)
-            }
-        }
-        .sheet(item: $exportTargetMeta) { meta in
-            ExportDocumentSheet(
-                meta: meta,
-                library: library,
-                activeSession: tabManager.session(for: meta.id),
-                liveBridge: tabManager.liveWebBridge(for: meta.id)
-            )
-        }
-        .alert("打开网址", isPresented: $showURLPrompt) {
-            TextField("https://example.com", text: $urlText)
-                .keyboardType(.URL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-            Button("取消", role: .cancel) {}
-            Button("导入") {
-                if let url = HTMLImportService.normalizedWebURL(urlText) {
-                    startImport(.web(url))
-                } else {
-                    errorMessage = "网址无效"
-                }
-            }
-        } message: {
-            Text("网页会保存到本地，可离线批注。")
-        }
-        .alert("新建文件夹", isPresented: $showNewFolderPrompt) {
-            TextField("如：九年级几何、期中复习", text: $folderNameDraft)
-            Button("取消", role: .cancel) {}
-            Button("创建") {
-                createFolder(named: folderNameDraft)
-            }
-        }
-        .alert("重命名文件夹", isPresented: renamingFolderBinding) {
-            TextField("文件夹名称", text: $renameDraft)
-            Button("取消", role: .cancel) { renamingFolder = nil }
-            Button("保存") {
-                if let folder = renamingFolder {
-                    do {
-                        try library.renameFolder(folder.id, to: renameDraft)
-                    } catch {
-                        errorMessage = error.localizedDescription
-                    }
-                    renamingFolder = nil
-                }
-            }
-        }
-        .alert("重命名文档", isPresented: renamingDocumentBinding) {
-            TextField("文档标题", text: $renameDraft)
-            Button("取消", role: .cancel) { renamingDocument = nil }
-            Button("保存") {
-                if let doc = renamingDocument {
-                    do {
-                        try library.renameDocument(doc.id, to: renameDraft)
-                    } catch {
-                        errorMessage = error.localizedDescription
-                    }
-                    renamingDocument = nil
-                }
-            }
-        }
-        .alert("操作失败", isPresented: errorBinding) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(errorMessage ?? "")
-        }
-        .alert("完成", isPresented: infoBinding) {
-            Button("好", role: .cancel) {}
-        } message: {
-            Text(infoMessage ?? "")
-        }
-        .alert(clearAlertTitle, isPresented: clearBinding) {
-            Button("取消", role: .cancel) { pendingClear = nil }
-            Button("清空", role: .destructive) {
-                if let target = pendingClear {
-                    library.clearInk(for: target.meta.id, keepTapes: target.keepTapes)
-                    tabManager.reloadFromDisk(id: target.meta.id)
-                    pendingClear = nil
-                }
-            }
-        } message: {
-            Text(clearAlertMessage)
-        }
-        .confirmationDialog(
-            pendingDeleteDocument.map { "永久删除《\($0.title)》？" } ?? "删除文档？",
-            isPresented: Binding(
-                get: { pendingDeleteDocument != nil },
-                set: { if !$0 { pendingDeleteDocument = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("永久删除", role: .destructive) {
-                if let target = pendingDeleteDocument {
-                    tabManager.closeTab(id: target.id)
-                    library.delete(target.id)
-                    pendingDeleteDocument = nil
-                }
-            }
-            Button("取消", role: .cancel) {
-                pendingDeleteDocument = nil
-            }
-        } message: {
-            Text("该文档及其全部手写批注、班级图层与便签将被永久删除，无法撤销。")
-        }
-        .confirmationDialog(
-            "选择备份恢复方式",
-            isPresented: Binding(
-                get: { pendingRestoreURL != nil },
-                set: { if !$0 { pendingRestoreURL = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("跳过已存在文档（默认）") {
-                if let url = pendingRestoreURL {
-                    pendingRestoreURL = nil
-                    restoreBackup(from: url, policy: .automatic)
-                }
-            }
-            Button("覆盖同名原文档（修复或回滚）", role: .destructive) {
-                if let url = pendingRestoreURL {
-                    pendingRestoreURL = nil
-                    restoreBackup(from: url, policy: .replaceExisting)
-                }
-            }
-            Button("保留为独立副本") {
-                if let url = pendingRestoreURL {
-                    pendingRestoreURL = nil
-                    restoreBackup(from: url, policy: .importAsCopy)
-                }
-            }
-            Button("取消", role: .cancel) {
-                pendingRestoreURL = nil
-            }
-        } message: {
-            Text("若书库中已有同 ID 文档，可选择跳过、用备份覆盖修复，或作为新副本导入。")
-        }
-        .alert("数据安全提示", isPresented: Binding(
+    }
+
+    private var restoreBackupBinding: Binding<Bool> {
+        Binding(
+            get: { pendingRestoreURL != nil },
+            set: { if !$0 { pendingRestoreURL = nil } }
+        )
+    }
+
+    private var dataWarningBinding: Binding<Bool> {
+        Binding(
             get: { library.lastDataWarning != nil },
             set: { if !$0 { library.lastDataWarning = nil } }
-        )) {
-            Button("知道了", role: .cancel) { library.lastDataWarning = nil }
-        } message: {
-            Text(library.lastDataWarning ?? "")
-        }
+        )
+    }
+
+    var body: some View {
+        withSafetyDialogs(
+            withImportAndRenameModals(
+                mainStack
+            )
+        )
         .overlay {
             if isImporting { ImportProgressView(text: importStatusText) }
         }
@@ -381,6 +173,246 @@ struct LibraryView: View {
         .onChange(of: library.documents) { _, docs in
             tabManager.syncMetadata(from: docs)
         }
+    }
+
+    private var mainStack: some View {
+        ZStack {
+            // Unmount the Library grid while the document workspace covers the screen so 1-second
+            // autosaves never trigger hidden list re-sorts or background PDF thumbnail rasterization.
+            if !tabManager.isWorkspaceVisible {
+                libraryNavigationStack
+            }
+
+            if !tabManager.tabs.isEmpty {
+                WorkspaceView(
+                    tabManager: tabManager,
+                    library: library,
+                    onCreateNotebook: { showNewNotebookSheet = true },
+                    onImportPDF: { triggerFileImport(.pdf) },
+                    onImportHTML: { triggerFileImport(.html) },
+                    onImportURL: {
+                        urlText = ""
+                        showURLPrompt = true
+                    }
+                )
+                .opacity(tabManager.isWorkspaceVisible ? 1 : 0)
+                .allowsHitTesting(tabManager.isWorkspaceVisible)
+            }
+        }
+    }
+
+    private var libraryNavigationStack: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if !library.documents.isEmpty || !library.folders.isEmpty {
+                    folderFilterBar
+                    Divider()
+                }
+                if library.needsBackupReminder && !backupReminderDismissed {
+                    backupReminderBanner
+                    Divider()
+                }
+                content
+            }
+            .navigationTitle("羽签")
+            .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic),
+                        prompt: "搜索试卷、讲义或文件夹")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    HStack(spacing: 10) {
+                        if !tabManager.tabs.isEmpty {
+                            Button {
+                                tabManager.showWorkspace()
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "rectangle.stack")
+                                    Text("返回文档 (\(tabManager.tabs.count))")
+                                        .font(.subheadline.weight(.medium))
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.accentColor.opacity(0.16), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("返回已打开的文档标签页")
+                        }
+                        moreMenu
+                        importMenu
+                    }
+                }
+            }
+        }
+    }
+
+    private func withImportAndRenameModals<V: View>(_ view: V) -> some View {
+        view
+            .fileImporter(isPresented: $showFileImporter, allowedContentTypes: fileImportKind.allowedTypes) { result in
+                switch result {
+                case .success(let url):
+                    handleIncomingFileURL(url)
+                case .failure(let error):
+                    errorMessage = error.localizedDescription
+                }
+            }
+            .photosPicker(
+                isPresented: $showPhotoPicker,
+                selection: $selectedPhotoItems,
+                maxSelectionCount: 20,
+                selectionBehavior: .ordered,
+                matching: .images
+            )
+            .onChange(of: selectedPhotoItems) { _, newItems in
+                guard !newItems.isEmpty else { return }
+                let items = newItems
+                selectedPhotoItems = []
+                importSelectedPhotos(items)
+            }
+            .sheet(isPresented: $showNewNotebookSheet) {
+                NewBlankNotebookSheet(
+                    folders: library.folders,
+                    defaultFolderID: activeFolderIDForCreation
+                ) { title, paper, orientation, pageCount, folderID in
+                    createBlankNotebook(title: title, paper: paper, orientation: orientation,
+                                        pageCount: pageCount, folderID: folderID)
+                }
+            }
+            .sheet(item: $exportTargetMeta) { meta in
+                ExportDocumentSheet(
+                    meta: meta,
+                    library: library,
+                    activeSession: tabManager.session(for: meta.id),
+                    liveBridge: tabManager.liveWebBridge(for: meta.id)
+                )
+            }
+            .alert("打开网址", isPresented: $showURLPrompt) {
+                TextField("https://example.com", text: $urlText)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("取消", role: .cancel) {}
+                Button("导入") {
+                    if let url = HTMLImportService.normalizedWebURL(urlText) {
+                        startImport(.web(url))
+                    } else {
+                        errorMessage = "网址无效"
+                    }
+                }
+            } message: {
+                Text("网页会保存到本地，可离线批注。")
+            }
+            .alert("新建文件夹", isPresented: $showNewFolderPrompt) {
+                TextField("如：九年级几何、期中复习", text: $folderNameDraft)
+                Button("取消", role: .cancel) {}
+                Button("创建") {
+                    createFolder(named: folderNameDraft)
+                }
+            }
+            .alert("重命名文件夹", isPresented: renamingFolderBinding) {
+                TextField("文件夹名称", text: $renameDraft)
+                Button("取消", role: .cancel) { renamingFolder = nil }
+                Button("保存") {
+                    if let folder = renamingFolder {
+                        do {
+                            try library.renameFolder(folder.id, to: renameDraft)
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
+                        renamingFolder = nil
+                    }
+                }
+            }
+            .alert("重命名文档", isPresented: renamingDocumentBinding) {
+                TextField("文档标题", text: $renameDraft)
+                Button("取消", role: .cancel) { renamingDocument = nil }
+                Button("保存") {
+                    if let doc = renamingDocument {
+                        do {
+                            try library.renameDocument(doc.id, to: renameDraft)
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
+                        renamingDocument = nil
+                    }
+                }
+            }
+    }
+
+    private func withSafetyDialogs<V: View>(_ view: V) -> some View {
+        view
+            .alert("操作失败", isPresented: errorBinding) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(errorMessage ?? "")
+            }
+            .alert("完成", isPresented: infoBinding) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(infoMessage ?? "")
+            }
+            .alert(clearAlertTitle, isPresented: clearBinding) {
+                Button("取消", role: .cancel) { pendingClear = nil }
+                Button("清空", role: .destructive) {
+                    if let target = pendingClear {
+                        library.clearInk(for: target.meta.id, keepTapes: target.keepTapes)
+                        tabManager.reloadFromDisk(id: target.meta.id)
+                        pendingClear = nil
+                    }
+                }
+            } message: {
+                Text(clearAlertMessage)
+            }
+            .confirmationDialog(
+                pendingDeleteDocument.map { "永久删除《\($0.title)》？" } ?? "删除文档？",
+                isPresented: deleteDocumentBinding,
+                titleVisibility: .visible
+            ) {
+                Button("永久删除", role: .destructive) {
+                    if let target = pendingDeleteDocument {
+                        tabManager.closeTab(id: target.id)
+                        library.delete(target.id)
+                        pendingDeleteDocument = nil
+                    }
+                }
+                Button("取消", role: .cancel) {
+                    pendingDeleteDocument = nil
+                }
+            } message: {
+                Text("该文档及其全部手写批注、班级图层与便签将被永久删除，无法撤销。")
+            }
+            .confirmationDialog(
+                "选择备份恢复方式",
+                isPresented: restoreBackupBinding,
+                titleVisibility: .visible
+            ) {
+                Button("跳过已存在文档（默认）") {
+                    if let url = pendingRestoreURL {
+                        pendingRestoreURL = nil
+                        restoreBackup(from: url, policy: .automatic)
+                    }
+                }
+                Button("覆盖同名原文档（修复或回滚）", role: .destructive) {
+                    if let url = pendingRestoreURL {
+                        pendingRestoreURL = nil
+                        restoreBackup(from: url, policy: .replaceExisting)
+                    }
+                }
+                Button("保留为独立副本") {
+                    if let url = pendingRestoreURL {
+                        pendingRestoreURL = nil
+                        restoreBackup(from: url, policy: .importAsCopy)
+                    }
+                }
+                Button("取消", role: .cancel) {
+                    pendingRestoreURL = nil
+                }
+            } message: {
+                Text("若书库中已有同 ID 文档，可选择跳过、用备份覆盖修复，或作为新副本导入。")
+            }
+            .alert("数据安全提示", isPresented: dataWarningBinding) {
+                Button("知道了", role: .cancel) { library.lastDataWarning = nil }
+            } message: {
+                Text(library.lastDataWarning ?? "")
+            }
     }
 
     // MARK: Folder Filter Strip
