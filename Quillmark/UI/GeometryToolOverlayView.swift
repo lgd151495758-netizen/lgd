@@ -3,7 +3,7 @@ import UIKit
 /// Renders the virtual Compass, selected shape edit handles/mini-bar, and magnetic snap indicators
 /// on the iPad screen. Lives as a sibling above `WKWebView` (never inside the web view and never
 /// mirrored in `LiveOverlayState`), so students on the external display only see crisp geometry.
-final class GeometryToolOverlayView: UIView {
+final class GeometryToolOverlayView: UIView, UIGestureRecognizerDelegate {
     var aid: GeometryAid = .none {
         didSet {
             guard aid != oldValue else { return }
@@ -125,11 +125,15 @@ final class GeometryToolOverlayView: UIView {
             NSNumber(value: UITouch.TouchType.indirectPointer.rawValue),
         ]
         fingerTap.allowedTouchTypes = fingerTypes
+        fingerTap.cancelsTouchesInView = false
+        fingerTap.delegate = self
         fingerTap.addTarget(self, action: #selector(handleFingerTap(_:)))
         addGestureRecognizer(fingerTap)
 
         fingerPan.allowedTouchTypes = fingerTypes
         fingerPan.maximumNumberOfTouches = 1
+        fingerPan.cancelsTouchesInView = false
+        fingerPan.delegate = self
         fingerPan.addTarget(self, action: #selector(handleFingerPan(_:)))
         addGestureRecognizer(fingerPan)
     }
@@ -138,9 +142,25 @@ final class GeometryToolOverlayView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer)
+    }
+
     /// Returns `true` only on manipulative control handles/buttons so finger touches elsewhere
-    /// fall straight through to `WKWebView` (scrolling, zooming, page buttons, cover tapes).
+    /// fall straight through to `WKWebView` / `PDFView` (scrolling, zooming, page buttons, cover tapes).
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        // Multi-finger pinch/scroll always passes straight through to the document underneath.
+        if let touches = event?.allTouches {
+            let activeFingers = touches.reduce(into: 0) { count, touch in
+                if touch.type == .direct, touch.phase != .ended, touch.phase != .cancelled {
+                    count += 1
+                }
+            }
+            if activeFingers >= 2 {
+                return false
+            }
+        }
         if let lasso = lassoSelection {
             switch lasso.hitTest(point, in: bounds, includeActionBar: !isTransformingLasso) {
             case .action, .handle, .body:

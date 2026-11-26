@@ -19,10 +19,29 @@ final class InkGestureRecognizer: UIGestureRecognizer {
     weak var inkDelegate: InkInputDelegate?
 
     var allowsFingerDrawing = false {
-        didSet { updateAllowedTouchTypes() }
+        didSet {
+            guard allowsFingerDrawing != oldValue else { return }
+            updateAllowedTouchTypes()
+        }
     }
 
     private var trackedTouch: UITouch?
+
+    /// Returns `true` for scroll-view pan/pinch and WebKit deferring recognizers that must never
+    /// be prevented or deadlocked by `InkGestureRecognizer`.
+    static func isScrollOrZoomGesture(_ recognizer: UIGestureRecognizer) -> Bool {
+        if recognizer is UIPinchGestureRecognizer {
+            return true
+        }
+        if recognizer is UIPanGestureRecognizer, recognizer.view is UIScrollView {
+            return true
+        }
+        let typeName = String(describing: type(of: recognizer))
+        if typeName.contains("Pinch") || typeName.contains("Deferring") {
+            return true
+        }
+        return false
+    }
 
     override init(target: Any?, action: Selector?) {
         super.init(target: target, action: action)
@@ -37,7 +56,22 @@ final class InkGestureRecognizer: UIGestureRecognizer {
         if allowsFingerDrawing {
             types.append(NSNumber(value: UITouch.TouchType.direct.rawValue))
         }
-        allowedTouchTypes = types
+        if allowedTouchTypes != types {
+            allowedTouchTypes = types
+        }
+    }
+
+    /// Cancels any stale or in-flight stroke when the hosting tab deactivates or hides.
+    func cancelIfActive() {
+        guard trackedTouch != nil || state == .began || state == .changed else { return }
+        trackedTouch = nil
+        inkDelegate?.inkCancelled()
+        if state == .began || state == .changed {
+            state = .cancelled
+        } else {
+            isEnabled = false
+            isEnabled = true
+        }
     }
 
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -45,10 +79,28 @@ final class InkGestureRecognizer: UIGestureRecognizer {
     }
 
     override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Never prevent scroll-view pan/pinch recognizers:
+        // - In Apple Pencil mode, pan/pinch ignore `.pencil` via `allowedTouchTypes`, so leaving
+        //   them unblocked guarantees a stale or overlapping Pencil touch can never break zoom.
+        // - In Finger Drawing mode, pan requires 2 fingers and pinch requires 2 fingers, so
+        //   1-finger drawing never scrolls while 2-finger pinch (whose fingers land ~15ms apart)
+        //   stays alive instead of being killed when Finger 1 lands first.
+        if Self.isScrollOrZoomGesture(preventedGestureRecognizer) {
+            return false
+        }
         if let tracked = trackedTouch, tracked.type == .pencil {
             return true
         }
         return allowsFingerDrawing
+    }
+
+    private func activeDirectFingerCount(in event: UIEvent) -> Int {
+        guard let allTouches = event.allTouches else { return 0 }
+        return allTouches.reduce(into: 0) { count, touch in
+            if touch.type == .direct, touch.phase != .ended, touch.phase != .cancelled {
+                count += 1
+            }
+        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
@@ -57,7 +109,8 @@ final class InkGestureRecognizer: UIGestureRecognizer {
             if tracked.phase == .ended || tracked.phase == .cancelled {
                 trackedTouch = nil
             } else {
-                if tracked.type == .direct, touches.contains(where: { $0.type == .direct }) {
+                if tracked.type == .direct,
+                   touches.contains(where: { $0.type == .direct }) || activeDirectFingerCount(in: event) >= 2 {
                     trackedTouch = nil
                     inkDelegate?.inkCancelled()
                     state = .cancelled
@@ -69,8 +122,9 @@ final class InkGestureRecognizer: UIGestureRecognizer {
                 return
             }
         }
+        let hasPencil = touches.contains(where: { $0.type == .pencil })
         let fingers = touches.filter { $0.type == .direct }
-        if fingers.count > 1 {
+        if !hasPencil && (fingers.count > 1 || activeDirectFingerCount(in: event) > 1) {
             state = .failed
             return
         }
@@ -85,6 +139,12 @@ final class InkGestureRecognizer: UIGestureRecognizer {
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
         guard let touch = trackedTouch, touches.contains(touch) else { return }
+        if touch.type == .direct, activeDirectFingerCount(in: event) >= 2 {
+            trackedTouch = nil
+            inkDelegate?.inkCancelled()
+            state = .cancelled
+            return
+        }
         state = .changed
         inkDelegate?.inkMoved(touch, event: event)
     }

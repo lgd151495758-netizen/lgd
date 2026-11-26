@@ -498,9 +498,11 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         pencilInteraction.isEnabled = active
         if active {
             updatePresentationViewport(focusY: nil)
+            applyGestureRules()
             PresentationCenter.shared.setContentSource(self)
             pushPresentationOverlay()
         } else {
+            inkRecognizer.cancelIfActive()
             stopLaserLoop()
             laserEngine.cancel()
             laserFrame = .empty
@@ -681,6 +683,13 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
 
     // MARK: Gestures & Scribble Suppression
 
+    private static func setAllowedTouchTypesIfNeeded(_ types: [NSNumber], on recognizer: UIGestureRecognizer) {
+        guard recognizer.state != .began && recognizer.state != .changed else { return }
+        if recognizer.allowedTouchTypes != types {
+            recognizer.allowedTouchTypes = types
+        }
+    }
+
     /// Pencil never drives the page or iPadOS Scribble. With finger drawing on, the page only
     /// scrolls/zooms with two fingers and ignores one-finger taps.
     private func applyGestureRules() {
@@ -688,18 +697,27 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         inkRecognizer.allowsFingerDrawing = fingerDrawing
         let direct = NSNumber(value: UITouch.TouchType.direct.rawValue)
         let pointer = NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        let scrollTypes = [direct, pointer]
+        let otherTypes = fingerDrawing ? [pointer] : [direct, pointer]
         let scrollView = webView.scrollView
         for recognizer in Self.allGestureRecognizers(in: webView) where recognizer !== inkRecognizer {
-            if recognizer === scrollView.panGestureRecognizer || recognizer === scrollView.pinchGestureRecognizer {
-                recognizer.allowedTouchTypes = [direct, pointer]
-            } else {
-                recognizer.allowedTouchTypes = fingerDrawing ? [pointer] : [direct, pointer]
-            }
+            let isScrollOrZoom = (recognizer === scrollView.panGestureRecognizer
+                || recognizer === scrollView.pinchGestureRecognizer
+                || InkGestureRecognizer.isScrollOrZoomGesture(recognizer))
+            Self.setAllowedTouchTypesIfNeeded(isScrollOrZoom ? scrollTypes : otherTypes, on: recognizer)
         }
-        scrollView.panGestureRecognizer.minimumNumberOfTouches = fingerDrawing ? 2 : 1
+        let targetMinTouches = fingerDrawing ? 2 : 1
+        if scrollView.panGestureRecognizer.minimumNumberOfTouches != targetMinTouches {
+            scrollView.panGestureRecognizer.minimumNumberOfTouches = targetMinTouches
+        }
+        if let pinch = scrollView.pinchGestureRecognizer, !pinch.isEnabled {
+            pinch.isEnabled = true
+        }
         // When fingerDrawing is enabled, inkRecognizer handles single-finger touches directly;
         // otherwise geometryOverlay handles finger controls while passing everything else to webView.
-        geometryOverlay.isUserInteractionEnabled = !fingerDrawing
+        if geometryOverlay.isUserInteractionEnabled != !fingerDrawing {
+            geometryOverlay.isUserInteractionEnabled = !fingerDrawing
+        }
         suppressSystemScribble(in: webView)
     }
 
@@ -747,7 +765,11 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        false
+        if gestureRecognizer === inkRecognizer,
+           InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer) {
+            return true
+        }
+        return false
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
@@ -758,6 +780,11 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === inkRecognizer else { return false }
+        // Never deadlock finger pinch-to-zoom, scroll-view pan, or WebKit deferring recognizers
+        // waiting for Pencil-only inkRecognizer to fail.
+        if InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer) {
+            return false
+        }
         let typeName = String(describing: type(of: otherGestureRecognizer))
         if typeName.contains("Scribble") {
             return true

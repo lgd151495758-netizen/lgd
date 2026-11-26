@@ -102,6 +102,61 @@ final class EfficiencyAndStabilityTests: XCTestCase {
         XCTAssertTrue(scratchMultiFingerTaps.isEmpty, "Scratchpad canvas must not attach multi-finger tap undo/redo gestures")
     }
 
+    @MainActor
+    func testPinchToZoomIsNeverBlockedOrDeadlockedByInkOrOverlayRecognizers() throws {
+        let scrollView = UIScrollView(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        let pinch = UIPinchGestureRecognizer()
+        scrollView.addGestureRecognizer(pinch)
+        let scrollPan = scrollView.panGestureRecognizer
+        let plainTap = UITapGestureRecognizer()
+
+        XCTAssertTrue(InkGestureRecognizer.isScrollOrZoomGesture(pinch))
+        XCTAssertTrue(InkGestureRecognizer.isScrollOrZoomGesture(scrollPan))
+        XCTAssertFalse(InkGestureRecognizer.isScrollOrZoomGesture(plainTap))
+
+        let ink = InkGestureRecognizer(target: nil, action: nil)
+        ink.allowsFingerDrawing = false
+        XCTAssertFalse(ink.canPrevent(pinch), "Ink recognizer must never prevent pinch-to-zoom in Pencil mode")
+        XCTAssertFalse(ink.canPrevent(scrollPan), "Ink recognizer must never prevent scroll pan in Pencil mode")
+
+        ink.allowsFingerDrawing = true
+        XCTAssertFalse(ink.canPrevent(pinch), "Ink recognizer must never kill pinch-to-zoom in Finger Drawing mode")
+        XCTAssertFalse(ink.canPrevent(scrollPan), "Ink recognizer must never kill 2-finger scroll in Finger Drawing mode")
+        XCTAssertTrue(ink.canPrevent(plainTap), "Ink recognizer still prevents 1-finger taps in Finger Drawing mode")
+
+        // Verify EditorViewController delegate never deadlocks a pinch gesture even if pinch has default `.pencil` touch type.
+        let pdfMeta = try library.createDocument(title: "pinch-pdf", pdfData: makePDFData(),
+                                                 layout: .pdf, sourceKind: .pdfFile, sourceURL: "p.pdf", stagedSource: nil)
+        let pdfSession = DocumentSession(meta: pdfMeta, library: library, tool: ToolSettings())
+        let pdfEditor = EditorViewController(session: pdfSession)
+        pdfEditor.loadViewIfNeeded()
+        let pdfInk = try XCTUnwrap((pdfEditor.view.gestureRecognizers ?? []).first { $0 is InkGestureRecognizer })
+
+        // Simulate a newly-created PDFView pinch recognizer whose default allowedTouchTypes still includes `.pencil`.
+        let simulatedPDFPinch = UIPinchGestureRecognizer()
+        simulatedPDFPinch.allowedTouchTypes = [
+            NSNumber(value: UITouch.TouchType.direct.rawValue),
+            NSNumber(value: UITouch.TouchType.pencil.rawValue),
+        ]
+        pdfEditor.pdfView.addGestureRecognizer(simulatedPDFPinch)
+        XCTAssertFalse(
+            pdfEditor.gestureRecognizer(pdfInk, shouldBeRequiredToFailBy: simulatedPDFPinch),
+            "PDF pinch recognizer must never wait for Pencil-only inkRecognizer to fail"
+        )
+        XCTAssertTrue(
+            pdfEditor.gestureRecognizer(pdfInk, shouldRecognizeSimultaneouslyWith: simulatedPDFPinch),
+            "PDF pinch recognizer must recognize simultaneously with inkRecognizer"
+        )
+
+        // Verify GeometryToolOverlayView recognizes simultaneously with pinch gestures.
+        let overlay = GeometryToolOverlayView(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        let overlayRecognizers = overlay.gestureRecognizers ?? []
+        XCTAssertFalse(overlayRecognizers.isEmpty)
+        for rec in overlayRecognizers {
+            XCTAssertTrue(overlay.gestureRecognizer(rec, shouldRecognizeSimultaneouslyWith: pinch))
+        }
+    }
+
     // MARK: 3. Multi-Tab LRU Memory Hibernation & Seamless Revival
 
     @MainActor

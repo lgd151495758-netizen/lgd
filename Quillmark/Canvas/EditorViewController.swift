@@ -339,6 +339,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 self.pdfView.go(to: page)
             }
             self.updateActiveDocumentPageIndex()
+            self.applyGestureRules()
             self.recordCurrentViewport()
             PresentationCenter.shared.requestFrameRefresh()
         }
@@ -524,6 +525,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         pencilInteraction.isEnabled = active
         if active {
             updatePresentationViewport(focusY: nil)
+            applyGestureRules()
             PresentationCenter.shared.setContentSource(self)
             pushPresentationOverlay()
             if hasRestoredViewport, pdfView.bounds.width > 0,
@@ -531,6 +533,7 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
                 navigatePDFToPage(pendingPage)
             }
         } else {
+            inkRecognizer.cancelIfActive()
             stopLaserLoop()
             laserEngine.cancel()
             laserFrame = .empty
@@ -655,28 +658,62 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
 
     // MARK: Gestures & Scribble Suppression
 
+    private static func setAllowedTouchTypesIfNeeded(_ types: [NSNumber], on recognizer: UIGestureRecognizer) {
+        guard recognizer.state != .began && recognizer.state != .changed else { return }
+        if recognizer.allowedTouchTypes != types {
+            recognizer.allowedTouchTypes = types
+        }
+    }
+
+    private func ensurePDFZoomBounds() {
+        guard pdfView.bounds.width > 0, pdfView.bounds.height > 0, pdfView.document != nil else { return }
+        let fit = pdfView.scaleFactorForSizeToFit
+        guard fit.isFinite, fit > 0 else { return }
+        let desiredMin = min(fit * 0.5, 0.5)
+        let desiredMax = max(fit * 5.0, 5.0)
+        if !pdfView.minScaleFactor.isFinite || pdfView.minScaleFactor <= 0 || pdfView.minScaleFactor > desiredMin * 1.05 {
+            pdfView.minScaleFactor = desiredMin
+        }
+        if !pdfView.maxScaleFactor.isFinite || pdfView.maxScaleFactor <= pdfView.minScaleFactor || pdfView.maxScaleFactor < desiredMax * 0.95 {
+            pdfView.maxScaleFactor = desiredMax
+        }
+    }
+
     private func applyGestureRules() {
         let fingerDrawing = session.tool.fingerDrawing
         inkRecognizer.allowsFingerDrawing = fingerDrawing
-        tapeTapRecognizer.isEnabled = !fingerDrawing
-        geometryOverlay.isUserInteractionEnabled = !fingerDrawing
+        if tapeTapRecognizer.isEnabled != !fingerDrawing {
+            tapeTapRecognizer.isEnabled = !fingerDrawing
+        }
+        if geometryOverlay.isUserInteractionEnabled != !fingerDrawing {
+            geometryOverlay.isUserInteractionEnabled = !fingerDrawing
+        }
 
         let direct = NSNumber(value: UITouch.TouchType.direct.rawValue)
         let pointer = NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)
+        let scrollTypes = [direct, pointer]
+        let otherTypes = fingerDrawing ? [pointer] : [direct, pointer]
         let scrollView = pdfView.firstDescendant(of: UIScrollView.self)
 
         for recognizer in Self.allGestureRecognizers(in: pdfView) where recognizer !== inkRecognizer {
-            if let scrollView,
-               recognizer === scrollView.panGestureRecognizer || recognizer === scrollView.pinchGestureRecognizer {
-                recognizer.allowedTouchTypes = [direct, pointer]
-            } else {
-                recognizer.allowedTouchTypes = fingerDrawing ? [pointer] : [direct, pointer]
-            }
+            let isScrollOrZoom = (scrollView != nil &&
+                (recognizer === scrollView!.panGestureRecognizer || recognizer === scrollView!.pinchGestureRecognizer))
+                || InkGestureRecognizer.isScrollOrZoomGesture(recognizer)
+            Self.setAllowedTouchTypesIfNeeded(isScrollOrZoom ? scrollTypes : otherTypes, on: recognizer)
         }
         if let scrollView {
-            scrollView.panGestureRecognizer.minimumNumberOfTouches = fingerDrawing ? 2 : 1
-            scrollView.delaysContentTouches = false
+            let targetMinTouches = fingerDrawing ? 2 : 1
+            if scrollView.panGestureRecognizer.minimumNumberOfTouches != targetMinTouches {
+                scrollView.panGestureRecognizer.minimumNumberOfTouches = targetMinTouches
+            }
+            if let pinch = scrollView.pinchGestureRecognizer, !pinch.isEnabled {
+                pinch.isEnabled = true
+            }
+            if scrollView.delaysContentTouches {
+                scrollView.delaysContentTouches = false
+            }
         }
+        ensurePDFZoomBounds()
         suppressSystemScribble(in: pdfView)
     }
 
@@ -725,6 +762,10 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
         if gestureRecognizer === tapeTapRecognizer {
             return true
         }
+        if gestureRecognizer === inkRecognizer,
+           InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer) {
+            return true
+        }
         return false
     }
 
@@ -736,6 +777,10 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === inkRecognizer else { return false }
+        // Never deadlock finger pinch-to-zoom or scroll-view pan waiting for Pencil-only inkRecognizer to fail.
+        if InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer) {
+            return false
+        }
         let typeName = String(describing: type(of: otherGestureRecognizer))
         if typeName.contains("Scribble") {
             return true
