@@ -144,7 +144,7 @@ final class GeometryToolOverlayView: UIView, UIGestureRecognizerDelegate {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-        InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer)
+        InkGestureRecognizer.isPinchGesture(otherGestureRecognizer)
     }
 
     /// Returns `true` only on manipulative control handles/buttons so finger touches elsewhere

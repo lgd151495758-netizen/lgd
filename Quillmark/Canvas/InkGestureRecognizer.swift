@@ -27,17 +27,45 @@ final class InkGestureRecognizer: UIGestureRecognizer {
 
     private var trackedTouch: UITouch?
 
-    /// Returns `true` for scroll-view pan/pinch and WebKit deferring recognizers that must never
-    /// be prevented or deadlocked by `InkGestureRecognizer`.
-    static func isScrollOrZoomGesture(_ recognizer: UIGestureRecognizer) -> Bool {
+    /// `true` while actively tracking an Apple Pencil touch (must strictly lock out scroll/zoom
+    /// so neither the Pencil nor a resting palm can ever drag the page mid-stroke).
+    var isTrackingPencil: Bool {
+        guard let tracked = trackedTouch, tracked.type == .pencil else { return false }
+        return tracked.phase != .ended && tracked.phase != .cancelled
+    }
+
+    /// Returns `true` for 2-finger pinch recognizers (which a single Apple Pencil can never trigger).
+    static func isPinchGesture(_ recognizer: UIGestureRecognizer) -> Bool {
         if recognizer is UIPinchGestureRecognizer {
+            return true
+        }
+        return String(describing: type(of: recognizer)).contains("Pinch")
+    }
+
+    /// Returns `true` for scroll-view pan/pinch and WebKit deferring recognizers when configuring
+    /// `allowedTouchTypes` (keeping finger scrolling/zooming enabled without `.pencil`).
+    static func isScrollOrZoomGesture(_ recognizer: UIGestureRecognizer) -> Bool {
+        if isPinchGesture(recognizer) {
             return true
         }
         if recognizer is UIPanGestureRecognizer, recognizer.view is UIScrollView {
             return true
         }
-        let typeName = String(describing: type(of: recognizer))
-        if typeName.contains("Pinch") || typeName.contains("Deferring") {
+        if String(describing: type(of: recognizer)).contains("Deferring") {
+            return true
+        }
+        return false
+    }
+
+    /// Returns `true` for recognizers that require >= 2 fingers (pinch or 2-finger scroll pan),
+    /// safe to coexist with Finger Drawing until the 2nd finger cancels the tentative stroke.
+    static func isTwoFingerScrollOrPinchGesture(_ recognizer: UIGestureRecognizer) -> Bool {
+        if isPinchGesture(recognizer) {
+            return true
+        }
+        if let pan = recognizer as? UIPanGestureRecognizer,
+           pan.view is UIScrollView,
+           pan.minimumNumberOfTouches >= 2 {
             return true
         }
         return false
@@ -79,17 +107,26 @@ final class InkGestureRecognizer: UIGestureRecognizer {
     }
 
     override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
-        // Never prevent scroll-view pan/pinch recognizers:
-        // - In Apple Pencil mode, pan/pinch ignore `.pencil` via `allowedTouchTypes`, so leaving
-        //   them unblocked guarantees a stale or overlapping Pencil touch can never break zoom.
-        // - In Finger Drawing mode, pan requires 2 fingers and pinch requires 2 fingers, so
-        //   1-finger drawing never scrolls while 2-finger pinch (whose fingers land ~15ms apart)
-        //   stays alive instead of being killed when Finger 1 lands first.
-        if Self.isScrollOrZoomGesture(preventedGestureRecognizer) {
-            return false
+        if let tracked = trackedTouch {
+            // Self-heal if UIKit ended/cancelled the tracked touch without firing reset/touchesEnded.
+            if tracked.phase == .ended || tracked.phase == .cancelled {
+                trackedTouch = nil
+                inkDelegate?.inkCancelled()
+                if state == .began || state == .changed {
+                    state = .cancelled
+                }
+            } else if tracked.type == .pencil {
+                // Critical palm rejection & scroll lock: while Apple Pencil is writing, prevent ALL
+                // other recognizers (including scrollView pan & pinch) so resting hand/palm or
+                // Pencil can NEVER drag the page mid-stroke.
+                return true
+            }
         }
-        if let tracked = trackedTouch, tracked.type == .pencil {
-            return true
+        // When NOT actively writing with Apple Pencil:
+        // Never prevent 2-finger pinch or 2-finger scroll pan (fixes pinch failure in Finger Drawing mode
+        // when Finger 1 lands ~15ms before Finger 2).
+        if Self.isTwoFingerScrollOrPinchGesture(preventedGestureRecognizer) {
+            return false
         }
         return allowsFingerDrawing
     }

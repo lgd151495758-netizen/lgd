@@ -110,21 +110,28 @@ final class EfficiencyAndStabilityTests: XCTestCase {
         let scrollPan = scrollView.panGestureRecognizer
         let plainTap = UITapGestureRecognizer()
 
+        XCTAssertTrue(InkGestureRecognizer.isPinchGesture(pinch))
+        XCTAssertFalse(InkGestureRecognizer.isPinchGesture(scrollPan))
         XCTAssertTrue(InkGestureRecognizer.isScrollOrZoomGesture(pinch))
         XCTAssertTrue(InkGestureRecognizer.isScrollOrZoomGesture(scrollPan))
         XCTAssertFalse(InkGestureRecognizer.isScrollOrZoomGesture(plainTap))
 
         let ink = InkGestureRecognizer(target: nil, action: nil)
+        // Idle in Pencil mode: never blocks pinch or scroll.
         ink.allowsFingerDrawing = false
-        XCTAssertFalse(ink.canPrevent(pinch), "Ink recognizer must never prevent pinch-to-zoom in Pencil mode")
-        XCTAssertFalse(ink.canPrevent(scrollPan), "Ink recognizer must never prevent scroll pan in Pencil mode")
+        XCTAssertFalse(ink.canPrevent(pinch), "Idle ink recognizer must never prevent pinch-to-zoom")
+        XCTAssertFalse(ink.canPrevent(scrollPan), "Idle ink recognizer must never prevent scroll pan")
 
+        // Finger Drawing mode (2-finger scroll pan): never kills 2-finger pinch or 2-finger scroll,
+        // while still blocking 1-finger pan/tap.
         ink.allowsFingerDrawing = true
+        scrollPan.minimumNumberOfTouches = 2
         XCTAssertFalse(ink.canPrevent(pinch), "Ink recognizer must never kill pinch-to-zoom in Finger Drawing mode")
         XCTAssertFalse(ink.canPrevent(scrollPan), "Ink recognizer must never kill 2-finger scroll in Finger Drawing mode")
         XCTAssertTrue(ink.canPrevent(plainTap), "Ink recognizer still prevents 1-finger taps in Finger Drawing mode")
 
-        // Verify EditorViewController delegate never deadlocks a pinch gesture even if pinch has default `.pencil` touch type.
+        // Verify EditorViewController delegate never deadlocks pinch, AND strictly prevents
+        // simultaneous scrollView pan during Apple Pencil mode (critical for palm rejection!).
         let pdfMeta = try library.createDocument(title: "pinch-pdf", pdfData: makePDFData(),
                                                  layout: .pdf, sourceKind: .pdfFile, sourceURL: "p.pdf", stagedSource: nil)
         let pdfSession = DocumentSession(meta: pdfMeta, library: library, tool: ToolSettings())
@@ -143,17 +150,26 @@ final class EfficiencyAndStabilityTests: XCTestCase {
             pdfEditor.gestureRecognizer(pdfInk, shouldBeRequiredToFailBy: simulatedPDFPinch),
             "PDF pinch recognizer must never wait for Pencil-only inkRecognizer to fail"
         )
+        // In Apple Pencil mode, inkRecognizer must NOT run simultaneously with scroll pan (palm rejection!).
+        scrollPan.minimumNumberOfTouches = 1
+        XCTAssertFalse(
+            pdfEditor.gestureRecognizer(pdfInk, shouldRecognizeSimultaneouslyWith: scrollPan),
+            "Apple Pencil writing must NEVER run simultaneously with scrollView pan"
+        )
+        // In Finger Drawing mode (with no Pencil active), 2-finger pinch can coexist until 2nd finger cancels ink.
+        pdfSession.tool.fingerDrawing = true
         XCTAssertTrue(
             pdfEditor.gestureRecognizer(pdfInk, shouldRecognizeSimultaneouslyWith: simulatedPDFPinch),
-            "PDF pinch recognizer must recognize simultaneously with inkRecognizer"
+            "Finger Drawing mode allows 2-finger pinch to start cleanly"
         )
 
-        // Verify GeometryToolOverlayView recognizes simultaneously with pinch gestures.
+        // Verify GeometryToolOverlayView recognizes simultaneously with pinch gestures (not 1-finger pan).
         let overlay = GeometryToolOverlayView(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
         let overlayRecognizers = overlay.gestureRecognizers ?? []
         XCTAssertFalse(overlayRecognizers.isEmpty)
         for rec in overlayRecognizers {
             XCTAssertTrue(overlay.gestureRecognizer(rec, shouldRecognizeSimultaneouslyWith: pinch))
+            XCTAssertFalse(overlay.gestureRecognizer(rec, shouldRecognizeSimultaneouslyWith: scrollPan))
         }
     }
 

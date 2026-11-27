@@ -765,8 +765,13 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        // Never run simultaneously with scrollView.panGestureRecognizer while writing with Apple Pencil
+        // (doing so allows a resting palm or Pencil to scroll the page underneath active strokes!).
+        // Only allow 2-finger pinch/scroll coexistence in Finger Drawing mode when not using Pencil.
         if gestureRecognizer === inkRecognizer,
-           InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer) {
+           session.tool.fingerDrawing,
+           !inkRecognizer.isTrackingPencil,
+           InkGestureRecognizer.isTwoFingerScrollOrPinchGesture(otherGestureRecognizer) {
             return true
         }
         return false
@@ -780,9 +785,9 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === inkRecognizer else { return false }
-        // Never deadlock finger pinch-to-zoom, scroll-view pan, or WebKit deferring recognizers
-        // waiting for Pencil-only inkRecognizer to fail.
-        if InkGestureRecognizer.isScrollOrZoomGesture(otherGestureRecognizer) {
+        // A 2-finger pinch recognizer can never be triggered by a single Apple Pencil;
+        // never deadlock pinch waiting for Pencil-only inkRecognizer to fail.
+        if InkGestureRecognizer.isPinchGesture(otherGestureRecognizer) {
             return false
         }
         let typeName = String(describing: type(of: otherGestureRecognizer))
