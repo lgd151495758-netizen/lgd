@@ -22,6 +22,7 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
     var onPlacementsChanged: (() -> Void)?
     var onToggleTape: ((UUID) -> Void)?
     var onUserActivity: (() -> Void)?
+    var onImageTapGuarded: (() -> Void)?
 
     /// What the page currently shows, to send only differences.
     private var rendered: [UUID: InkStroke] = [:]
@@ -243,6 +244,8 @@ final class WebInkBridge: NSObject, WKScriptMessageHandler {
             }
         case "activity":
             onUserActivity?()
+        case "imageTapGuarded":
+            onImageTapGuarded?()
         default:
             break
         }

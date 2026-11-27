@@ -254,8 +254,177 @@
       layout();
       return JSON.parse(lastReport || '{}');
     },
-    count: function () { return strokes.size; }
+    count: function () { return strokes.size; },
+    setImageTapGuard: function (enabled) {
+      imageTapGuardEnabled = !!enabled;
+      lastGuardTap = { el: null, time: 0, x: 0, y: 0 };
+    }
   };
+
+  // Guard zoomable images & large static diagrams against accidental single-tap lightbox pops
+  // during iPad lectures, while leaving all buttons, links, accordions, quiz controls, cover
+  // tapes, interactive widgets, and open modal close actions 100% single-tap responsive.
+  var imageTapGuardEnabled = true;
+  var DOUBLE_TAP_MS = 420;
+  var DOUBLE_TAP_DIST_SQ = 56 * 56;
+  var lastGuardTap = { el: null, time: 0, x: 0, y: 0 };
+  var lastGuardHintAt = 0;
+
+  var INTERACTIVE_ANCESTOR_SELECTOR =
+    'button, a[href], input, select, textarea, summary, label, option, canvas, video, audio, ' +
+    '[role="button"], [role="link"], [role="tab"], [role="switch"], [role="checkbox"], ' +
+    '[role="radio"], [role="menuitem"], [role="option"], [role="slider"], [role="combobox"], ' +
+    '[data-qm-single-tap="true"]';
+  var ZOOM_CLASS_RE = /\b(zoom|lightbox|modal|preview|fig|figure|diagram|img|image|photo|pic|origin|vector|compare|media)/i;
+  var CONTROL_CLASS_RE = /\b(btn|button|tab|toggle|collapse|accordion|header|toolbar|nav|menu|opt|option|choice|chip|step|close|dismiss|action)\b/i;
+
+  function elementOf(node) {
+    if (!node) { return null; }
+    return node.nodeType === 1 ? node : node.parentElement;
+  }
+
+  function isInsideOpenOverlay(el) {
+    var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+    var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+    var cur = el;
+    while (cur && cur !== document.body && cur !== document.documentElement) {
+      var role = cur.getAttribute ? cur.getAttribute('role') : null;
+      if (role === 'dialog' || role === 'alertdialog' ||
+          (cur.getAttribute && cur.getAttribute('aria-modal') === 'true') ||
+          (cur.tagName === 'DIALOG' && cur.hasAttribute('open'))) {
+        return true;
+      }
+      var style = getComputedStyle(cur);
+      if (style.position === 'fixed' && vw > 0 && vh > 0) {
+        var r = cur.getBoundingClientRect();
+        if (r.width >= vw * 0.55 && r.height >= vh * 0.55) {
+          return true;
+        }
+      }
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
+  function hasZoomCues(el) {
+    var cur = el;
+    for (var depth = 0; cur && depth < 3 && cur !== document.body && cur !== document.documentElement; depth++) {
+      var tag = cur.tagName;
+      if (tag === 'SECTION' || tag === 'ARTICLE' || tag === 'MAIN') { break; }
+      if (cur.hasAttribute && (cur.hasAttribute('onclick') || cur.hasAttribute('data-zoom') || cur.hasAttribute('data-lightbox'))) {
+        return true;
+      }
+      var cursor = getComputedStyle(cur).cursor;
+      if (cursor === 'zoom-in' || cursor === 'pointer') {
+        return true;
+      }
+      var cls = typeof cur.className === 'string' ? cur.className : (cur.getAttribute ? (cur.getAttribute('class') || '') : '');
+      var id = cur.id || '';
+      if (tag === 'FIGURE' || ZOOM_CLASS_RE.test(cls) || ZOOM_CLASS_RE.test(id)) {
+        return true;
+      }
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
+  function isInteractiveSVGSubcontrol(target, svg) {
+    var cur = target;
+    while (cur && cur !== svg) {
+      if (cur.hasAttribute && (cur.hasAttribute('onclick') || cur.getAttribute('role') === 'button' || cur.hasAttribute('data-interactive'))) {
+        return true;
+      }
+      var cursor = getComputedStyle(cur).cursor;
+      if (cursor === 'grab' || cursor === 'grabbing' || cursor === 'move' ||
+          cursor === 'ew-resize' || cursor === 'ns-resize' || cursor === 'nwse-resize' || cursor === 'nesw-resize') {
+        return true;
+      }
+      cur = cur.parentElement;
+    }
+    return false;
+  }
+
+  function findGuardedMediaTarget(rawTarget) {
+    var el = elementOf(rawTarget);
+    if (!el || el === layer || layer.contains(el)) { return null; }
+    if (el.closest && el.closest(INTERACTIVE_ANCESTOR_SELECTOR)) { return null; }
+    if (isInsideOpenOverlay(el)) { return null; }
+
+    // 1. Direct <img> or <picture> (skip tiny icons < 48px).
+    var img = el.tagName === 'IMG' ? el : (el.closest ? el.closest('picture') : null);
+    if (img) {
+      var ir = img.getBoundingClientRect();
+      if (ir.width >= 48 || ir.height >= 48) { return img; }
+      return null;
+    }
+
+    // 2. Large diagram <svg> (skip KaTeX/MathJax math glyphs, tiny icons, and interactive SVG sub-controls).
+    var svg = el.closest ? el.closest('svg') : null;
+    if (svg && !layer.contains(svg)) {
+      if (svg.closest && svg.closest('.katex, .MathJax, mjx-container')) { return null; }
+      var sr = svg.getBoundingClientRect();
+      if (sr.width >= 72 && sr.height >= 56 && !isInteractiveSVGSubcontrol(el, svg)) {
+        var svgCursor = getComputedStyle(svg).cursor;
+        if (svgCursor === 'crosshair' || svgCursor === 'grab' || svgCursor === 'grabbing' || svgCursor === 'move') {
+          return null;
+        }
+        if (hasZoomCues(svg)) {
+          return svg;
+        }
+      }
+      return null;
+    }
+
+    // 3. Direct figure/image wrapper padding (e.g. <div class="fig-box" onclick="..."> around an <img>/<svg>).
+    if (el.tagName !== 'BODY' && el.tagName !== 'HTML') {
+      var cls = typeof el.className === 'string' ? el.className : '';
+      var id = el.id || '';
+      if (!CONTROL_CLASS_RE.test(cls) && !CONTROL_CLASS_RE.test(id) &&
+          !el.querySelector(INTERACTIVE_ANCESTOR_SELECTOR)) {
+        var media = el.querySelector('img, svg');
+        if (media && !layer.contains(media)) {
+          var mr = media.getBoundingClientRect();
+          var textLen = (el.textContent || '').trim().length;
+          var style = getComputedStyle(el);
+          if ((mr.width >= 48 || mr.height >= 48) && textLen <= 80 &&
+              (el.tagName === 'FIGURE' || style.cursor === 'zoom-in' ||
+               (style.cursor === 'pointer' && (ZOOM_CLASS_RE.test(cls) || ZOOM_CLASS_RE.test(id))))) {
+            return el;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function handleImageTapGuard(e) {
+    if (!imageTapGuardEnabled || e.defaultPrevented) { return; }
+    var guarded = findGuardedMediaTarget(e.target);
+    if (!guarded) { return; }
+
+    var now = Date.now();
+    var x = typeof e.clientX === 'number' ? e.clientX : 0;
+    var y = typeof e.clientY === 'number' ? e.clientY : 0;
+    var dx = x - lastGuardTap.x;
+    var dy = y - lastGuardTap.y;
+    var isDoubleTap = (lastGuardTap.el === guarded) &&
+      ((now - lastGuardTap.time) <= DOUBLE_TAP_MS) &&
+      ((dx * dx + dy * dy) <= DOUBLE_TAP_DIST_SQ);
+
+    if (isDoubleTap) {
+      lastGuardTap = { el: null, time: 0, x: 0, y: 0 };
+      return;
+    }
+
+    lastGuardTap = { el: guarded, time: now, x: x, y: y };
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (hasZoomCues(guarded) && (now - lastGuardHintAt) > 1200) {
+      lastGuardHintAt = now;
+      post({ type: 'imageTapGuarded' });
+    }
+  }
+  window.addEventListener('click', handleImageTapGuard, { capture: true });
 
   // Re-place ink whenever the page may have moved. Mutations of our own layer are ignored.
   new MutationObserver(function (records) {

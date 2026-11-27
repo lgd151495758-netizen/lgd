@@ -198,4 +198,90 @@ final class WebLiveTests: XCTestCase {
             arguments: [:], in: nil, contentWorld: .page) as? Int
         XCTAssertEqual(pathCount, 2, "shaded geometric stroke must render both fill and outline SVG paths")
     }
+
+    func testImageTapGuardBlocksSingleTapAllowsDoubleTapAndNeverBlocksButtons() async throws {
+        let pageHTML = """
+        <!doctype html><html><head><meta charset="utf-8"><style>
+        body { margin: 0; }
+        .zoom-img { width: 200px; height: 140px; cursor: zoom-in; display: block; }
+        .fig-box { width: 220px; height: 160px; cursor: pointer; display: block; }
+        #lightbox { display: none; position: fixed; left: 0; top: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.8); }
+        #lightbox.open { display: block; }
+        </style></head><body>
+        <button id="iconBtn" onclick="window.__btnClicks = (window.__btnClicks || 0) + 1">
+          <svg width="24" height="24" viewBox="0 0 24 24"><circle id="btnIcon" cx="12" cy="12" r="10"/></svg>
+          切换原图
+        </button>
+        <div id="stepCard" class="step-card" onclick="window.__stepClicks = (window.__stepClicks || 0) + 1">步骤 1</div>
+        <img id="zoomImg" class="zoom-img"
+             src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+             onclick="window.__imgZooms = (window.__imgZooms || 0) + 1; document.getElementById('lightbox').classList.add('open')">
+        <div class="fig-box" onclick="window.__svgZooms = (window.__svgZooms || 0) + 1">
+          <svg id="diagramSvg" width="200" height="140" viewBox="0 0 200 140">
+            <rect id="diagramRect" x="10" y="10" width="180" height="120" fill="#eee"/>
+          </svg>
+        </div>
+        <div id="lightbox" onclick="window.__lbCloses = (window.__lbCloses || 0) + 1; this.classList.remove('open')">
+          <img id="lbImg" class="zoom-img"
+               src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">
+        </div>
+        </body></html>
+        """
+        try await load(pageHTML)
+
+        var guardHintCount = 0
+        bridge.onImageTapGuarded = { guardHintCount += 1 }
+
+        // 1. Normal buttons (including clicking an <svg> icon inside a <button>) & step cards stay single-tap!
+        try await run("""
+        document.getElementById('btnIcon').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 20, clientY: 20 }));
+        document.getElementById('stepCard').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 20, clientY: 60 }));
+        """)
+        let btnClicks = try await bridge.webView.callAsyncJavaScript("return window.__btnClicks || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        let stepClicks = try await bridge.webView.callAsyncJavaScript("return window.__stepClicks || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        XCTAssertEqual(btnClicks, 1, "button with nested SVG icon must still fire on single tap")
+        XCTAssertEqual(stepClicks, 1, "text step-card button must still fire on single tap")
+
+        // 2. Single tap on zoomable <img> is intercepted (no accidental lightbox pop) and fires iPad hint.
+        try await run("""
+        document.getElementById('zoomImg').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 100, clientY: 120 }));
+        """)
+        let imgZoomAfterSingle = try await bridge.webView.callAsyncJavaScript("return window.__imgZooms || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        XCTAssertEqual(imgZoomAfterSingle, 0, "single tap on zoomable image must be blocked to prevent accidental zoom")
+        let hintReceived = await waitUntil { guardHintCount >= 1 }
+        XCTAssertTrue(hintReceived, "single tap on zoomable image should notify host for subtle iPad-only toast")
+
+        // 3. Rapid double-tap (reset guard timer first for CI determinism) opens the lightbox natively.
+        try await run("""
+        window.__qm.setImageTapGuard(true);
+        var img = document.getElementById('zoomImg');
+        img.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 100, clientY: 120 }));
+        window.__imgZoomBetweenTaps = window.__imgZooms || 0;
+        img.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 104, clientY: 122 }));
+        """)
+        let imgZoomBetween = try await bridge.webView.callAsyncJavaScript("return window.__imgZoomBetweenTaps || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        let imgZoomAfterDouble = try await bridge.webView.callAsyncJavaScript("return window.__imgZooms || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        XCTAssertEqual(imgZoomBetween, 0, "first tap of double-tap must remain blocked")
+        XCTAssertEqual(imgZoomAfterDouble, 1, "second tap of double-tap on zoomable image must open lightbox")
+
+        // 4. Single tap on the enlarged <img> inside the open fullscreen lightbox closes it immediately!
+        try await run("""
+        document.getElementById('lbImg').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 100, clientY: 100 }));
+        """)
+        let lbCloses = try await bridge.webView.callAsyncJavaScript("return window.__lbCloses || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        XCTAssertEqual(lbCloses, 1, "single tap inside an open lightbox must dismiss it immediately")
+
+        // 5. Large diagram <svg> inside clickable .fig-box: single tap blocked, rapid double-tap opens!
+        try await run("""
+        window.__qm.setImageTapGuard(true);
+        var rect = document.getElementById('diagramRect');
+        rect.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 110, clientY: 300 }));
+        window.__svgZoomAfterFirst = window.__svgZooms || 0;
+        rect.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, clientX: 114, clientY: 302 }));
+        """)
+        let svgZoomAfterFirst = try await bridge.webView.callAsyncJavaScript("return window.__svgZoomAfterFirst || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        let svgZoomAfterDouble = try await bridge.webView.callAsyncJavaScript("return window.__svgZooms || 0;", arguments: [:], in: nil, contentWorld: .page) as? Int
+        XCTAssertEqual(svgZoomAfterFirst, 0, "single tap on zoomable diagram SVG must be blocked")
+        XCTAssertEqual(svgZoomAfterDouble, 1, "double tap on zoomable diagram SVG must open lightbox")
+    }
 }

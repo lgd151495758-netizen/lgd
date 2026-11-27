@@ -295,6 +295,13 @@ final class WebEditorViewController: UIViewController, DocumentTabViewController
         bridge.onUserActivity = {
             PresentationCenter.shared.markContentActive()
         }
+        bridge.onImageTapGuarded = {
+            NotificationCenter.default.post(
+                name: .quillmarkUndoRedoFeedback,
+                object: nil,
+                userInfo: ["message": "已防误触 · 双击图片可放大"]
+            )
+        }
         session.pageDidChange = { [weak self] changedPage in
             guard let self else { return }
             if changedPage < 0 {
