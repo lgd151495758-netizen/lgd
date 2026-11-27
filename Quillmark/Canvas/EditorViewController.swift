@@ -21,6 +21,13 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     private var overlays: [Int: PageInkView] = [:]
     private var cancellables = Set<AnyCancellable>()
     private var scrollViewObserved = false
+    private weak var pdfScrollView: UIScrollView?
+    private let projectionRenderer = PDFProjectionRenderer()
+    private var pdfDocumentRevision: UInt64 = 0
+    private var viewportRecordWork: DispatchWorkItem?
+    private var scrollSettleWork: DispatchWorkItem?
+    private var lastScrollActivityAt: CFAbsoluteTime = 0
+    private var needsHighResSettleRefresh = false
     private var pdfViewHeightConstraint: NSLayoutConstraint?
     private var presentationViewport = PresentationViewport(contentHeight: 0, extraBottomInset: 0, captureRect: .zero)
     private var captureOriginY: CGFloat = 0
@@ -148,6 +155,8 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     deinit {
         stopLaserLoop()
         holdTimer?.cancel()
+        viewportRecordWork?.cancel()
+        scrollSettleWork?.cancel()
     }
 
     override func viewDidLoad() {
@@ -329,6 +338,8 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             self.clearLassoSelection()
             let savedScale = self.pdfView.scaleFactor
             self.overlays.removeAll()
+            self.pdfDocumentRevision &+= 1
+            self.projectionRenderer.invalidateDocument()
             self.pdfView.document = self.session.pdfDocument
             if savedScale.isFinite, savedScale > 0.1 {
                 self.pdfView.scaleFactor = savedScale
@@ -429,19 +440,21 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     private func bindPDFNotifications() {
         NotificationCenter.default.publisher(for: .PDFViewPageChanged, object: pdfView)
             .sink { [weak self] _ in
-                self?.updateActiveDocumentPageIndex()
-                self?.refreshSelectedShapeOverlay()
-                self?.refreshLassoSelectionOverlay()
-                self?.recordCurrentViewport()
+                guard let self else { return }
+                self.updateActiveDocumentPageIndex()
+                if self.selectedStrokeID != nil {
+                    self.refreshSelectedShapeOverlay()
+                }
+                if !self.lassoSelectedIDs.isEmpty {
+                    self.refreshLassoSelectionOverlay()
+                }
+                self.scheduleViewportRecord()
                 PresentationCenter.shared.markContentActive()
             }
             .store(in: &cancellables)
         NotificationCenter.default.publisher(for: .PDFViewScaleChanged, object: pdfView)
             .sink { [weak self] _ in
-                self?.refreshSelectedShapeOverlay()
-                self?.refreshLassoSelectionOverlay()
-                self?.recordCurrentViewport()
-                PresentationCenter.shared.markContentActive()
+                self?.handleScrollOrZoomChanged()
             }
             .store(in: &cancellables)
         attachScrollViewObserversIfNeeded()
@@ -450,22 +463,66 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     private func attachScrollViewObserversIfNeeded() {
         guard !scrollViewObserved, let scrollView = pdfView.firstDescendant(of: UIScrollView.self) else { return }
         scrollViewObserved = true
+        pdfScrollView = scrollView
         scrollView.publisher(for: \.contentOffset)
             .sink { [weak self] _ in
-                self?.refreshSelectedShapeOverlay()
-                self?.refreshLassoSelectionOverlay()
-                self?.recordCurrentViewport()
-                PresentationCenter.shared.markContentActive()
+                self?.handleScrollOrZoomChanged()
             }
             .store(in: &cancellables)
         scrollView.publisher(for: \.zoomScale)
             .sink { [weak self] _ in
-                self?.refreshSelectedShapeOverlay()
-                self?.refreshLassoSelectionOverlay()
-                self?.recordCurrentViewport()
-                PresentationCenter.shared.markContentActive()
+                self?.handleScrollOrZoomChanged()
             }
             .store(in: &cancellables)
+    }
+
+    private func handleScrollOrZoomChanged() {
+        if selectedStrokeID != nil {
+            refreshSelectedShapeOverlay()
+        }
+        if !lassoSelectedIDs.isEmpty {
+            refreshLassoSelectionOverlay()
+        }
+        scheduleViewportRecord()
+        lastScrollActivityAt = CFAbsoluteTimeGetCurrent()
+        PresentationCenter.shared.markContentActive()
+        if PresentationCenter.shared.isExternalDisplayConnected {
+            scheduleScrollSettleRefresh()
+        }
+    }
+
+    private func scheduleViewportRecord() {
+        guard hasRestoredViewport, !isRestoringViewport else { return }
+        viewportRecordWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.recordCurrentViewport()
+        }
+        viewportRecordWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    private func scheduleScrollSettleRefresh() {
+        scrollSettleWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard PresentationCenter.shared.isExternalDisplayConnected else {
+                self.needsHighResSettleRefresh = false
+                return
+            }
+            if let sv = self.pdfScrollView,
+               sv.isTracking || sv.isDragging || sv.isDecelerating || sv.isZooming {
+                if self.needsHighResSettleRefresh {
+                    self.scheduleScrollSettleRefresh()
+                }
+                return
+            }
+            if self.needsHighResSettleRefresh {
+                self.needsHighResSettleRefresh = false
+                PresentationCenter.shared.requestFrameRefresh()
+            }
+        }
+        scrollSettleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16, execute: work)
     }
 
     fileprivate func handlePencilTap(_ action: UIPencilPreferredAction) {
@@ -539,6 +596,12 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
             laserFrame = .empty
             holdTimer?.cancel()
             holdTimer = nil
+            viewportRecordWork?.cancel()
+            viewportRecordWork = nil
+            scrollSettleWork?.cancel()
+            scrollSettleWork = nil
+            needsHighResSettleRefresh = false
+            projectionRenderer.clearCache()
             scratchpadPanel.canvas.deactivate()
             scratchpadLiveOverlay = nil
             if releasePresentation {
@@ -548,13 +611,15 @@ final class EditorViewController: UIViewController, DocumentTabViewController, P
     }
 
     func saveStateNow() {
+        viewportRecordWork?.cancel()
+        viewportRecordWork = nil
         recordCurrentViewport()
         session.saveNow()
     }
 
     private func recordCurrentViewport() {
         guard hasRestoredViewport, !isRestoringViewport, pdfView.bounds.width > 0 else { return }
-        guard let sv = pdfView.firstDescendant(of: UIScrollView.self), sv.contentSize.height > 0 else { return }
+        guard let sv = pdfScrollView ?? pdfView.firstDescendant(of: UIScrollView.self), sv.contentSize.height > 0 else { return }
         session.updateViewport(ViewportState(
             offsetX: sv.contentOffset.x,
             offsetY: sv.contentOffset.y,
@@ -2806,15 +2871,71 @@ extension EditorViewController: PresentationContentSource {
             return
         }
 
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = PresentationCenter.shared.preferredPDFCaptureScale(
+        let fullScale = PresentationCenter.shared.preferredPDFCaptureScale(
             forCaptureWidth: pdfCapture.width,
             screenScale: view.window?.screen.scale ?? 2
         )
+
+        // 2. Fast async off-main-thread PDF projection (matches HTML WKWebView.takeSnapshot fluidity):
+        // Collect lightweight geometry & strokes on main thread (<0.2ms), then composite cached page
+        // bitmaps + crisp vector ink on a private serial queue so scrolling stays locked at 60/120fps.
+        if let doc = pdfView.document, let pdfURL = doc.documentURL {
+            let sv = pdfScrollView ?? pdfView.firstDescendant(of: UIScrollView.self)
+            let isActivelyScrolling = (sv?.isTracking == true)
+                || (sv?.isDragging == true)
+                || (sv?.isDecelerating == true)
+                || (sv?.isZooming == true)
+                || (CFAbsoluteTimeGetCurrent() - lastScrollActivityAt) < 0.14
+            let outputScale = isActivelyScrolling ? min(fullScale, 1.0) : fullScale
+            if isActivelyScrolling {
+                needsHighResSettleRefresh = true
+                scheduleScrollSettleRefresh()
+            } else {
+                needsHighResSettleRefresh = false
+            }
+
+            let pages = buildProjectionPageSlices(doc: doc, pdfCapture: pdfCapture)
+            let floatingCard: PDFProjectionFloatingCard?
+            if session.isScratchpadOpen && session.scratchpadSplitMode == .floating {
+                let canvasFrame = stickyCanvasFrameInView()
+                let cardRect = canvasFrame.offsetBy(dx: -pdfCapture.minX, dy: -pdfCapture.minY)
+                let stickyImage = scratchpadPanel.canvas.renderCleanImage(size: canvasFrame.size)
+                if let cgCard = stickyImage.cgImage {
+                    floatingCard = PDFProjectionFloatingCard(rect: cardRect, image: cgCard)
+                } else {
+                    floatingCard = nil
+                }
+            } else {
+                floatingCard = nil
+            }
+
+            let bgColor = (pdfView.backgroundColor ?? .secondarySystemBackground)
+                .resolvedColor(with: traitCollection)
+                .cgColor
+
+            let request = PDFProjectionFrameRequest(
+                pdfURL: pdfURL,
+                documentRevision: pdfDocumentRevision,
+                displayBox: pdfView.displayBox,
+                captureSize: pdfCapture.size,
+                outputScale: outputScale,
+                backgroundColor: bgColor,
+                pages: pages,
+                floatingScratchpad: floatingCard,
+                isFastMotion: isActivelyScrolling
+            )
+            projectionRenderer.render(request) { image in
+                completion(image, pdfCapture.size)
+            }
+            return
+        }
+
+        // Fallback for synthetic in-memory PDFs without a backing disk file.
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = fullScale
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: pdfCapture.size, format: format)
 
-        // 2. Floating sticky-note mode: PDF pages underneath + clean rounded sticky-note card on top.
         if session.isScratchpadOpen && session.scratchpadSplitMode == .floating {
             let canvasFrame = stickyCanvasFrameInView()
             let cardRect = canvasFrame.offsetBy(dx: -pdfCapture.minX, dy: -pdfCapture.minY)
@@ -2847,12 +2968,76 @@ extension EditorViewController: PresentationContentSource {
             return
         }
 
-        // 3. Normal PDF mode (geometryOverlay & scratchpadPanel are siblings above pdfView, so never projected).
         let image = renderer.image { ctx in
             ctx.cgContext.translateBy(x: -pdfCapture.minX, y: -pdfCapture.minY)
             pdfView.drawHierarchy(in: pdfBounds, afterScreenUpdates: false)
         }
         completion(image, pdfCapture.size)
+    }
+
+    private func buildProjectionPageSlices(doc: PDFDocument, pdfCapture: CGRect) -> [PDFProjectionPageSlice] {
+        var candidateIndices = Set<Int>()
+        for page in pdfView.visiblePages {
+            let idx = doc.index(for: page)
+            if idx != NSNotFound, idx >= 0, idx < doc.pageCount {
+                candidateIndices.insert(idx)
+            }
+        }
+        if candidateIndices.isEmpty, let current = pdfView.currentPage {
+            let idx = doc.index(for: current)
+            if idx != NSNotFound, idx >= 0, idx < doc.pageCount {
+                candidateIndices.insert(idx)
+            }
+        }
+        // Also inspect immediate neighbors so pages just entering `pdfCapture` during fast flicks never clip out.
+        if let minIdx = candidateIndices.min(), minIdx > 0 {
+            candidateIndices.insert(minIdx - 1)
+        }
+        if let maxIdx = candidateIndices.max(), maxIdx + 1 < doc.pageCount {
+            candidateIndices.insert(maxIdx + 1)
+        }
+
+        let captureInView = view.convert(pdfCapture, from: pdfView)
+        let captureShift = CGAffineTransform(translationX: -captureInView.minX, y: -captureInView.minY)
+        let visibilityBounds = CGRect(origin: .zero, size: pdfCapture.size).insetBy(dx: -2, dy: -2)
+        let displayBox = pdfView.displayBox
+
+        var slices: [PDFProjectionPageSlice] = []
+        slices.reserveCapacity(candidateIndices.count)
+
+        for pageIndex in candidateIndices.sorted() {
+            guard let page = doc.page(at: pageIndex) else { continue }
+            let pageBox = page.bounds(for: displayBox)
+            let rectInPDF = pdfView.convert(pageBox, from: page).standardized
+            let frameInCapture = rectInPDF.offsetBy(dx: -pdfCapture.minX, dy: -pdfCapture.minY)
+            guard frameInCapture.width > 0.5,
+                  frameInCapture.height > 0.5,
+                  frameInCapture.intersects(visibilityBounds) else {
+                continue
+            }
+
+            let rawStrokes: [InkStroke]
+            if eraseOriginal != nil && activeErasePageIndex == pageIndex {
+                rawStrokes = eraseWorking
+            } else {
+                rawStrokes = session.strokes(onPage: pageIndex)
+            }
+            let visibleStrokes: [InkStroke]
+            if let hidden = overlays[pageIndex]?.hiddenStrokeIDs, !hidden.isEmpty {
+                visibleStrokes = rawStrokes.filter { !hidden.contains($0.id) }
+            } else {
+                visibleStrokes = rawStrokes
+            }
+
+            let inkTransform = pageToViewTransform(for: pageIndex).concatenating(captureShift)
+            slices.append(PDFProjectionPageSlice(
+                pageIndex: pageIndex,
+                frameInCapture: frameInCapture,
+                inkToCaptureTransform: inkTransform,
+                strokes: visibleStrokes
+            ))
+        }
+        return slices
     }
 }
 

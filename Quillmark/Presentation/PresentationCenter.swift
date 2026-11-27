@@ -342,6 +342,7 @@ final class PresentationCenter: ObservableObject {
     private var needsFrameCapture = false
     private var isCapturingFrame = false
     private var captureStartedAt: CFAbsoluteTime = 0
+    private var captureRequestToken: UInt64 = 0
     private var observers: [NSObjectProtocol] = []
     private var isObserving = false
 
@@ -733,7 +734,7 @@ final class PresentationCenter: ObservableObject {
         let now = CFAbsoluteTimeGetCurrent()
         if isCapturingFrame {
             if !force && now - captureStartedAt < 2.0 { return }
-            if force && now - captureStartedAt < 0.25 {
+            if force && now - captureStartedAt < 1.0 {
                 // Keep the forced request queued so the very next tick after this snapshot finishes captures it.
                 needsFrameCapture = true
                 return
@@ -749,11 +750,17 @@ final class PresentationCenter: ObservableObject {
                 return
             }
             presenter.setStandbyVisible(false)
+            captureRequestToken &+= 1
+            let token = captureRequestToken
             isCapturingFrame = true
             captureStartedAt = now
             source.capturePresentationFrame { [weak self] image, size in
                 guard let self else { return }
+                guard self.captureRequestToken == token else { return }
                 self.isCapturingFrame = false
+                if self.needsFrameCapture && !self.isFrozen {
+                    self.markContentActive()
+                }
                 guard !self.isFrozen else { return }
                 guard let image, size.width > 0, size.height > 0 else { return }
                 guard self.isShowingContentOnly else { return }
@@ -767,12 +774,18 @@ final class PresentationCenter: ObservableObject {
         guard let mainWindow = Self.mainWindow(),
               mainWindow.bounds.width > 0, mainWindow.bounds.height > 0 else { return }
         if let source = contentSource, source.presentationView.window === mainWindow {
+            captureRequestToken &+= 1
+            let token = captureRequestToken
             isCapturingFrame = true
             captureStartedAt = now
             let contentFrame = source.presentationView.convert(source.presentationView.bounds, to: mainWindow)
             source.capturePresentationFrame { [weak self] contentImage, _ in
                 guard let self else { return }
+                guard self.captureRequestToken == token else { return }
                 self.isCapturingFrame = false
+                if self.needsFrameCapture && !self.isFrozen {
+                    self.markContentActive()
+                }
                 guard !self.isFrozen else { return }
                 let composite = Self.renderWindow(mainWindow, replacing: contentFrame, with: contentImage)
                 self.presenter?.show(image: composite, sourceSize: mainWindow.bounds.size)
